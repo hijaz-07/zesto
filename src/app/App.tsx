@@ -1,5 +1,6 @@
 import { IonApp, setupIonicReact } from '@ionic/react';
 import { IonReactRouter } from '@ionic/react-router';
+import { AuthProvider } from '../features/auth/AuthProvider';
 import { AppRoutes } from './routes';
 
 setupIonicReact();
@@ -7,9 +8,11 @@ setupIonicReact();
 export function App() {
   return (
     <IonApp>
-      <IonReactRouter>
-        <AppRoutes />
-      </IonReactRouter>
+      <AuthProvider>
+        <IonReactRouter>
+          <AppRoutes />
+        </IonReactRouter>
+      </AuthProvider>
     </IonApp>
   );
 }

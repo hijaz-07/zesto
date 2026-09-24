@@ -1,18 +1,161 @@
-rules_version='2'
+rules_version = '2';
+
+// ===============================================================
+// Assumed Data Model
+// ===============================================================
+//
+// Collection: users
+// Document ID: {userId} — the Firebase Auth uid.
+// Fields:
+//   - id: string (required, immutable) — must equal the document id.
+//   - displayName: string (optional, 1-100 chars)
+//   - phoneNumber: string (optional, 1-20 chars)
+//   - email: string (optional, valid email format)
+//   - createdAt: timestamp (required, immutable)
+// A user document holds only that user's own profile info (PII). It has no
+// role or organization fields — organization access is granted exclusively
+// through the `members` subcollection below, never through this document.
+//
+// Collection: organizations
+// Document ID: {organizationId}
+// Organization documents are provisioned by trusted backend code only —
+// there is no client-side organization creation workflow yet, so this
+// collection is entirely read-only to clients, and only to members whose
+// membership `status` is exactly 'active' (an 'invited' or 'revoked'
+// member cannot read the organization document).
+//
+// Subcollection: organizations/{organizationId}/members
+// Document ID: {memberId} — the member's Firebase Auth uid.
+// Fields:
+//   - userId: string (required, immutable) — must equal the document id.
+//   - organizationId: string (required, immutable) — must equal the parent
+//     organization id.
+//   - role: string (required) — one of 'owner' | 'manager' | 'staff'.
+//   - status: string (required) — one of 'active' | 'invited' | 'revoked'.
+//   - createdAt: timestamp (required, immutable)
+// Membership documents are written exclusively by trusted backend code
+// (Cloud Functions using the Admin SDK, once that exists). No client create,
+// update, or delete is permitted here, so a user can never grant themselves
+// membership or change their own (or anyone else's) role.
+//
+// ===============================================================
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
+
+    // -----------------------------------------------------------
+    // Helper functions
+    // -----------------------------------------------------------
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+
+    function isValidOptionalString(field, minLen, maxLen) {
+      return !(field in request.resource.data) ||
+        (request.resource.data[field] is string &&
+         request.resource.data[field].size() >= minLen &&
+         request.resource.data[field].size() <= maxLen);
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
+    }
+
+    function areImmutableFieldsUnchanged(fields) {
+      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
+    }
+
+    // Membership status must be checked with get(), not just exists() —
+    // exists() only proves a membership document is present, not that it
+    // is still 'active' (it may be 'invited' or 'revoked').
+    function isActiveMember(organizationId, userId) {
+      return isOwner(userId) &&
+        exists(/databases/$(database)/documents/organizations/$(organizationId)/members/$(userId)) &&
+        get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(userId)).data.status == 'active';
+    }
+
+    // -----------------------------------------------------------
+    // users/{userId}
+    // -----------------------------------------------------------
+
+    function isValidUser(userId, data) {
+      return hasOnlyAllowedFields(['id', 'displayName', 'phoneNumber', 'email', 'createdAt']) &&
+        hasRequiredFields(['id', 'createdAt']) &&
+        data.id == userId &&
+        data.createdAt is timestamp &&
+        isValidOptionalString('displayName', 1, 100) &&
+        isValidOptionalString('phoneNumber', 1, 20) &&
+        (!('email' in data) || isValidEmail(data.email));
+    }
+
+    match /users/{userId} {
+      // A user may read only their own profile — it contains PII (email,
+      // phone), so it is never exposed to anyone else.
+      allow read: if isOwner(userId);
+
+      allow create: if isOwner(userId) && isValidUser(userId, request.resource.data);
+
+      // Ownership alone is never enough to allow an update — it must also
+      // pass the same schema validation as create, and `id`/`createdAt`
+      // must not change.
+      allow update: if isOwner(userId) &&
+        isValidUser(userId, request.resource.data) &&
+        areImmutableFieldsUnchanged(['id', 'createdAt']);
+
+      allow delete: if false;
+    }
+
+    // -----------------------------------------------------------
+    // organizations/{organizationId}
+    // -----------------------------------------------------------
+
+    match /organizations/{organizationId} {
+      // Readable only by ACTIVE members of that specific organization — an
+      // 'invited' or 'revoked' membership document existing is not enough.
+      // There is no client-side organization creation/edit workflow yet, so
+      // writes are fully closed.
       //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 10, 24);
+      // `isAuthenticated() &&` here is deliberate, not redundant with
+      // isActiveMember()'s own isOwner() check: it guarantees request.auth
+      // is non-null before request.auth.uid is evaluated as an argument
+      // below (argument expressions are evaluated before the function
+      // body runs).
+      allow read: if isAuthenticated() && isActiveMember(organizationId, request.auth.uid);
+      allow write: if false;
+
+      // ---------------------------------------------------------
+      // organizations/{organizationId}/members/{memberId}
+      // ---------------------------------------------------------
+      match /members/{memberId} {
+        // A member may read only their own membership record within this
+        // organization (tenant + self scoped). Membership documents are
+        // never client-writable: they are created and changed exclusively
+        // by trusted backend code, so a user can never grant themselves
+        // membership in an organization or change their own role.
+        allow read: if isOwner(memberId);
+        allow write: if false;
+      }
+    }
+
+    // -----------------------------------------------------------
+    // Deny everything else by default.
+    // -----------------------------------------------------------
+    match /{document=**} {
+      allow read, write: if false;
     }
   }
 }
