@@ -1,0 +1,30 @@
+/*
+ * Zesto visual foundation.
+ * Tokens are exposed via Tailwind's `@theme` so utilities like
+ * `bg-primary`, `text-muted`, `border-border` are generated automatically.
+ */
+@theme {
+  --color-background: #f7f7f5;
+  --color-surface: #ffffff;
+  --color-text: #1c1b1f;
+  --color-muted: #6b6b70;
+  --color-border: #e4e3e0;
+  --color-primary: #d6482b;
+  --color-primary-hover: #b83b21;
+  --color-success: #1f8a4c;
+  --color-warning: #b8860b;
+  --color-danger: #c62828;
+}
+
+:root[data-theme='dark'] {
+  --color-background: #131214;
+  --color-surface: #1c1b1e;
+  --color-text: #f2f1ef;
+  --color-muted: #a3a2a6;
+  --color-border: #2e2d30;
+  --color-primary: #ef6a4c;
+  --color-primary-hover: #f5876c;
+  --color-success: #3ba86a;
+  --color-warning: #d9a441;
+  --color-danger: #e05656;
+}
