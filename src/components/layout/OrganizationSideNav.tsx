@@ -9,6 +9,7 @@ import {
 } from '@ionic/react';
 import {
   analyticsOutline,
+  businessOutline,
   gridOutline,
   receiptOutline,
   restaurantOutline,
@@ -18,6 +19,7 @@ import {
 const navItems = [
   { href: '/org/dashboard', label: 'Dashboard', icon: gridOutline },
   { href: '/org/menus', label: 'Menus', icon: restaurantOutline },
+  { href: '/org/outlets', label: 'Outlets', icon: businessOutline },
   { href: '/org/orders', label: 'Orders', icon: receiptOutline },
   { href: '/org/analytics', label: 'Analytics', icon: analyticsOutline },
   { href: '/org/settings', label: 'Settings', icon: settingsOutline },

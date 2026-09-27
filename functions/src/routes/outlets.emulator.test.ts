@@ -179,6 +179,60 @@ describe("POST /organizations/:organizationId/outlets (Firestore emulator)", () 
     expect(slugSnapshot.data()).toMatchObject({organizationId, outletId: outlet.id});
   });
 
+  it("persists every optional field exactly as submitted, read back from Firestore", async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const input = {
+      ...freshOutletInput(),
+      description: "Main campus food outlet",
+      phone: "0499xxxxxxx",
+      address: {line1: "Main Campus", city: "Kasaragod", state: "Kerala", postalCode: "671121"},
+      location: {latitude: 12.5, longitude: 74.9},
+    };
+
+    const result = await callCreate(organizationId, acceptingValidator(ownerId), input);
+
+    expect(result).toMatchObject({kind: "success", status: 201});
+    if (result.kind !== "success") throw new Error("expected success");
+    const {outlet} = result.data as {outlet: {id: string}};
+
+    const snapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outlets").doc(outlet.id)
+      .get();
+    expect(snapshot.data()).toMatchObject({
+      description: input.description,
+      phone: input.phone,
+      address: input.address,
+      location: input.location,
+    });
+  });
+
+  it("a failed create (slug already taken) leaves the existing slug reservation and outlet count unchanged, with no orphaned outlet document", async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const input = freshOutletInput();
+    const validator = acceptingValidator(ownerId);
+
+    const first = await callCreate(organizationId, validator, input);
+    expect(first).toMatchObject({kind: "success", status: 201});
+    if (first.kind !== "success") throw new Error("setup failed");
+    const originalOutletId = (first.data as {outlet: {id: string}}).outlet.id;
+
+    const second = await callCreate(organizationId, validator, input);
+    expect(second).toMatchObject({kind: "error", status: 409, code: "already_exists"});
+
+    const slugSnapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outletSlugs").doc(input.slug)
+      .get();
+    expect(slugSnapshot.data()).toMatchObject({organizationId, outletId: originalOutletId});
+
+    const outletsSnapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outlets").get();
+    expect(outletsSnapshot.size).toBe(1);
+    expect(outletsSnapshot.docs[0].id).toBe(originalOutletId);
+  });
+
   it("lets exactly one of two concurrent requests for the SAME slug (same org) succeed", async () => {
     const {organizationId, ownerId} = await setupOrgWithOwner();
     const input = freshOutletInput();
@@ -202,6 +256,31 @@ describe("POST /organizations/:organizationId/outlets (Firestore emulator)", () 
       .collection("outlets").where("slug", "==", input.slug).get();
     expect(outlets.size).toBe(1);
   });
+
+  it("under concurrent requests for the same slug, exactly one outlet document exists afterward (no orphan from the losing attempt)", async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const input = freshOutletInput();
+    const validator = acceptingValidator(ownerId);
+
+    await Promise.all([
+      callCreate(organizationId, validator, input),
+      callCreate(organizationId, validator, input),
+    ]);
+
+    // Unfiltered by slug this time — an orphaned document under a different
+    // ID would still show up here, unlike the slug-filtered query above.
+    const outletsSnapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outlets").get();
+    expect(outletsSnapshot.size).toBe(1);
+
+    const slugSnapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outletSlugs").doc(input.slug)
+      .get();
+    expect(slugSnapshot.exists).toBe(true);
+    expect(slugSnapshot.data()?.outletId).toBe(outletsSnapshot.docs[0].id);
+  }, 15000);
 
   it("lets two concurrent requests for DIFFERENT slugs (same org) both succeed", async () => {
     const {organizationId, ownerId} = await setupOrgWithOwner();
@@ -409,6 +488,23 @@ describe("PATCH /organizations/:organizationId/outlets/:outletId (Firestore emul
     });
 
     expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("never creates a document at the target path when the outlet doesn't exist (no upsert)", async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const missingOutletId = "does-not-exist-outlet";
+
+    const result = await callPatch(organizationId, missingOutletId, acceptingValidator(ownerId), {
+      name: "Should Never Be Persisted",
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+
+    const snapshot = await db
+      .collection("organizations").doc(organizationId)
+      .collection("outlets").doc(missingOutletId)
+      .get();
+    expect(snapshot.exists).toBe(false);
   });
 
   it("an outlet from another organization cannot be updated (404, never leaking cross-tenant data)", async () => {

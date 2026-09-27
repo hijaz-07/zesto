@@ -1,14 +1,20 @@
 import { IonRouterOutlet, IonSplitPane } from '@ionic/react';
 import { Navigate, Route, Routes } from 'react-router-dom';
+import type { OrganizationId } from '../domain/types';
 import { OrganizationSideNav } from '../components/layout/OrganizationSideNav';
 import { OrganizationAnalyticsPage } from '../pages/organization/OrganizationAnalyticsPage';
 import { OrganizationDashboardPage } from '../pages/organization/OrganizationDashboardPage';
 import { OrganizationMenusPage } from '../pages/organization/OrganizationMenusPage';
 import { OrganizationOrdersPage } from '../pages/organization/OrganizationOrdersPage';
+import { OrganizationOutletsPage } from '../pages/organization/OrganizationOutletsPage';
 import { OrganizationSettingsPage } from '../pages/organization/OrganizationSettingsPage';
 
+export interface OrganizationAppLayoutProps {
+  organizationId: OrganizationId;
+}
+
 /** Desktop-first organization shell: a persistent side menu over a routed outlet. */
-export function OrganizationAppLayout() {
+export function OrganizationAppLayout({ organizationId }: OrganizationAppLayoutProps) {
   return (
     <IonSplitPane contentId="org-main-content" when="md">
       <OrganizationSideNav />
@@ -16,6 +22,7 @@ export function OrganizationAppLayout() {
         <Routes>
           <Route path="dashboard" element={<OrganizationDashboardPage />} />
           <Route path="menus" element={<OrganizationMenusPage />} />
+          <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
           <Route path="orders" element={<OrganizationOrdersPage />} />
           <Route path="analytics" element={<OrganizationAnalyticsPage />} />
           <Route path="settings" element={<OrganizationSettingsPage />} />

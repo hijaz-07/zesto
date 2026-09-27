@@ -38,7 +38,11 @@ export function OrganizationGate() {
   const hasOrganization = organizations.length > 0;
 
   if (hasOrganization) {
-    return pathname === ONBOARDING_PATH ? <Navigate to={DASHBOARD_PATH} replace /> : <OrganizationAppLayout />;
+    return pathname === ONBOARDING_PATH ? (
+      <Navigate to={DASHBOARD_PATH} replace />
+    ) : (
+      <OrganizationAppLayout organizationId={organizations[0].id} />
+    );
   }
 
   return pathname === ONBOARDING_PATH ? (
