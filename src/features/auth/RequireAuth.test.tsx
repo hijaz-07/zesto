@@ -1,45 +1,50 @@
 import { render, screen } from '@testing-library/react';
-import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { descopeMock } from '../../test/mockDescopeSdk';
+import { AuthProvider } from './AuthProvider';
 import { RequireAuth } from './RequireAuth';
-import type { AuthContextValue } from './types';
-import { useAuth } from './useAuth';
 
-vi.mock('./useAuth');
+vi.mock('@descope/react-sdk', async () => (await import('../../test/mockDescopeSdk')).mockDescopeSdkModule);
 
-const mockedUseAuth = vi.mocked(useAuth);
+function LoginProbe() {
+  const location = useLocation();
+  const from = (location.state as { from?: { pathname: string } } | null)?.from?.pathname;
+  return <div>Login page (from: {from ?? 'none'})</div>;
+}
 
 function renderWithGuard(initialEntries: string[]) {
   return render(
-    <MemoryRouter initialEntries={initialEntries}>
-      <Routes>
-        <Route path="/" element={<div>Public home</div>} />
-        <Route
-          path="/app"
-          element={
-            <RequireAuth>
-              <div>Protected content</div>
-            </RequireAuth>
-          }
-        />
-      </Routes>
-    </MemoryRouter>,
+    <AuthProvider>
+      <MemoryRouter initialEntries={initialEntries}>
+        <Routes>
+          <Route path="/login" element={<LoginProbe />} />
+          <Route
+            path="/app"
+            element={
+              <RequireAuth>
+                <div>Protected content</div>
+              </RequireAuth>
+            }
+          />
+        </Routes>
+      </MemoryRouter>
+    </AuthProvider>,
   );
 }
 
-function authValue(overrides: Partial<AuthContextValue>): AuthContextValue {
-  return {
-    user: null,
-    status: 'initializing',
-    isAuthenticated: false,
-    signOut: vi.fn(),
-    ...overrides,
-  };
-}
+describe('RequireAuth (Descope session)', () => {
+  beforeEach(() => {
+    descopeMock.reset();
+    vi.stubEnv('VITE_DESCOPE_PROJECT_ID', 'P-test-project');
+  });
 
-describe('RequireAuth', () => {
-  it('shows a loading state while auth is initializing, without revealing protected content', () => {
-    mockedUseAuth.mockReturnValue(authValue({ status: 'initializing' }));
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('shows a loading state while the Descope session is loading, without revealing protected content', () => {
+    descopeMock.setSessionLoading();
 
     renderWithGuard(['/app']);
 
@@ -47,22 +52,18 @@ describe('RequireAuth', () => {
     expect(screen.queryByText('Protected content')).not.toBeInTheDocument();
   });
 
-  it('renders protected content for authenticated users', () => {
-    mockedUseAuth.mockReturnValue(
-      authValue({ status: 'signedIn', isAuthenticated: true, user: { uid: 'user-123' } as never }),
-    );
+  it('renders protected content when the Descope session is authenticated', () => {
+    descopeMock.setSignedIn();
 
     renderWithGuard(['/app']);
 
     expect(screen.getByText('Protected content')).toBeInTheDocument();
   });
 
-  it('redirects signed-out users away from protected content', () => {
-    mockedUseAuth.mockReturnValue(authValue({ status: 'signedOut' }));
-
+  it('redirects to the login page, remembering the requested route, when there is no Descope session', () => {
     renderWithGuard(['/app']);
 
     expect(screen.queryByText('Protected content')).not.toBeInTheDocument();
-    expect(screen.getByText('Public home')).toBeInTheDocument();
+    expect(screen.getByText('Login page (from: /app)')).toBeInTheDocument();
   });
 });

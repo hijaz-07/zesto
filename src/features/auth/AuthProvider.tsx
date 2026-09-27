@@ -1,6 +1,6 @@
-import { onAuthStateChanged, signOut as firebaseSignOut } from 'firebase/auth';
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { auth } from '../../lib/firebase';
+import { AuthProvider as DescopeAuthProvider, useDescope, useSession, useUser } from '@descope/react-sdk';
+import { useCallback, useMemo, type ReactNode } from 'react';
+import { getDescopeProjectId } from './config';
 import { AuthContext } from './context';
 import type { AuthContextValue, AuthStatus } from './types';
 
@@ -9,30 +9,51 @@ export interface AuthProviderProps {
 }
 
 /**
- * The single place in the app that subscribes to Firebase's `onAuthStateChanged`.
- * Firebase Auth (via its own persistence) is the source of truth for session state —
- * this provider never reads or writes tokens itself.
+ * The app's single authentication root. Descope is the source of truth for
+ * session state: its SDK restores, refreshes, persists, and clears tokens
+ * itself — this provider never reads or writes tokens directly.
  */
 export function AuthProvider({ children }: AuthProviderProps) {
-  const [status, setStatus] = useState<AuthStatus>('initializing');
-  const [user, setUser] = useState<AuthContextValue['user']>(null);
+  return (
+    <DescopeAuthProvider projectId={getDescopeProjectId()}>
+      <DescopeAuthBridge>{children}</DescopeAuthBridge>
+    </DescopeAuthProvider>
+  );
+}
 
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
-      setUser(firebaseUser);
-      setStatus(firebaseUser ? 'signedIn' : 'signedOut');
-    });
-    return unsubscribe;
-  }, []);
+/** Maps Descope's session/user hooks onto Zesto's stable `useAuth()` contract. */
+function DescopeAuthBridge({ children }: AuthProviderProps) {
+  const { isAuthenticated, isSessionLoading } = useSession();
+  const { user: descopeUser, isUserLoading } = useUser();
+  const sdk = useDescope();
+
+  let status: AuthStatus;
+  if (isSessionLoading || (isAuthenticated && !descopeUser && isUserLoading)) {
+    status = 'initializing';
+  } else {
+    status = isAuthenticated ? 'signedIn' : 'signedOut';
+  }
+
+  const signOut = useCallback(async () => {
+    await sdk.logout();
+  }, [sdk]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
-      user,
+      user:
+        status === 'signedIn' && descopeUser
+          ? {
+              userId: descopeUser.userId,
+              name: descopeUser.name,
+              phone: descopeUser.phone,
+              email: descopeUser.email,
+            }
+          : null,
       status,
       isAuthenticated: status === 'signedIn',
-      signOut: () => firebaseSignOut(auth),
+      signOut,
     }),
-    [user, status],
+    [descopeUser, status, signOut],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -34,12 +34,16 @@ describe('firebase client', () => {
     expect(getApps()).toHaveLength(1);
   });
 
-  it('creates Auth, Firestore, Functions, and Storage service instances', async () => {
-    const { auth, db, functions, storage, firebaseApp } = await import('./firebase');
-    expect(auth.app).toBe(firebaseApp);
+  it('creates Firestore, Functions, and Storage service instances', async () => {
+    const { db, functions, storage, firebaseApp } = await import('./firebase');
     expect(db.app).toBe(firebaseApp);
     expect(functions.app).toBe(firebaseApp);
     expect(storage.app).toBe(firebaseApp);
+  });
+
+  it('does not initialize Firebase Authentication — Descope is the identity provider', async () => {
+    const firebaseModule: Record<string, unknown> = await import('./firebase');
+    expect(firebaseModule).not.toHaveProperty('auth');
   });
 
   describe('shouldUseEmulators', () => {

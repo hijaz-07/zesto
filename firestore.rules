@@ -1,11 +1,34 @@
 rules_version = '2';
 
 // ===============================================================
-// Assumed Data Model
+// Access architecture
+// ===============================================================
+//
+// Descope is Zesto's sole identity provider. Firebase Authentication is
+// NOT used, so `request.auth` never carries a Zesto identity: for every
+// legitimate Zesto client it is null. Any non-null `request.auth` would
+// come from a Firebase Auth sign-in outside of Zesto, which must never
+// be treated as a Zesto user. These rules therefore grant NOTHING based
+// on `request.auth`.
+//
+// Protected data is accessed only through Cloud Functions, which:
+//   1. validate the caller's Descope session token server-side
+//      (functions/src/auth/session.ts),
+//   2. authorize tenant access from organizations/{organizationId}/
+//      members/{userId} (functions/src/auth/membership.ts), and
+//   3. read/write Firestore with the Admin SDK (which bypasses these
+//      rules) and enforce schema validation there.
+//
+// Direct client access may be re-opened later ONLY for data that needs no
+// identity (e.g. published menus), and must be justified per collection.
+// See docs/architecture/authentication.md.
+//
+// ===============================================================
+// Data model (written by trusted backend code only)
 // ===============================================================
 //
 // Collection: users
-// Document ID: {userId} — the Firebase Auth uid.
+// Document ID: {userId} — the Descope user ID (session JWT `sub`).
 // Fields:
 //   - id: string (required, immutable) — must equal the document id.
 //   - displayName: string (optional, 1-100 chars)
@@ -18,136 +41,39 @@ rules_version = '2';
 //
 // Collection: organizations
 // Document ID: {organizationId}
-// Organization documents are provisioned by trusted backend code only —
-// there is no client-side organization creation workflow yet, so this
-// collection is entirely read-only to clients, and only to members whose
-// membership `status` is exactly 'active' (an 'invited' or 'revoked'
-// member cannot read the organization document).
+// Provisioned by trusted backend code only.
 //
 // Subcollection: organizations/{organizationId}/members
-// Document ID: {memberId} — the member's Firebase Auth uid.
+// Document ID: {memberId} — the member's Descope user ID.
 // Fields:
 //   - userId: string (required, immutable) — must equal the document id.
 //   - organizationId: string (required, immutable) — must equal the parent
 //     organization id.
 //   - role: string (required) — one of 'owner' | 'manager' | 'staff'.
+//     Roles are tenant-scoped; there are no global custom claims.
 //   - status: string (required) — one of 'active' | 'invited' | 'revoked'.
+//     Only 'active' grants organization access.
 //   - createdAt: timestamp (required, immutable)
-// Membership documents are written exclusively by trusted backend code
-// (Cloud Functions using the Admin SDK, once that exists). No client create,
-// update, or delete is permitted here, so a user can never grant themselves
-// membership or change their own (or anyone else's) role.
+// Membership is created and changed exclusively by trusted backend code,
+// so a user can never grant themselves membership or change a role.
 //
 // ===============================================================
 
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // -----------------------------------------------------------
-    // Helper functions
-    // -----------------------------------------------------------
-
-    function isAuthenticated() {
-      return request.auth != null;
-    }
-
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
-    }
-
-    function hasOnlyAllowedFields(fields) {
-      return request.resource.data.keys().hasOnly(fields);
-    }
-
-    function hasRequiredFields(fields) {
-      return request.resource.data.keys().hasAll(fields);
-    }
-
-    function isValidOptionalString(field, minLen, maxLen) {
-      return !(field in request.resource.data) ||
-        (request.resource.data[field] is string &&
-         request.resource.data[field].size() >= minLen &&
-         request.resource.data[field].size() <= maxLen);
-    }
-
-    function isValidEmail(email) {
-      return email is string &&
-        email.matches('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$');
-    }
-
-    function areImmutableFieldsUnchanged(fields) {
-      return !request.resource.data.diff(resource.data).affectedKeys().hasAny(fields);
-    }
-
-    // Membership status must be checked with get(), not just exists() —
-    // exists() only proves a membership document is present, not that it
-    // is still 'active' (it may be 'invited' or 'revoked').
-    function isActiveMember(organizationId, userId) {
-      return isOwner(userId) &&
-        exists(/databases/$(database)/documents/organizations/$(organizationId)/members/$(userId)) &&
-        get(/databases/$(database)/documents/organizations/$(organizationId)/members/$(userId)).data.status == 'active';
-    }
-
-    // -----------------------------------------------------------
-    // users/{userId}
-    // -----------------------------------------------------------
-
-    function isValidUser(userId, data) {
-      return hasOnlyAllowedFields(['id', 'displayName', 'phoneNumber', 'email', 'createdAt']) &&
-        hasRequiredFields(['id', 'createdAt']) &&
-        data.id == userId &&
-        data.createdAt is timestamp &&
-        isValidOptionalString('displayName', 1, 100) &&
-        isValidOptionalString('phoneNumber', 1, 20) &&
-        (!('email' in data) || isValidEmail(data.email));
-    }
-
+    // Profile PII. Read/written via Cloud Functions only.
     match /users/{userId} {
-      // A user may read only their own profile — it contains PII (email,
-      // phone), so it is never exposed to anyone else.
-      allow read: if isOwner(userId);
-
-      allow create: if isOwner(userId) && isValidUser(userId, request.resource.data);
-
-      // Ownership alone is never enough to allow an update — it must also
-      // pass the same schema validation as create, and `id`/`createdAt`
-      // must not change.
-      allow update: if isOwner(userId) &&
-        isValidUser(userId, request.resource.data) &&
-        areImmutableFieldsUnchanged(['id', 'createdAt']);
-
-      allow delete: if false;
+      allow read, write: if false;
     }
 
-    // -----------------------------------------------------------
-    // organizations/{organizationId}
-    // -----------------------------------------------------------
-
+    // Tenant data. Read/written via Cloud Functions only.
     match /organizations/{organizationId} {
-      // Readable only by ACTIVE members of that specific organization — an
-      // 'invited' or 'revoked' membership document existing is not enough.
-      // There is no client-side organization creation/edit workflow yet, so
-      // writes are fully closed.
-      //
-      // `isAuthenticated() &&` here is deliberate, not redundant with
-      // isActiveMember()'s own isOwner() check: it guarantees request.auth
-      // is non-null before request.auth.uid is evaluated as an argument
-      // below (argument expressions are evaluated before the function
-      // body runs).
-      allow read: if isAuthenticated() && isActiveMember(organizationId, request.auth.uid);
-      allow write: if false;
+      allow read, write: if false;
 
-      // ---------------------------------------------------------
-      // organizations/{organizationId}/members/{memberId}
-      // ---------------------------------------------------------
+      // Tenant-scoped membership and roles. Backend-only, always.
       match /members/{memberId} {
-        // A member may read only their own membership record within this
-        // organization (tenant + self scoped). Membership documents are
-        // never client-writable: they are created and changed exclusively
-        // by trusted backend code, so a user can never grant themselves
-        // membership in an organization or change their own role.
-        allow read: if isOwner(memberId);
-        allow write: if false;
+        allow read, write: if false;
       }
     }
 

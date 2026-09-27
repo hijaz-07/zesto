@@ -18,8 +18,7 @@ unless a future requirement explicitly introduces one.
 ### User
 A person who has authenticated with Zesto. A `User` may act as a
 customer, as a member of one or more organizations, or both. Identity
-and authentication details live outside this document (see
-`CLAUDE.md` — Firebase Authentication / OTPLESS).
+comes from Descope; see `docs/architecture/authentication.md`.
 
 ### Organization
 A business entity on the platform — a canteen, café, restaurant, or

@@ -70,12 +70,11 @@ Use:
 - Tailwind CSS 4
 - React Router with Ionic-compatible routing
 - Firebase
-- Firebase Authentication
+- Descope (sole identity/session provider: @descope/react-sdk, @descope/node-sdk)
 - Firestore
 - Firebase Storage
 - Firebase Cloud Functions
 - Firebase Cloud Messaging
-- OTPLESS
 - Capacitor 8
 - Git
 - GitHub

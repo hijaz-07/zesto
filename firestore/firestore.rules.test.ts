@@ -2,19 +2,23 @@
 import { readFileSync } from 'node:fs';
 import {
   assertFails,
-  assertSucceeds,
   initializeTestEnvironment,
   type RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { Timestamp, doc, getDoc, setDoc } from 'firebase/firestore';
+import { Timestamp, deleteDoc, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
 import { afterAll, afterEach, beforeAll, describe, it } from 'vitest';
+
+/**
+ * Descope is Zesto's identity provider, so no legitimate client carries a
+ * Firebase Auth identity. `authenticatedContext(uid)` here simulates a
+ * stray Firebase Auth sign-in, which must never be treated as a Zesto user —
+ * even when its uid matches a stored user or an active membership.
+ */
 
 let testEnv: RulesTestEnvironment;
 
-const OWNER_UID = 'user-owner';
-const OTHER_UID = 'user-other';
+const USER_ID = 'user-owner';
 const ORG_A = 'org-a';
-const ORG_B = 'org-b';
 
 function validUserDoc(uid: string) {
   return {
@@ -24,13 +28,20 @@ function validUserDoc(uid: string) {
   };
 }
 
-function membershipDoc(uid: string, organizationId: string, status: 'active' | 'invited' | 'revoked' = 'active') {
+function membershipDoc(uid: string, organizationId: string) {
   return {
     userId: uid,
     organizationId,
     role: 'owner',
-    status,
+    status: 'active',
     createdAt: Timestamp.now(),
+  };
+}
+
+function clients() {
+  return {
+    unauthenticated: testEnv.unauthenticatedContext().firestore(),
+    firebaseAuthenticated: testEnv.authenticatedContext(USER_ID).firestore(),
   };
 }
 
@@ -52,172 +63,93 @@ afterAll(async () => {
 });
 
 describe('firestore.rules: users/{userId}', () => {
-  it('denies unauthenticated access', async () => {
-    const unauthedDb = testEnv.unauthenticatedContext().firestore();
-    await assertFails(getDoc(doc(unauthedDb, 'users', OWNER_UID)));
-  });
-
-  it('allows a user to read their own user document', async () => {
+  it('denies all client reads, even of a user document whose id matches the caller', async () => {
     await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'users', OWNER_UID), validUserDoc(OWNER_UID));
+      await setDoc(doc(context.firestore(), 'users', USER_ID), validUserDoc(USER_ID));
     });
 
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertSucceeds(getDoc(doc(ownerDb, 'users', OWNER_UID)));
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'users', USER_ID)));
+    }
   });
 
-  it('denies reading another user’s document', async () => {
+  it('denies all client creates, updates, and deletes', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(setDoc(doc(db, 'users', USER_ID), validUserDoc(USER_ID)));
+    }
+
     await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'users', OWNER_UID), validUserDoc(OWNER_UID));
+      await setDoc(doc(context.firestore(), 'users', USER_ID), validUserDoc(USER_ID));
     });
 
-    const otherDb = testEnv.authenticatedContext(OTHER_UID).firestore();
-    await assertFails(getDoc(doc(otherDb, 'users', OWNER_UID)));
-  });
-
-  it('denies modifying another user’s document', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'users', OWNER_UID), validUserDoc(OWNER_UID));
-    });
-
-    const otherDb = testEnv.authenticatedContext(OTHER_UID).firestore();
-    await assertFails(
-      setDoc(doc(otherDb, 'users', OWNER_UID), { ...validUserDoc(OWNER_UID), displayName: 'Hijacked' }),
-    );
-  });
-
-  it('allows a user to create their own valid user document', async () => {
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertSucceeds(setDoc(doc(ownerDb, 'users', OWNER_UID), validUserDoc(OWNER_UID)));
-  });
-
-  it('denies creating a user document under someone else’s uid', async () => {
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(setDoc(doc(ownerDb, 'users', OTHER_UID), validUserDoc(OTHER_UID)));
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'users', USER_ID), { displayName: 'Changed' }));
+      await assertFails(deleteDoc(doc(db, 'users', USER_ID)));
+    }
   });
 });
 
 describe('firestore.rules: organizations/{organizationId}', () => {
-  it('allows an active member to read the organization', async () => {
+  it('denies client reads even when the caller id matches an active membership', async () => {
     await testEnv.withSecurityRulesDisabled(async (context) => {
       await setDoc(doc(context.firestore(), 'organizations', ORG_A), { id: ORG_A, name: 'Org A' });
       await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'active'),
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
       );
     });
 
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertSucceeds(getDoc(doc(ownerDb, 'organizations', ORG_A)));
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizations', ORG_A)));
+    }
   });
 
-  it('denies an invited (not yet active) member from reading the organization', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'organizations', ORG_A), { id: ORG_A, name: 'Org A' });
-      await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'invited'),
-      );
-    });
-
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(getDoc(doc(ownerDb, 'organizations', ORG_A)));
-  });
-
-  it('denies a revoked member from reading the organization', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'organizations', ORG_A), { id: ORG_A, name: 'Org A' });
-      await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'revoked'),
-      );
-    });
-
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(getDoc(doc(ownerDb, 'organizations', ORG_A)));
-  });
-
-  it('denies a non-member (no membership document at all) from reading the organization', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'organizations', ORG_A), { id: ORG_A, name: 'Org A' });
-    });
-
-    const otherDb = testEnv.authenticatedContext(OTHER_UID).firestore();
-    await assertFails(getDoc(doc(otherDb, 'organizations', ORG_A)));
-  });
-
-  it('denies reading an organization the user is not an active member of (tenant isolation)', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(doc(context.firestore(), 'organizations', ORG_B), { id: ORG_B, name: 'Org B' });
-      await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'active'),
-      );
-    });
-
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(getDoc(doc(ownerDb, 'organizations', ORG_B)));
+  it('denies all client writes', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(setDoc(doc(db, 'organizations', ORG_A), { id: ORG_A, name: 'Org A' }));
+    }
   });
 });
 
 describe('firestore.rules: organizations/{organizationId}/members/{memberId}', () => {
-  it('denies a user creating/granting themselves organization membership', async () => {
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(
-      setDoc(doc(ownerDb, 'organizations', ORG_A, 'members', OWNER_UID), membershipDoc(OWNER_UID, ORG_A)),
-    );
-  });
-
-  it('denies a user changing their own organization role', async () => {
+  it('denies a client reading its own membership document', async () => {
     await testEnv.withSecurityRulesDisabled(async (context) => {
       await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'active'),
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
       );
     });
 
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertFails(
-      setDoc(doc(ownerDb, 'organizations', ORG_A, 'members', OWNER_UID), {
-        ...membershipDoc(OWNER_UID, ORG_A, 'active'),
-        role: 'manager',
-      }),
-    );
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizations', ORG_A, 'members', USER_ID)));
+    }
   });
 
-  it('allows an active member to read their own membership document', async () => {
+  it('denies a client granting itself membership or changing its role', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(doc(db, 'organizations', ORG_A, 'members', USER_ID), membershipDoc(USER_ID, ORG_A)),
+      );
+    }
+
     await testEnv.withSecurityRulesDisabled(async (context) => {
       await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'active'),
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
       );
     });
 
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertSucceeds(getDoc(doc(ownerDb, 'organizations', ORG_A, 'members', OWNER_UID)));
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'organizations', ORG_A, 'members', USER_ID), { role: 'manager' }));
+    }
   });
+});
 
-  it('allows a revoked member to still read their own membership document (so they can see their status)', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'revoked'),
-      );
-    });
-
-    const ownerDb = testEnv.authenticatedContext(OWNER_UID).firestore();
-    await assertSucceeds(getDoc(doc(ownerDb, 'organizations', ORG_A, 'members', OWNER_UID)));
-  });
-
-  it('denies a member from reading another user’s membership document', async () => {
-    await testEnv.withSecurityRulesDisabled(async (context) => {
-      await setDoc(
-        doc(context.firestore(), 'organizations', ORG_A, 'members', OWNER_UID),
-        membershipDoc(OWNER_UID, ORG_A, 'active'),
-      );
-    });
-
-    const otherDb = testEnv.authenticatedContext(OTHER_UID).firestore();
-    await assertFails(getDoc(doc(otherDb, 'organizations', ORG_A, 'members', OWNER_UID)));
+describe('firestore.rules: default deny', () => {
+  it('denies client access to any other collection', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'menus', 'menu-1')));
+      await assertFails(setDoc(doc(db, 'menus', 'menu-1'), { title: 'Tomorrow' }));
+    }
   });
 });

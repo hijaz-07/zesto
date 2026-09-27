@@ -39,7 +39,7 @@ export interface DemandLine {
 
 export type UserId = string;
 
-/** A person authenticated with Zesto. Identity comes from Firebase Auth; this is their Firestore profile. */
+/** A person authenticated with Zesto. Identity comes from Descope (`id` is the Descope user ID); this is their Firestore profile. */
 export interface User {
   id: UserId;
   displayName?: string;

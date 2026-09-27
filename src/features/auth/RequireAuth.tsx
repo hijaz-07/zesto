@@ -8,9 +8,10 @@ export interface RequireAuthProps {
 }
 
 /**
- * UX-level route guard only. It keeps signed-out users out of authenticated
- * shells, but it is not a security boundary — Firestore Security Rules and
- * backend authorization are what actually protect the data.
+ * UX-level route guard only, driven by the Descope session state behind
+ * `useAuth()`. It keeps signed-out users out of authenticated shells, but it
+ * is not a security boundary — backend validation of the Descope session
+ * token (and Firestore Security Rules) is what actually protects the data.
  */
 export function RequireAuth({ children }: RequireAuthProps) {
   const { status } = useAuth();
@@ -21,7 +22,7 @@ export function RequireAuth({ children }: RequireAuthProps) {
   }
 
   if (status === 'signedOut') {
-    return <Navigate to="/" replace state={{ from: location }} />;
+    return <Navigate to="/login" replace state={{ from: location }} />;
   }
 
   return <>{children}</>;

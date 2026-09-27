@@ -5,6 +5,7 @@ import { CustomerAppLayout } from '../layouts/CustomerAppLayout';
 import { OrganizationAppLayout } from '../layouts/OrganizationAppLayout';
 import { PublicLayout } from '../layouts/PublicLayout';
 import { HomePage } from '../pages/HomePage';
+import { LoginPage } from '../pages/LoginPage';
 
 export function AppRoutes() {
   return (
@@ -15,6 +16,14 @@ export function AppRoutes() {
           element={
             <PublicLayout>
               <HomePage />
+            </PublicLayout>
+          }
+        />
+        <Route
+          path="/login"
+          element={
+            <PublicLayout>
+              <LoginPage />
             </PublicLayout>
           }
         />
