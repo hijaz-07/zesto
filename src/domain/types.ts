@@ -77,3 +77,41 @@ export interface OrganizationMember {
 export interface OrganizationWithRole extends Organization {
   role: OrganizationMemberRole;
 }
+
+export type OutletId = string;
+
+export type OutletStatus = 'active' | 'inactive';
+
+export interface OutletAddress {
+  line1?: string;
+  line2?: string;
+  city?: string;
+  state?: string;
+  postalCode?: string;
+}
+
+export interface OutletLocation {
+  latitude: number;
+  longitude: number;
+}
+
+/**
+ * A physical point of service belonging to an `Organization`. `slug` is
+ * unique only within its organization (not globally, unlike an
+ * organization's own slug), and immutable for this first implementation.
+ */
+export interface Outlet {
+  id: OutletId;
+  organizationId: OrganizationId;
+  name: string;
+  slug: string;
+  description?: string;
+  status: OutletStatus;
+  phone?: string;
+  address?: OutletAddress;
+  location?: OutletLocation;
+  createdAt: string;
+  updatedAt: string;
+  /** The Descope user ID that created the outlet. */
+  createdBy: UserId;
+}
