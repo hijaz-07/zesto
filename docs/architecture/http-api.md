@@ -21,8 +21,11 @@ functions/src/
     logger.ts             structured request logging
   routes/
     me.ts                GET /me
+    organizations.ts     POST /organizations, GET /organizations
   domain/
     users.ts             users/{userId} profile: schema + get-or-create
+    organizations.ts     organizations/*, organizationSlugs/*, and the
+                         owner-membership write side of organizations/*/members
   auth/
     session.ts           verifyDescopeSession / authenticateRequest
     membership.ts         organization role authorization (unrelated to /me)
@@ -80,9 +83,11 @@ no cacheable, non-personal responses yet. A 401 response additionally gets
 
 | Status | `error.code`          | Meaning |
 | ------ | --------------------- | ------- |
+| 400    | `invalid_argument`    | The request body failed validation (e.g. `POST /organizations` with a bad `name`/`slug`). |
 | 401    | `unauthenticated`      | Missing, malformed, expired, or wrong-audience session token. |
 | 404    | `not_found`            | No route registered for the path. |
 | 405    | `method_not_allowed`   | The path exists, but not for this method (`Allow` header lists what does). |
+| 409    | `already_exists`       | `POST /organizations` with a `slug` that is already taken. |
 | 500    | `internal`             | An unhandled exception in a route handler (e.g. a malformed stored Firestore document). The client never sees the underlying detail. |
 | 503    | `unavailable`          | An infrastructure failure while validating the session (see below) — **not** the caller's fault. |
 
@@ -130,6 +135,79 @@ silently write to production Firestore.
   Admin SDK bypasses Firestore rules, so this is the only validation a
   stored document gets); a malformed document raises a plain `Error`, which
   `handleRequest` turns into a generic 500 without leaking the detail.
+
+## Organizations
+
+`POST /organizations` and `GET /organizations` (`functions/src/routes/organizations.ts`
++ `functions/src/domain/organizations.ts`) are the first organization/tenant
+endpoints. See [domain-model.md](./domain-model.md#organization) for the
+entity and `functions/src/auth/membership.ts` for the tenant-role
+authorization future organization-scoped endpoints will build on.
+
+### `POST /organizations`
+
+Request body (validated with Zod; any other field, e.g. `ownerId`, `userId`,
+`createdBy`, `role`, `status`, `id`, is ignored — never treated as authority):
+
+```jsonc
+{ "name": "Test Canteen", "slug": "test-canteen" }
+```
+
+- `name`: trimmed, 1-100 characters.
+- `slug`: 3-50 characters, matching `^[a-z0-9]+(-[a-z0-9]+)*$` — lowercase
+  letters, digits, and single hyphens only. The backend validates this
+  strictly and never lowercases or otherwise slugifies the input itself.
+  **The slug is immutable for this first implementation** — there is no
+  slug-edit endpoint. A future slug-change feature will need its own atomic
+  reservation migration (release the old `organizationSlugs/{oldSlug}` doc
+  and create the new one in the same transaction that updates the
+  organization), not an in-place field edit.
+
+The authenticated caller (from the verified Descope session — never the
+request body) always becomes the organization's `createdBy` and its sole
+`owner`/`active` member. Success: `201` with
+
+```jsonc
+{
+  "data": {
+    "organization": { "id": "...", "name": "...", "slug": "...", "createdAt": "...", "createdBy": "..." },
+    "membership": { "userId": "...", "organizationId": "...", "role": "owner", "status": "active", "createdAt": "..." }
+  }
+}
+```
+
+Errors: `400 invalid_argument` (bad `name`/`slug`), `401 unauthenticated`,
+`409 already_exists` (slug already taken), `503 unavailable`.
+
+The organization document, the `organizationSlugs/{slug}` uniqueness
+reservation, and the owner membership are created in **one Firestore
+transaction** (`createOrganization`): it pre-allocates the organization's
+auto-ID, reads the slug reservation, and aborts with `already-exists` before
+writing anything if the slug is taken — so a slug conflict never leaves a
+partial organization behind.
+
+### `GET /organizations`
+
+Returns the organizations where the caller has an **active** membership —
+never `invited`/`revoked` memberships, and never an organization the caller
+has no membership in. `200` with
+
+```jsonc
+{ "data": { "organizations": [ { "id": "...", "name": "...", "slug": "...", "createdAt": "...", "createdBy": "...", "role": "owner" } ] } }
+```
+
+ordered by the caller's membership `createdAt` ascending; `[]` if the caller
+belongs to no organization. Implemented as a **collection-group query** over
+every `organizations/*/members` subcollection
+(`.where('userId','==',uid).where('status','==','active').orderBy('createdAt','asc')`),
+then a single batched `db.getAll(...)` of the matched organizations —
+`members` stays the one source of truth for tenant access, rather than a
+denormalized list that could drift. Requires the composite index in
+`firestore.indexes.json` (`members`, `COLLECTION_GROUP`, `userId` +
+`status` + `createdAt`). If an active membership ever points at a missing or
+malformed organization document, the request fails with a generic `500`
+(logged with its `requestId`, detail never returned to the client) rather
+than silently omitting it.
 
 ## Local emulator setup
 

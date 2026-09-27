@@ -40,8 +40,28 @@ rules_version = '2';
 // through the `members` subcollection below, never through this document.
 //
 // Collection: organizations
-// Document ID: {organizationId}
+// Document ID: {organizationId} — a Firestore auto-ID.
+// Fields:
+//   - id: string (required, immutable) — must equal the document id.
+//   - name: string (required, 1-100 chars)
+//   - slug: string (required, immutable for this first implementation) —
+//     lowercase letters/digits/hyphens, 3-50 chars, globally unique (see
+//     organizationSlugs below).
+//   - createdAt: timestamp (required, immutable)
+//   - createdBy: string (required, immutable) — the Descope user ID that
+//     created the organization. Not necessarily the current owner if
+//     ownership is ever transferred (a future requirement) — current
+//     ownership is always read from the members subcollection below.
 // Provisioned by trusted backend code only.
+//
+// Collection: organizationSlugs
+// Document ID: {slug} — the reserved slug itself.
+// Fields:
+//   - organizationId: string (required, immutable)
+//   - createdAt: timestamp (required, immutable)
+// Exists solely so organization creation can atomically check-and-reserve a
+// slug inside one Firestore transaction (functions/src/domain/organizations.ts).
+// Never read or written directly by clients.
 //
 // Subcollection: organizations/{organizationId}/members
 // Document ID: {memberId} — the member's Descope user ID.
@@ -75,6 +95,14 @@ service cloud.firestore {
       match /members/{memberId} {
         allow read, write: if false;
       }
+    }
+
+    // Slug uniqueness reservation for organization creation. Backend-only,
+    // always — a client must never be able to reserve or discover a slug
+    // outside the atomic transaction in
+    // functions/src/domain/organizations.ts.
+    match /organizationSlugs/{slug} {
+      allow read, write: if false;
     }
 
     // -----------------------------------------------------------

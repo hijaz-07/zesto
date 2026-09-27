@@ -53,7 +53,11 @@ export type OrganizationId = string;
 export interface Organization {
   id: OrganizationId;
   name: string;
+  /** Globally unique, immutable for this first implementation. */
+  slug: string;
   createdAt: string;
+  /** The Descope user ID that created the organization; not necessarily the current owner. */
+  createdBy: UserId;
 }
 
 /** A member's standing within one organization. Roles are tenant-scoped, never a global claim. */

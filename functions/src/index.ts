@@ -9,6 +9,7 @@ import {logRequest, logUnhandledError} from "./http/logger";
 import {normalizePath} from "./http/router";
 import type {ApiResult, NormalizedRequest} from "./http/types";
 import {createMeRoutes} from "./routes/me";
+import {createOrganizationRoutes} from "./routes/organizations";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
@@ -16,7 +17,10 @@ import {createMeRoutes} from "./routes/me";
 // per-function limit. See functions/README or Firebase docs for details.
 setGlobalOptions({maxInstances: 10});
 
-const ROUTES = [...createMeRoutes({db: getAdminFirestore()})];
+const ROUTES = [
+  ...createMeRoutes({db: getAdminFirestore()}),
+  ...createOrganizationRoutes({db: getAdminFirestore()}),
+];
 
 /**
  * @param {Request} request The incoming Express-compatible request.

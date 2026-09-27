@@ -25,6 +25,19 @@ A business entity on the platform — a canteen, café, restaurant, or
 college food outlet operator. An `Organization` owns one or more
 `Outlet`s and is the billing/subscription unit.
 
+The first implementation (`functions/src/domain/organizations.ts`,
+[http-api.md](./http-api.md#organizations)) keeps this minimal: `id`
+(Firestore auto-ID), `name`, `slug`, `createdAt`, `createdBy`. `slug` is
+globally unique and **immutable for now** — reserved atomically via
+`organizationSlugs/{slug}` in the same transaction that creates the
+organization and its owner membership, so no organization or membership is
+ever created without a reserved slug, or vice versa. `createdBy` records who
+created the organization; it is not necessarily the current owner, since
+ownership (an `OrganizationMember` with `role: 'owner'`) could in principle
+be transferred later. No `status` field exists yet — every organization that
+exists is implicitly active — and no billing/subscription/outlet fields
+exist yet either; those are future requirements, not part of this feature.
+
 ### OrganizationMember
 A `User` granted a role (e.g. owner, manager, staff) within an
 `Organization`. Roles determine which organization capabilities

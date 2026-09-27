@@ -145,6 +145,48 @@ describe('firestore.rules: organizations/{organizationId}/members/{memberId}', (
   });
 });
 
+describe('firestore.rules: organizationSlugs/{slug}', () => {
+  const SLUG = 'test-canteen';
+
+  it('denies all client reads, even of a slug reservation the caller created the organization for', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), 'organizationSlugs', SLUG), {
+        organizationId: ORG_A,
+        createdAt: Timestamp.now(),
+      });
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizationSlugs', SLUG)));
+    }
+  });
+
+  it('denies a client reserving a slug directly, bypassing organization creation', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(doc(db, 'organizationSlugs', SLUG), {
+          organizationId: ORG_A,
+          createdAt: Timestamp.now(),
+        }),
+      );
+    }
+  });
+
+  it('denies all client updates and deletes', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), 'organizationSlugs', SLUG), {
+        organizationId: ORG_A,
+        createdAt: Timestamp.now(),
+      });
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'organizationSlugs', SLUG), { organizationId: 'org-attacker' }));
+      await assertFails(deleteDoc(doc(db, 'organizationSlugs', SLUG)));
+    }
+  });
+});
+
 describe('firestore.rules: default deny', () => {
   it('denies client access to any other collection', async () => {
     for (const db of Object.values(clients())) {
