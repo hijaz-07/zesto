@@ -281,6 +281,68 @@ describe("verifyDescopeSession: invalid sessions", () => {
   });
 });
 
+describe("verifyDescopeSession: infrastructure failures", () => {
+  /**
+   * The Descope Node SDK collapses every `validateSession` failure into a
+   * generic `Error` whose message embeds the original error's stringified
+   * form (see `session.ts`'s `TOKEN_REJECTION_PATTERNS` comment) — this
+   * reproduces that shape for a validator failure that is NOT the token's
+   * fault, e.g. a network error fetching Descope's signing keys.
+   *
+   * @param {string} innerErrorString The stringified inner error to embed.
+   * @return {SessionValidator} A validator that fails this way.
+   */
+  function validatorFailingWith(innerErrorString: string): SessionValidator {
+    return {
+      validateSession: vi.fn(async () => {
+        throw new Error(`session validation failed. Error: ${innerErrorString}`);
+      }),
+    };
+  }
+
+  it.each([
+    "FetchError: request to https://api.descope.com/v2/keys/P-test failed",
+    "TypeError: fetch failed",
+    "SyntaxError: Unexpected token < in JSON at position 0",
+    "AggregateError: connection failed",
+  ])(
+    "reports 503 unavailable, not 401, when validation fails with: %s",
+    async (innerErrorString) => {
+      const validator = validatorFailingWith(innerErrorString);
+
+      const error = await rejection(
+        verifyDescopeSession(signJwt(sessionClaims()), validator),
+      );
+
+      expect(error.code).toBe("unavailable");
+      expect(error.httpErrorCode.status).toBe(503);
+      // Generic message only — the inner error is not leaked to the client.
+      expect(error.message).not.toContain(innerErrorString);
+    },
+  );
+
+  it.each([
+    "JWTExpired: \"exp\" claim timestamp check failed",
+    "JWSSignatureVerificationFailed: signature verification failed",
+    "JWSInvalid: Invalid Compact JWS",
+    "JWTClaimValidationFailed: unexpected \"aud\" claim value",
+    "Error: header.kid must not be empty",
+    "Error: failed to fetch matching key",
+  ])(
+    "still reports 401, not 503, for a token-rejection error: %s",
+    async (innerErrorString) => {
+      const validator = validatorFailingWith(innerErrorString);
+
+      const error = await rejection(
+        verifyDescopeSession(signJwt(sessionClaims()), validator),
+      );
+
+      expect(error.code).toBe("unauthenticated");
+      expect(error.httpErrorCode.status).toBe(401);
+    },
+  );
+});
+
 describe("authenticateRequest", () => {
   it("validates the bearer token from the Authorization header", async () => {
     const token = signJwt(sessionClaims());

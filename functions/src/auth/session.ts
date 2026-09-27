@@ -43,6 +43,43 @@ export interface VerifiedSession {
 export type SessionValidator = Pick<DescopeSdk, "validateSession">;
 
 /**
+ * The Descope Node SDK's `validateSession` collapses every failure — a
+ * rejected token AND an infrastructure failure while validating it (e.g. it
+ * could not fetch Descope's signing keys) — into one generic `Error`, whose
+ * message embeds the original error's stringified name (see
+ * `@descope/node-sdk`'s `validateSession`/`getKey`). These substrings are
+ * the only signal available to tell "the token was rejected" apart from "we
+ * couldn't validate it right now": every one of jose's JWT-content error
+ * classes (expired, bad signature, malformed, disallowed algorithm, wrong
+ * claim), plus this SDK's own "no matching signing key" / "malformed kid"
+ * messages, which mean the keys WERE fetched successfully. Anything else —
+ * a network/DNS failure, a timeout, or a bad response fetching Descope's
+ * signing keys — does not match and is treated as an infrastructure failure.
+ */
+const TOKEN_REJECTION_PATTERNS: readonly RegExp[] = [
+  /JWTExpired/,
+  /JWTClaimValidationFailed/,
+  /JWSSignatureVerificationFailed/,
+  /JWSInvalid/,
+  /JWTInvalid/,
+  /JOSEAlgNotAllowed/,
+  /JOSENotSupported/,
+  /JWKInvalid/,
+  /header\.kid must not be empty/,
+  /failed to fetch matching key/,
+];
+
+/**
+ * @param {unknown} error An error thrown by `SessionValidator.validateSession`.
+ * @return {boolean} Whether it indicates the token itself was rejected, as
+ *   opposed to an infrastructure failure while validating it.
+ */
+function isTokenRejection(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return TOKEN_REJECTION_PATTERNS.some((pattern) => pattern.test(message));
+}
+
+/**
  * Extracts the token from an `Authorization: Bearer <token>` header value.
  *
  * @param {string | undefined} header The raw Authorization header value.
@@ -69,8 +106,13 @@ function hasAudience(aud: unknown, expected: string): boolean {
  * @param {SessionValidator} validator Descope client (defaults to the shared
  *   client; injectable for tests).
  * @return {Promise<VerifiedSession>} The verified caller identity.
- * @throws {HttpsError} `unauthenticated` if the token is missing, invalid,
- *   expired, issued for another audience, or has no subject.
+ * @throws {HttpsError} `unauthenticated` (401) if the token is missing,
+ *   invalid, expired, issued for another audience, or has no subject.
+ * @throws {HttpsError} `unavailable` (503) if the session could not be
+ *   validated due to an infrastructure failure (e.g. Descope's signing
+ *   keys could not be fetched) rather than a rejected token. Callers must
+ *   not treat this as an authentication failure — in particular, the
+ *   frontend must not sign the user out because of it.
  * @throws {Error} If `DESCOPE_PROJECT_ID` is not configured (a server
  *   misconfiguration, deliberately not reported as a client auth failure).
  */
@@ -87,14 +129,25 @@ export async function verifyDescopeSession(
     "unauthenticated",
     "The session is invalid or has expired.",
   );
+  const serviceUnavailable = () => new HttpsError(
+    "unavailable",
+    "The session could not be validated right now. Please try again.",
+  );
 
   let authInfo: AuthenticationInfo;
   try {
     authInfo = await validator.validateSession(sessionToken, {
       audience: expectedAudience,
     });
-  } catch {
-    throw invalidSession();
+  } catch (error) {
+    // A validator that already throws HttpsError (the real Descope SDK
+    // never does — see TOKEN_REJECTION_PATTERNS — but a test double
+    // legitimately might) has already made this call; respect it as-is
+    // instead of reclassifying it by message text.
+    if (error instanceof HttpsError) {
+      throw error;
+    }
+    throw isTokenRejection(error) ? invalidSession() : serviceUnavailable();
   }
 
   // Defense in depth: enforce the audience here too, rather than relying
@@ -121,8 +174,10 @@ export async function verifyDescopeSession(
  * @param {{headers: {authorization?: string}}} request The incoming request.
  * @param {SessionValidator} validator Descope client (injectable for tests).
  * @return {Promise<VerifiedSession>} The verified caller identity.
- * @throws {HttpsError} `unauthenticated` if the session cannot be verified;
- *   handlers should respond with `error.httpErrorCode.status` (401).
+ * @throws {HttpsError} `unauthenticated` (401) if the session is rejected,
+ *   or `unavailable` (503) if it could not be validated right now (see
+ *   `verifyDescopeSession`). Handlers should respond with
+ *   `error.httpErrorCode.status` either way.
  */
 export async function authenticateRequest(
   request: {headers: {authorization?: string}},

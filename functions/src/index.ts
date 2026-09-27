@@ -1,32 +1,86 @@
-/**
- * Import function triggers from their respective submodules:
- *
- * import {onCall} from "firebase-functions/v2/https";
- * import {onDocumentWritten} from "firebase-functions/v2/firestore";
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
- */
-
+import {randomUUID} from "node:crypto";
 import {setGlobalOptions} from "firebase-functions";
-// import {onRequest} from "firebase-functions/https";
-// import * as logger from "firebase-functions/logger";
-
-// Start writing functions
-// https://firebase.google.com/docs/functions/typescript
+import {onRequest, type Request} from "firebase-functions/v2/https";
+import type {Response} from "express";
+import {getAdminFirestore} from "./firebaseAdmin";
+import {toResponseBody} from "./http/envelope";
+import {handleRequest} from "./http/handleRequest";
+import {logRequest, logUnhandledError} from "./http/logger";
+import {normalizePath} from "./http/router";
+import type {ApiResult, NormalizedRequest} from "./http/types";
+import {createMeRoutes} from "./routes/me";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
 // traffic spikes by instead downgrading performance. This limit is a
-// per-function limit. You can override the limit for each function using the
-// `maxInstances` option in the function's options, e.g.
-// `onRequest({ maxInstances: 5 }, (req, res) => { ... })`.
-// NOTE: setGlobalOptions does not apply to functions using the v1 API. V1
-// functions should each use functions.runWith({ maxInstances: 10 }) instead.
-// In the v1 API, each function can only serve one request per container, so
-// this will be the maximum concurrent request count.
+// per-function limit. See functions/README or Firebase docs for details.
 setGlobalOptions({maxInstances: 10});
 
-// export const helloWorld = onRequest((request, response) => {
-//   logger.info("Hello logs!", {structuredData: true});
-//   response.send("Hello from Firebase!");
-// });
+const ROUTES = [...createMeRoutes({db: getAdminFirestore()})];
+
+/**
+ * @param {Request} request The incoming Express-compatible request.
+ * @return {NormalizedRequest} The request reduced to the router's contract.
+ */
+function toNormalizedRequest(request: Request): NormalizedRequest {
+  return {
+    method: request.method,
+    path: normalizePath(request.path),
+    headers: request.headers,
+    query: request.query,
+    body: request.body,
+  };
+}
+
+/**
+ * Applies the headers common to every response (always `X-Request-Id` and
+ * `Cache-Control`; anything the result itself specifies, e.g. `Allow` on a
+ * 405 or `WWW-Authenticate` on a 401) and writes the enveloped JSON body.
+ *
+ * @param {Response} response The Express response to write to.
+ * @param {ApiResult} result The route's outcome.
+ * @param {string} requestId This request's ID.
+ */
+function sendResult(
+  response: Response,
+  result: ApiResult,
+  requestId: string,
+): void {
+  response.set("X-Request-Id", requestId);
+  response.set("Cache-Control", "private, no-store");
+  for (const [name, value] of Object.entries(result.headers ?? {})) {
+    response.set(name, value);
+  }
+  response.status(result.status).json(toResponseBody(result, requestId));
+}
+
+/**
+ * Zesto's HTTP API. A single Cloud Function fronting a small internal
+ * router (see `functions/src/http/router.ts`) — see
+ * docs/architecture/http-api.md for the full request/response contract.
+ */
+export const api = onRequest(
+  {region: "asia-south1"},
+  async (request, response) => {
+    const requestId = randomUUID();
+    const startedAt = Date.now();
+    const normalized = toNormalizedRequest(request);
+
+    const result: ApiResult = await handleRequest(
+      ROUTES,
+      normalized,
+      (error) => logUnhandledError(requestId, normalized.path, error),
+    );
+
+    sendResult(response, result, requestId);
+
+    logRequest({
+      requestId,
+      route: normalized.path,
+      method: normalized.method,
+      status: result.status,
+      duration: Date.now() - startedAt,
+      userId: result.userId,
+    });
+  },
+);

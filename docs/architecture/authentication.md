@@ -5,6 +5,10 @@ used for data and backend services only (Firestore, Cloud Functions,
 Storage, Hosting, Emulator Suite). Firebase Authentication is not used,
 and there is no Firebase custom-token bridge.
 
+This document covers the authentication boundary itself. For the HTTP API
+that sits behind it (routing, response envelope, `/me`), see
+[http-api.md](./http-api.md).
+
 ## Client (web / Capacitor)
 
 - `src/features/auth/AuthProvider.tsx` wraps Descope's `AuthProvider`
@@ -50,6 +54,18 @@ Every protected operation must:
 3. authorize tenant access with `requireOrganizationRole` where the
    operation is organization-scoped, and
 4. only then read or write Firestore with the Admin SDK.
+
+**401 vs 503:** `verifyDescopeSession` / `authenticateRequest` throw
+`HttpsError("unauthenticated", ...)` (→ 401) when the token itself is
+rejected — missing, malformed, expired, wrong signature, or wrong audience —
+and `HttpsError("unavailable", ...)` (→ 503) when the session could not be
+validated at all because of an infrastructure failure (e.g. Descope's
+signing keys could not be fetched). These must not be confused: a 401 means
+"this session is invalid," a 503 means "we couldn't check." In particular,
+**the frontend must never sign the user out in response to a 503** — only
+to a 401. See [http-api.md](./http-api.md#descope-401-vs-503) for how the
+distinction is actually detected (the SDK gives us only an error message to
+go on) and `functions/src/auth/session.test.ts` for both directions.
 
 **Revocation caveat:** validation is offline (signature, expiry, audience)
 and doesn't ask Descope whether a session was revoked. Signing out clears
