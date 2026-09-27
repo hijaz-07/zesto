@@ -27,12 +27,15 @@ functions/src/
     menus.ts             POST/GET .../outlets/{outletId}/menus,
                          GET/PATCH .../menus/{menuId},
                          POST .../menus/{menuId}/publish|archive
+    menuItems.ts         POST/GET .../menus/{menuId}/items,
+                         GET/PATCH/DELETE .../items/{itemId}
   domain/
     users.ts             users/{userId} profile: schema + get-or-create
     organizations.ts     organizations/*, organizationSlugs/*, and the
                          owner-membership write side of organizations/*/members
     outlets.ts           organizations/*/outlets/*, organizations/*/outletSlugs/*
     menus.ts             organizations/*/outlets/*/menus/*
+    menuItems.ts         organizations/*/outlets/*/menus/*/items/*
   auth/
     session.ts           verifyDescopeSession / authenticateRequest
     membership.ts         organization role authorization (unrelated to /me)
@@ -537,10 +540,188 @@ archived menu.
 Errors: `400 invalid_argument` (not currently published), `401
 unauthenticated`, `403 permission_denied`, `404 not_found`, `503 unavailable`.
 
-Menu items are a later step — this foundation deliberately has no
-item-related fields or endpoints. Zesto is demand-driven, not
-inventory-driven: there is no stock/inventory/remaining-quantity concept
-anywhere in the menu model (see [domain-model.md](./domain-model.md#menu)).
+## Menu items
+
+`POST`, `GET`, `PATCH`, `DELETE` on
+`/organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items[/{itemId}]`
+(`functions/src/routes/menuItems.ts` + `functions/src/domain/menuItems.ts`)
+are the first menu item endpoints. See
+[domain-model.md](./domain-model.md#menuitem) for the entity. An item
+belongs to exactly one menu; ownership always comes through the menu (and,
+transitively, the outlet), and `organizationId`/`outletId`/`menuId` (and
+`itemId`, for the single-item endpoints) come from the route's path
+parameters, never the request body. Unlike `Menu` (which duplicates its
+`organizationId`/`outletId` onto its own document), an item's document does
+**not** duplicate `organizationId`/`outletId`/`menuId` — every request
+already re-resolves and re-validates the full ancestor chain before an item
+is ever touched, so those fields would be redundant path metadata.
+
+Every item endpoint first authenticates the caller (`401`/`503` exactly as
+above), then authorizes them via `requireOrganizationRole` — identical to
+Outlet's/Menu's authorization; there is no separate outlet-level,
+menu-level, or item-level role — then confirms the route's `:outletId`
+exists and belongs to `organizationId` (`404` otherwise, via `getOutlet`),
+then confirms the route's `:menuId` exists and belongs to that outlet (`404`
+otherwise, via `getMenu`), before looking at the request body.
+
+| Role | View (`GET`) | Create/Edit (`POST`/`PATCH`) | Delete |
+| --- | --- | --- | --- |
+| `owner` | ✓ | ✓ | ✓ |
+| `manager` | ✓ | ✓ | ✓ |
+| `staff` | ✓ | ✗ (`403 permission_denied`) | ✗ (`403 permission_denied`) |
+| non-member | ✗ (`403 permission_denied`) | ✗ (`403 permission_denied`) | ✗ (`403 permission_denied`) |
+
+### Price model
+
+`priceInPaise` is always a non-negative integer number of paise — money is
+never a floating-point rupee amount (see root `CLAUDE.md`). `₹120.00` is
+`12000`; `₹99.50` is `9950`. The request body must send an actual JSON
+number (`z.number().int().min(0)`, exactly like `outlets.ts`'s `location`
+fields) — a numeric string, a decimal, or a negative value is rejected.
+There is no secondary rupee-price field, and the API always returns
+`priceInPaise` as an integer. Changing an item's price never alters the
+price already recorded on an existing order — Orders will snapshot their
+own `unitPriceInPaiseAtOrder` at order time (not part of this
+implementation; see [domain-model.md](./domain-model.md#menuitem)).
+
+### Menu-lifecycle and ordering-window gate
+
+Whether an item mutation is allowed right now depends on the **parent
+menu's** current state — checked by `routes/menuItems.ts`'s `requireMenu`
+(a non-transactional read, mirroring `requireOutlet`'s shape and accepting
+the same narrow TOCTOU race) calling two pure, independently-tested
+functions in `domain/menuItems.ts`:
+
+- `findItemMutationViolation` — governs `POST`/`PATCH` (create, edit,
+  enable/disable, reorder): a **draft** menu always allows item mutations,
+  regardless of its `orderingClosesAt` (a draft's ordering window has no
+  meaning until it is published); a **published** menu allows them only
+  until `orderingClosesAt`; an **archived** menu never allows them.
+- `findItemDeletionViolation` — stricter, governs `DELETE` only: allowed
+  **only** while the menu is currently `draft`, regardless of the ordering
+  window. A published or archived menu's item can only be disabled
+  (`PATCH {"enabled": false}`), never hard-deleted — this is how
+  historical menu/order data survives a menu going live.
+
+Reads (`GET`) are **never** gated by menu state or the ordering window —
+historical menu/item data must always remain readable, and the outlet may
+be inactive.
+
+| Endpoint | Outlet must be active? | Menu gate |
+| --- | --- | --- |
+| `POST` (create) | Yes — `400 invalid_argument` if inactive | `findItemMutationViolation` |
+| `GET` (list/one) | No | None — always readable |
+| `PATCH` (update) | Yes | `findItemMutationViolation` |
+| `DELETE` | Yes | `findItemDeletionViolation` (stricter: draft only) |
+
+A nonexistent outlet or menu, or one belonging to a different
+organization/outlet, is `404 not_found` — the same secure-not-found
+behavior Menu's own endpoints already rely on.
+
+### `POST /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items`
+
+Request body (validated with Zod; `id`, `menuId`, `enabled`, `createdBy`,
+`createdAt`, `updatedAt` are never accepted — an unrecognized field is
+ignored, not treated as authority):
+
+```jsonc
+{
+  "name": "Chicken Biriyani",
+  "description": "Aromatic chicken biriyani",
+  "priceInPaise": 12000,
+  "displayOrder": 1
+}
+```
+
+- `name`: trimmed, 1-100 characters. Not required to be unique within a
+  menu — variants (e.g. "Chicken Biriyani" vs "Chicken Biriyani + Egg") are
+  expected. `description` (≤500 chars): optional.
+- `priceInPaise`, `displayOrder`: non-negative integers (see
+  [Price model](#price-model) above).
+
+A new item always starts `enabled: true`; `createdBy` always comes from the
+verified Descope session. Like `createMenu`, this write is **not** wrapped
+in a Firestore transaction — there is no uniqueness constraint to protect.
+Success: `201` with
+
+```jsonc
+{
+  "data": {
+    "item": {
+      "id": "...", "menuId": "...", "name": "Chicken Biriyani",
+      "description": "Aromatic chicken biriyani", "priceInPaise": 12000,
+      "enabled": true, "displayOrder": 1,
+      "createdAt": "...", "updatedAt": "...", "createdBy": "..."
+    }
+  }
+}
+```
+
+Errors: `400 invalid_argument` (bad body, an inactive outlet, or the menu
+gate above), `401 unauthenticated`, `403 permission_denied`,
+`404 not_found` (no such outlet or menu), `503 unavailable`.
+
+### `GET /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items`
+
+Returns **every** item on the menu — enabled and disabled alike; this is an
+organization-management view, so disabled items are never hidden. Any
+active member (`owner`, `manager`, or `staff`) may call this, the outlet may
+be inactive, and the menu may be in any lifecycle state. `200` with
+
+```jsonc
+{ "data": { "items": [ { "id": "...", "enabled": true, "...": "..." } ] } }
+```
+
+ordered by `displayOrder` ascending, then `createdAt` ascending as a
+deterministic tie-breaker (multiple items can share a `displayOrder`) —
+this 2-field ordering requires the composite index declared in
+`firestore.indexes.json` (`items`, `COLLECTION` scope, `displayOrder` +
+`createdAt`, both ascending); `[]` if the menu has no items.
+
+### `GET /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items/{itemId}`
+
+Returns a single item. Any active member may call this, the outlet may be
+inactive, and the menu may be in any lifecycle state. `200` with the same
+shape as a single entry of the list above.
+
+Errors: `401 unauthenticated`, `403 permission_denied`, `404 not_found` (no
+such item in this menu — including an item ID that belongs to a different
+menu, outlet, or organization: this never leaks whether that ID exists
+elsewhere).
+
+### `PATCH /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items/{itemId}`
+
+Only an active `owner`/`manager` member may call this, only for an active
+outlet, and only while the menu gate above allows it. Editable fields:
+`name`, `description`, `priceInPaise`, `enabled`, `displayOrder` — every
+field is optional, but the body must contain at least one. `id`, `menuId`,
+`createdBy`, and `createdAt` can never be changed through this endpoint
+(present-but-ignored). `updatedAt` is set to the current time on every
+successful update. Success: `200` with the updated item, in the same shape
+as `POST`'s response.
+
+Errors: `400 invalid_argument` (bad body, including an empty one, an
+inactive outlet, or the menu gate above), `401 unauthenticated`,
+`403 permission_denied`, `404 not_found`, `503 unavailable`.
+
+### `DELETE /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items/{itemId}`
+
+Only an active `owner`/`manager` member may call this, only for an active
+outlet, and only while the parent menu is currently `draft` (the stricter
+`findItemDeletionViolation` gate — see above). Permanently removes the
+Firestore document; a published or archived menu's item is never silently
+disabled as a fallback — the caller must `PATCH {"enabled": false}`
+explicitly instead. Success: `200` with an empty `data` object.
+
+Errors: `400 invalid_argument` (the outlet is inactive, or the menu is not
+currently draft), `401 unauthenticated`, `403 permission_denied`,
+`404 not_found`, `503 unavailable`.
+
+Zesto is demand-driven, not inventory-driven: there is no stock/inventory/
+remaining-quantity concept anywhere in the menu or menu item model (see
+[domain-model.md](./domain-model.md#menu)). Historical order pricing (an
+`Order`'s immutable `unitPriceInPaiseAtOrder` snapshot) is a future Orders
+concern, not part of this implementation.
 
 ## Local emulator setup
 

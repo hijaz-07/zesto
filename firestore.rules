@@ -134,8 +134,40 @@ rules_version = '2';
 //     published.
 // Provisioned by trusted backend code only. Zesto is demand-driven, not
 // inventory-driven: this document deliberately has no stock/inventory/
-// remaining-quantity fields. Menu items are a later step, not part of this
-// implementation.
+// remaining-quantity fields.
+//
+// Subcollection: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items
+// Document ID: {itemId} — a Firestore auto-ID.
+// Fields:
+//   - id: string (required, immutable) — must equal the document id.
+//   - menuId: string (required, immutable) — must equal the parent menu id.
+//     Unlike Menu (which duplicates organizationId/outletId), an item does
+//     NOT duplicate organizationId/outletId/menuId's own ancestors — see
+//     functions/src/domain/menuItems.ts.
+//   - name: string (required, 1-100 chars). Not required to be unique
+//     within a menu — variants (e.g. "Chicken Biriyani" vs "Chicken
+//     Biriyani + Egg") are expected.
+//   - description: string (optional, 0-500 chars)
+//   - priceInPaise: number (required, non-negative integer) — money is
+//     always integer paise, never a floating-point rupee amount (see root
+//     CLAUDE.md). Changing an item's price never alters the price already
+//     recorded on an existing order (Orders will snapshot their own price
+//     at order time; not part of this implementation).
+//   - enabled: boolean (required, defaults true) — whether customers may
+//     currently order this item, independent of any inventory concept
+//     (Zesto has none). Disabling is how an organization temporarily makes
+//     a published menu's item unavailable without destroying it.
+//   - displayOrder: number (required, non-negative integer)
+//   - createdAt, updatedAt: timestamp (required)
+//   - createdBy: string (required, immutable) — the Descope user ID that
+//     created the item.
+// Provisioned by trusted backend code only. A hard delete
+// (functions/src/domain/menuItems.ts's deleteMenuItem) is only ever
+// permitted while the parent menu is still 'draft' — a published or
+// archived menu's item can only be disabled (enabled: false), never
+// deleted, so historical menu/order data is never destroyed. Zesto is
+// demand-driven, not inventory-driven: this document deliberately has no
+// stock/inventory/remaining-quantity fields.
 //
 // ===============================================================
 
@@ -163,6 +195,11 @@ service cloud.firestore {
         // Menus belonging to this outlet. Backend-only, always.
         match /menus/{menuId} {
           allow read, write: if false;
+
+          // Items belonging to this menu. Backend-only, always.
+          match /items/{itemId} {
+            allow read, write: if false;
+          }
         }
       }
 

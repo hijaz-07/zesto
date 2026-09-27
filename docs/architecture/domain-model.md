@@ -84,9 +84,9 @@ arbitrary `PATCH` of `status`), `orderingOpensAt`, `orderingClosesAt`,
 `pickupStartsAt`, `pickupEndsAt`, `createdAt`, `updatedAt`, `createdBy`,
 `publishedAt`. Zesto's business time zone is hardcoded to Asia/Kolkata
 for v1 (`functions/src/time.ts`) — there is no per-outlet time zone
-field yet. `MenuItem` is **not** part of this implementation; menu
-items are a later step. There is no stock/inventory/remaining-quantity
-concept anywhere in this model, matching Zesto's demand-driven design
+field yet. See "MenuItem" below for how items attach to a menu. There is
+no stock/inventory/remaining-quantity concept anywhere in this model,
+matching Zesto's demand-driven design
 (see "How these fit the demand-driven model" below) — quantity is
 introduced later, at the `Order`/`OrderItem` level, as demand rather
 than a reservation against this menu.
@@ -97,6 +97,35 @@ display order, and an enabled/disabled flag. Business rules must
 protect historical orders when menu item data changes: changing a
 menu item's price, for example, must never alter the price already
 recorded on an existing `Order`.
+
+The first implementation (`functions/src/domain/menuItems.ts`,
+[http-api.md](./http-api.md#menu-items)) keeps this minimal: `id`
+(Firestore auto-ID), `menuId`, `name`, `description`, `priceInPaise`,
+`enabled`, `displayOrder`, `createdAt`, `updatedAt`, `createdBy`. Unlike
+`Menu` (which duplicates its own `organizationId`/`outletId`), an item does
+**not** duplicate `organizationId`/`outletId`/`menuId`'s ancestors onto the
+document — every request already re-resolves and re-validates the full
+organization → outlet → menu chain before an item is ever touched, so
+those fields would be redundant path metadata rather than load-bearing
+data. `priceInPaise` is always a non-negative integer number of paise,
+never a floating-point rupee amount (see root `CLAUDE.md`) — there is no
+secondary rupee-price field. `name` is not required to be unique within a
+menu (variants like "Chicken Biriyani" vs "Chicken Biriyani + Egg" are
+expected). `enabled` defaults `true` and is independent of any inventory
+concept (Zesto has none) — it is how an organization temporarily makes a
+published menu's item unavailable without destroying it. No image field
+exists yet (a later, separate capability).
+
+Whether an item can be created, edited, enabled/disabled, or reordered
+depends on its parent menu's lifecycle state and ordering window: always
+allowed on a `draft` menu; allowed on a `published` menu only until
+`orderingClosesAt`; never allowed on an `archived` menu. Hard deletion is
+stricter still — allowed **only** while the parent menu is `draft`,
+regardless of the ordering window; once a menu is published, an item can
+only be disabled (`enabled: false`), never deleted, so historical menu/
+order data is never destroyed. Reads are never gated by any of this.
+Only an organization's `owner`/`manager` may create, edit, or delete an
+item; any active member (including `staff`) may view it.
 
 ### Order
 A customer's pre-order against a specific `Menu`. An `Order` records

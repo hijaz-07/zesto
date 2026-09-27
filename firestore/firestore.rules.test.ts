@@ -268,6 +268,101 @@ describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/men
   });
 });
 
+describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/items/{itemId}', () => {
+  const OUTLET_ID = 'outlet-1';
+  const MENU_ID = 'menu-1';
+  const ITEM_ID = 'item-1';
+
+  function menuDoc(menuId: string, outletId: string, organizationId: string) {
+    return {
+      id: menuId,
+      organizationId,
+      outletId,
+      menuDate: '2026-09-28',
+      title: 'Tuesday Special Menu',
+      status: 'draft',
+      orderingOpensAt: Timestamp.now(),
+      orderingClosesAt: Timestamp.now(),
+      pickupStartsAt: Timestamp.now(),
+      pickupEndsAt: Timestamp.now(),
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+      createdBy: USER_ID,
+    };
+  }
+
+  function itemDoc(itemId: string, menuId: string) {
+    return {
+      id: itemId,
+      menuId,
+      name: 'Chicken Biriyani',
+      priceInPaise: 12000,
+      enabled: true,
+      displayOrder: 1,
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+      createdBy: USER_ID,
+    };
+  }
+
+  it('denies a client reading an item even when the caller has an active membership and the outlet/menu exist', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID),
+        outletDoc(OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID),
+        menuDoc(MENU_ID, OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID),
+        itemDoc(ITEM_ID, MENU_ID),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        getDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID)),
+      );
+    }
+  });
+
+  it('denies all client writes', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(
+          doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID),
+          itemDoc(ITEM_ID, MENU_ID),
+        ),
+      );
+    }
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID),
+        itemDoc(ITEM_ID, MENU_ID),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        updateDoc(
+          doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID),
+          { enabled: false },
+        ),
+      );
+      await assertFails(
+        deleteDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'items', ITEM_ID)),
+      );
+    }
+  });
+});
+
 describe('firestore.rules: organizations/{organizationId}/outletSlugs/{slug}', () => {
   const SLUG = 'main-canteen';
 
