@@ -67,10 +67,29 @@ work at one location rather than across the whole organization.
 ### Menu
 A menu normally represents a **future** planned service for a
 specific `menuDate` at an `Outlet` — commonly tomorrow's menu. A menu
-has a lifecycle state (draft → published → ordering open → ordering
-closed) and a schedule: when it was/will be published, when ordering
-opens, when ordering closes, and the pickup window. A menu owns a list
-of `MenuItem`s.
+has a 3-state lifecycle (draft → published → archived) and a
+schedule: when ordering opens, when ordering closes, and the pickup
+window. "Ordering open" vs. "ordering closed" is not a separate stored
+state — it is computed from the current time against
+`orderingOpensAt`/`orderingClosesAt`, never persisted. A menu owns a
+list of `MenuItem`s.
+
+The first implementation (`functions/src/domain/menus.ts`,
+[http-api.md](./http-api.md#menus)) keeps this minimal: `id` (Firestore
+auto-ID), `organizationId`, `outletId`, `menuDate` (a calendar date
+string, `YYYY-MM-DD`, not a timestamp), `title`, `description`,
+`status` (`draft`/`published`/`archived`, only `draft → published →
+archived` allowed, each an explicit lifecycle action — never an
+arbitrary `PATCH` of `status`), `orderingOpensAt`, `orderingClosesAt`,
+`pickupStartsAt`, `pickupEndsAt`, `createdAt`, `updatedAt`, `createdBy`,
+`publishedAt`. Zesto's business time zone is hardcoded to Asia/Kolkata
+for v1 (`functions/src/time.ts`) — there is no per-outlet time zone
+field yet. `MenuItem` is **not** part of this implementation; menu
+items are a later step. There is no stock/inventory/remaining-quantity
+concept anywhere in this model, matching Zesto's demand-driven design
+(see "How these fit the demand-driven model" below) — quantity is
+introduced later, at the `Order`/`OrderItem` level, as demand rather
+than a reservation against this menu.
 
 ### MenuItem
 A single dish offered on a `Menu` — name, description, price, image,

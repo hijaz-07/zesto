@@ -189,6 +189,43 @@ function parseOutlet(
 }
 
 /**
+ * Reads a single outlet, validating it belongs to `organizationId`. The
+ * read-only half of what `updateOutlet` already does — used by other
+ * domain modules (e.g. `domain/menus.ts`, via `routes/menus.ts`) that need
+ * to confirm an outlet exists and inspect its `status` before proceeding,
+ * without needing to mutate it.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {string} organizationId The organization the outlet must belong to
+ *   (already authorized by the caller).
+ * @param {unknown} outletId The outlet's document ID, from the request path.
+ * @return {Promise<Outlet>} The outlet.
+ * @throws {HttpsError} `invalid-argument` (400) if `outletId` is not a
+ *   well-formed document ID.
+ * @throws {HttpsError} `not-found` (404) if no such outlet exists in this
+ *   organization.
+ */
+export async function getOutlet(
+  db: Firestore,
+  organizationId: string,
+  outletId: unknown,
+): Promise<Outlet> {
+  if (!isValidDocumentId(outletId)) {
+    throw new HttpsError("invalid-argument", "Invalid outlet ID.");
+  }
+
+  const snapshot = await db
+    .collection("organizations").doc(organizationId)
+    .collection("outlets").doc(outletId)
+    .get();
+  if (!snapshot.exists) {
+    throw new HttpsError("not-found", "Outlet not found.");
+  }
+
+  return parseOutlet(snapshot.data(), outletId, organizationId);
+}
+
+/**
  * @param {Outlet} outlet A stored outlet.
  * @return {OutletResponse} The API response shape for it.
  */

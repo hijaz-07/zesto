@@ -199,6 +199,75 @@ describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}', (
   });
 });
 
+describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}', () => {
+  const OUTLET_ID = 'outlet-1';
+  const MENU_ID = 'menu-1';
+
+  function menuDoc(menuId: string, outletId: string, organizationId: string) {
+    return {
+      id: menuId,
+      organizationId,
+      outletId,
+      menuDate: '2026-09-28',
+      title: 'Tuesday Special Menu',
+      status: 'draft',
+      orderingOpensAt: Timestamp.now(),
+      orderingClosesAt: Timestamp.now(),
+      pickupStartsAt: Timestamp.now(),
+      pickupEndsAt: Timestamp.now(),
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+      createdBy: USER_ID,
+    };
+  }
+
+  it('denies a client reading a menu even when the caller has an active membership and the outlet exists', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID),
+        outletDoc(OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID),
+        menuDoc(MENU_ID, OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID)));
+    }
+  });
+
+  it('denies all client writes', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(
+          doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID),
+          menuDoc(MENU_ID, OUTLET_ID, ORG_A),
+        ),
+      );
+    }
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID),
+        menuDoc(MENU_ID, OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        updateDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID), { status: 'published' }),
+      );
+      await assertFails(deleteDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID)));
+    }
+  });
+});
+
 describe('firestore.rules: organizations/{organizationId}/outletSlugs/{slug}', () => {
   const SLUG = 'main-canteen';
 

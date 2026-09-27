@@ -9,6 +9,7 @@ import {logRequest, logUnhandledError} from "./http/logger";
 import {normalizePath} from "./http/router";
 import type {ApiResult, NormalizedRequest} from "./http/types";
 import {createMeRoutes} from "./routes/me";
+import {createMenuRoutes} from "./routes/menus";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
 
@@ -22,6 +23,7 @@ const ROUTES = [
   ...createMeRoutes({db: getAdminFirestore()}),
   ...createOrganizationRoutes({db: getAdminFirestore()}),
   ...createOutletRoutes({db: getAdminFirestore()}),
+  ...createMenuRoutes({db: getAdminFirestore()}),
 ];
 
 /**

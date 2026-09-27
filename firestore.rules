@@ -106,6 +106,37 @@ rules_version = '2';
 // (functions/src/domain/outlets.ts) — the same pattern organizationSlugs
 // uses for global uniqueness. Never read or written directly by clients.
 //
+// Subcollection: organizations/{organizationId}/outlets/{outletId}/menus
+// Document ID: {menuId} — a Firestore auto-ID.
+// Fields:
+//   - id: string (required, immutable) — must equal the document id.
+//   - organizationId: string (required, immutable) — must equal the parent
+//     organization id.
+//   - outletId: string (required, immutable) — must equal the parent
+//     outlet id.
+//   - menuDate: string (required) — the food-service calendar date,
+//     "YYYY-MM-DD". Zesto's business time zone is Asia/Kolkata (hardcoded
+//     for v1; see functions/src/time.ts).
+//   - title: string (required, 1-100 chars)
+//   - description: string (optional, 0-500 chars)
+//   - status: string (required) — one of 'draft' | 'published' | 'archived'.
+//     Only 'draft' -> 'published' -> 'archived' transitions are allowed,
+//     each an explicit backend action (functions/src/domain/menus.ts's
+//     publishMenu/archiveMenu) — never an arbitrary client PATCH of status.
+//   - orderingOpensAt, orderingClosesAt, pickupStartsAt, pickupEndsAt:
+//     timestamp (required) — the ordering and pickup windows. See
+//     functions/src/domain/menus.ts's findScheduleViolation for the
+//     relational rules these must satisfy.
+//   - createdAt, updatedAt: timestamp (required)
+//   - createdBy: string (required, immutable) — the Descope user ID that
+//     created the menu.
+//   - publishedAt: timestamp (optional) — set only once, when the menu is
+//     published.
+// Provisioned by trusted backend code only. Zesto is demand-driven, not
+// inventory-driven: this document deliberately has no stock/inventory/
+// remaining-quantity fields. Menu items are a later step, not part of this
+// implementation.
+//
 // ===============================================================
 
 service cloud.firestore {
@@ -128,6 +159,11 @@ service cloud.firestore {
       // Outlets belonging to this organization. Backend-only, always.
       match /outlets/{outletId} {
         allow read, write: if false;
+
+        // Menus belonging to this outlet. Backend-only, always.
+        match /menus/{menuId} {
+          allow read, write: if false;
+        }
       }
 
       // Per-organization outlet-slug uniqueness reservation. Backend-only,
