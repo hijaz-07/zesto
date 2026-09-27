@@ -2,7 +2,7 @@ import { IonRouterOutlet } from '@ionic/react';
 import { Route, Routes } from 'react-router-dom';
 import { RequireAuth } from '../features/auth/RequireAuth';
 import { CustomerAppLayout } from '../layouts/CustomerAppLayout';
-import { OrganizationAppLayout } from '../layouts/OrganizationAppLayout';
+import { OrganizationGate } from '../layouts/OrganizationGate';
 import { PublicLayout } from '../layouts/PublicLayout';
 import { HomePage } from '../pages/HomePage';
 import { LoginPage } from '../pages/LoginPage';
@@ -39,7 +39,7 @@ export function AppRoutes() {
           path="/org/*"
           element={
             <RequireAuth>
-              <OrganizationAppLayout />
+              <OrganizationGate />
             </RequireAuth>
           }
         />

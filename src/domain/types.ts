@@ -72,3 +72,8 @@ export interface OrganizationMember {
   status: OrganizationMemberStatus;
   createdAt: string;
 }
+
+/** One row of `GET /organizations`: an organization plus the caller's role in it. */
+export interface OrganizationWithRole extends Organization {
+  role: OrganizationMemberRole;
+}
