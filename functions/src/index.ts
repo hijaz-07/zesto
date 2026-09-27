@@ -10,6 +10,7 @@ import {normalizePath} from "./http/router";
 import type {ApiResult, NormalizedRequest} from "./http/types";
 import {createMeRoutes} from "./routes/me";
 import {createOrganizationRoutes} from "./routes/organizations";
+import {createOutletRoutes} from "./routes/outlets";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
@@ -20,6 +21,7 @@ setGlobalOptions({maxInstances: 10});
 const ROUTES = [
   ...createMeRoutes({db: getAdminFirestore()}),
   ...createOrganizationRoutes({db: getAdminFirestore()}),
+  ...createOutletRoutes({db: getAdminFirestore()}),
 ];
 
 /**

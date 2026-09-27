@@ -38,6 +38,19 @@ function membershipDoc(uid: string, organizationId: string) {
   };
 }
 
+function outletDoc(outletId: string, organizationId: string) {
+  return {
+    id: outletId,
+    organizationId,
+    name: 'Main Canteen',
+    slug: 'main-canteen',
+    status: 'active',
+    createdAt: Timestamp.now(),
+    updatedAt: Timestamp.now(),
+    createdBy: USER_ID,
+  };
+}
+
 function clients() {
   return {
     unauthenticated: testEnv.unauthenticatedContext().firestore(),
@@ -141,6 +154,77 @@ describe('firestore.rules: organizations/{organizationId}/members/{memberId}', (
 
     for (const db of Object.values(clients())) {
       await assertFails(updateDoc(doc(db, 'organizations', ORG_A, 'members', USER_ID), { role: 'manager' }));
+    }
+  });
+});
+
+describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}', () => {
+  const OUTLET_ID = 'outlet-1';
+
+  it('denies a client reading an outlet even when the caller has an active membership in its organization', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'members', USER_ID),
+        membershipDoc(USER_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID),
+        outletDoc(OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID)));
+    }
+  });
+
+  it('denies all client writes', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID), outletDoc(OUTLET_ID, ORG_A)),
+      );
+    }
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID),
+        outletDoc(OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID), { status: 'inactive' }));
+      await assertFails(deleteDoc(doc(db, 'organizations', ORG_A, 'outlets', OUTLET_ID)));
+    }
+  });
+});
+
+describe('firestore.rules: organizations/{organizationId}/outletSlugs/{slug}', () => {
+  const SLUG = 'main-canteen';
+
+  it('denies all client reads', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), 'organizations', ORG_A, 'outletSlugs', SLUG), {
+        organizationId: ORG_A,
+        outletId: 'outlet-1',
+        createdAt: Timestamp.now(),
+      });
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'organizations', ORG_A, 'outletSlugs', SLUG)));
+    }
+  });
+
+  it('denies a client reserving an outlet slug directly, bypassing outlet creation', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(doc(db, 'organizations', ORG_A, 'outletSlugs', SLUG), {
+          organizationId: ORG_A,
+          outletId: 'outlet-1',
+          createdAt: Timestamp.now(),
+        }),
+      );
     }
   });
 });

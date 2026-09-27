@@ -49,6 +49,17 @@ A physical or logical point of service belonging to an `Organization`
 — e.g. a specific canteen counter or café branch. Menus, orders, and
 pickup happen in the context of an `Outlet`.
 
+The first implementation (`functions/src/domain/outlets.ts`,
+[http-api.md](./http-api.md#outlets)) keeps this minimal: `id` (Firestore
+auto-ID), `organizationId`, `name`, `slug`, `description`, `status`
+(`active`/`inactive`), `phone`, `address`, `location`, `createdAt`,
+`updatedAt`, `createdBy`. `slug` is unique only within the parent
+organization (reserved atomically via
+`organizations/{organizationId}/outletSlugs/{slug}`, the same pattern an
+organization's own slug uses) and **immutable for now**. Only an
+organization's `owner`/`manager` may create or edit an outlet; any active
+member (including `staff`) may view the list.
+
 ### OutletMember
 A `User` granted a role scoped to a single `Outlet`, for staff who
 work at one location rather than across the whole organization.

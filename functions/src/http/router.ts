@@ -20,9 +20,59 @@ export function normalizePath(rawPath: string): string {
 }
 
 export type RouteMatch =
-  | {kind: "found"; route: RouteDefinition}
+  | {kind: "found"; route: RouteDefinition; params: Record<string, string>}
   | {kind: "not_found"}
   | {kind: "method_not_allowed"; allowedMethods: string[]};
+
+/** A route whose path pattern matched, paired with its captured params. */
+interface MatchedRoute {
+  route: RouteDefinition;
+  params: Record<string, string>;
+}
+
+/**
+ * @param {string} path A request or route path.
+ * @return {string[]} Its non-empty `/`-separated segments, e.g. "/a/b/" ->
+ *   ["a", "b"]. Because both a request path and a route path are split the
+ *   same way, a route path can never match by virtue of stray slashes.
+ */
+function splitPath(path: string): string[] {
+  return path.split("/").filter((segment) => segment.length > 0);
+}
+
+/**
+ * Matches a single route's path pattern against a request path, capturing
+ * any `:name` segments. A `:name` segment matches exactly one non-empty
+ * path segment — never a slash, and never an empty segment — so it can't
+ * be used to smuggle in extra path structure.
+ *
+ * @param {string} routePath A registered `RouteDefinition.path`.
+ * @param {string} requestPath The already-normalized request path.
+ * @return {Record<string, string> | null} The captured params if the
+ *   route's path pattern matches, or null if it doesn't.
+ */
+function matchPath(
+  routePath: string,
+  requestPath: string,
+): Record<string, string> | null {
+  const routeSegments = splitPath(routePath);
+  const requestSegments = splitPath(requestPath);
+  if (routeSegments.length !== requestSegments.length) {
+    return null;
+  }
+
+  const params: Record<string, string> = {};
+  for (let i = 0; i < routeSegments.length; i++) {
+    const routeSegment = routeSegments[i];
+    const requestSegment = requestSegments[i];
+    if (routeSegment.startsWith(":")) {
+      params[routeSegment.slice(1)] = decodeURIComponent(requestSegment);
+    } else if (routeSegment !== requestSegment) {
+      return null;
+    }
+  }
+  return params;
+}
 
 /**
  * Finds the route for a normalized path and method, distinguishing an
@@ -38,21 +88,27 @@ export function matchRoute(
   method: string,
   path: string,
 ): RouteMatch {
-  const samePath = routes.filter((route) => route.path === path);
-  if (samePath.length === 0) {
+  const candidates: MatchedRoute[] = [];
+  for (const route of routes) {
+    const params = matchPath(route.path, path);
+    if (params !== null) {
+      candidates.push({route, params});
+    }
+  }
+  if (candidates.length === 0) {
     return {kind: "not_found"};
   }
 
   const upperMethod = method.toUpperCase();
-  const route = samePath.find((r) => r.method === upperMethod);
-  if (!route) {
+  const match = candidates.find((c) => c.route.method === upperMethod);
+  if (!match) {
     return {
       kind: "method_not_allowed",
-      allowedMethods: [...new Set(samePath.map((r) => r.method))],
+      allowedMethods: [...new Set(candidates.map((c) => c.route.method))],
     };
   }
 
-  return {kind: "found", route};
+  return {kind: "found", route: match.route, params: match.params};
 }
 
 /**
@@ -87,6 +143,6 @@ export async function dispatch(
       headers: {"Allow": match.allowedMethods.join(", ")},
     };
   case "found":
-    return match.route.handler({request});
+    return match.route.handler({request, params: match.params});
   }
 }

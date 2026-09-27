@@ -40,13 +40,24 @@ export type ApiResult = ApiSuccess | ApiError;
 
 export interface RouteContext {
   request: NormalizedRequest;
+  /**
+   * Values captured from `:name` segments in the matched route's `path`
+   * (see `router.ts`'s `matchRoute`). Always populated by `dispatch`;
+   * optional here only so a hand-built `RouteContext` in a test can omit it
+   * for a route with no dynamic segments.
+   */
+  params?: Record<string, string>;
 }
 
 export type RouteHandler = (ctx: RouteContext) => Promise<ApiResult>;
 
 export interface RouteDefinition {
   method: string;
-  /** Exact path to match, e.g. "/me". */
+  /**
+   * Path to match, e.g. "/me". A segment starting with `:` (e.g.
+   * "/organizations/:organizationId/outlets") matches any single non-empty
+   * path segment and is captured into `RouteContext.params` under that name.
+   */
   path: string;
   handler: RouteHandler;
 }

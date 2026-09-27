@@ -77,6 +77,35 @@ rules_version = '2';
 // Membership is created and changed exclusively by trusted backend code,
 // so a user can never grant themselves membership or change a role.
 //
+// Subcollection: organizations/{organizationId}/outlets
+// Document ID: {outletId} — a Firestore auto-ID.
+// Fields:
+//   - id: string (required, immutable) — must equal the document id.
+//   - organizationId: string (required, immutable) — must equal the parent
+//     organization id.
+//   - name: string (required, 1-100 chars)
+//   - slug: string (required, immutable for this first implementation) —
+//     lowercase letters/digits/hyphens, 3-50 chars, unique within the parent
+//     organization only (see outletSlugs below), NOT globally unique.
+//   - description, phone, address, location: optional (see
+//     functions/src/domain/outlets.ts for shapes/limits).
+//   - status: string (required) — one of 'active' | 'inactive'.
+//   - createdAt, updatedAt: timestamp (required)
+//   - createdBy: string (required, immutable) — the Descope user ID that
+//     created the outlet.
+// Provisioned by trusted backend code only.
+//
+// Subcollection: organizations/{organizationId}/outletSlugs
+// Document ID: {slug} — the reserved slug itself, scoped to this organization.
+// Fields:
+//   - organizationId: string (required, immutable)
+//   - outletId: string (required, immutable)
+//   - createdAt: timestamp (required, immutable)
+// Exists solely so outlet creation can atomically check-and-reserve a
+// per-organization-unique slug inside one Firestore transaction
+// (functions/src/domain/outlets.ts) — the same pattern organizationSlugs
+// uses for global uniqueness. Never read or written directly by clients.
+//
 // ===============================================================
 
 service cloud.firestore {
@@ -93,6 +122,18 @@ service cloud.firestore {
 
       // Tenant-scoped membership and roles. Backend-only, always.
       match /members/{memberId} {
+        allow read, write: if false;
+      }
+
+      // Outlets belonging to this organization. Backend-only, always.
+      match /outlets/{outletId} {
+        allow read, write: if false;
+      }
+
+      // Per-organization outlet-slug uniqueness reservation. Backend-only,
+      // always — same reasoning as organizationSlugs below, scoped one
+      // level deeper.
+      match /outletSlugs/{slug} {
         allow read, write: if false;
       }
     }

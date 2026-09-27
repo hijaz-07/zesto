@@ -22,10 +22,13 @@ functions/src/
   routes/
     me.ts                GET /me
     organizations.ts     POST /organizations, GET /organizations
+    outlets.ts           POST/GET /organizations/{organizationId}/outlets,
+                         PATCH .../outlets/{outletId}
   domain/
     users.ts             users/{userId} profile: schema + get-or-create
     organizations.ts     organizations/*, organizationSlugs/*, and the
                          owner-membership write side of organizations/*/members
+    outlets.ts           organizations/*/outlets/*, organizations/*/outletSlugs/*
   auth/
     session.ts           verifyDescopeSession / authenticateRequest
     membership.ts         organization role authorization (unrelated to /me)
@@ -45,6 +48,14 @@ development) strips the `/api` prefix before forwarding to the Functions
 emulator, so the function sees `/me`. `router.ts`'s `normalizePath()` strips
 a leading `/api` if present, so routes are registered once (e.g. `/me`) and
 match either way.
+
+**Path parameters:** a route's `path` may contain `:name` segments (e.g.
+`/organizations/:organizationId/outlets`), each matching exactly one
+non-empty path segment. `matchRoute()` captures them into
+`RouteContext.params`, which a handler reads (e.g.
+`ctx.params?.organizationId`) instead of parsing `request.path` itself. A
+route with no `:name` segments (e.g. `/me`) behaves exactly as before —
+`params` is just `{}`.
 
 ## Authentication pipeline
 
@@ -85,9 +96,10 @@ no cacheable, non-personal responses yet. A 401 response additionally gets
 | ------ | --------------------- | ------- |
 | 400    | `invalid_argument`    | The request body failed validation (e.g. `POST /organizations` with a bad `name`/`slug`). |
 | 401    | `unauthenticated`      | Missing, malformed, expired, or wrong-audience session token. |
-| 404    | `not_found`            | No route registered for the path. |
+| 403    | `permission_denied`    | The caller is authenticated but is not an active organization member with an allowed role (e.g. `staff` calling `POST .../outlets`). |
+| 404    | `not_found`            | No route registered for the path, or (e.g. `PATCH .../outlets/{outletId}`) the specific resource doesn't exist. |
 | 405    | `method_not_allowed`   | The path exists, but not for this method (`Allow` header lists what does). |
-| 409    | `already_exists`       | `POST /organizations` with a `slug` that is already taken. |
+| 409    | `already_exists`       | `POST /organizations` or `POST .../outlets` with a `slug` that is already taken. |
 | 500    | `internal`             | An unhandled exception in a route handler (e.g. a malformed stored Firestore document). The client never sees the underlying detail. |
 | 503    | `unavailable`          | An infrastructure failure while validating the session (see below) — **not** the caller's fault. |
 
@@ -208,6 +220,102 @@ denormalized list that could drift. Requires the composite index in
 malformed organization document, the request fails with a generic `500`
 (logged with its `requestId`, detail never returned to the client) rather
 than silently omitting it.
+
+## Outlets
+
+`POST`, `GET`, and `PATCH` on `/organizations/{organizationId}/outlets[/{outletId}]`
+(`functions/src/routes/outlets.ts` + `functions/src/domain/outlets.ts`) are
+the first outlet endpoints. See
+[domain-model.md](./domain-model.md#outlet) for the entity.
+
+Every outlet endpoint first authenticates the caller (`401`/`503` exactly as
+above), then authorizes them via `requireOrganizationRole` against
+`organizations/{organizationId}/members/{userId}` (`functions/src/auth/membership.ts`)
+**before** looking at the request body — an unauthorized caller never learns
+whether their body would otherwise have been valid. `organizationId` (and
+`outletId`, for `PATCH`) come from the route's path parameters
+(`RouteContext.params`), never the request body.
+
+| Role | View (`GET`) | Create/Edit (`POST`/`PATCH`) |
+| --- | --- | --- |
+| `owner` | ✓ | ✓ |
+| `manager` | ✓ | ✓ |
+| `staff` | ✓ | ✗ (`403 permission_denied`) |
+| non-member | ✗ (`403 permission_denied`) | ✗ (`403 permission_denied`) |
+
+### `POST /organizations/{organizationId}/outlets`
+
+Request body (validated with Zod; `status`, `id`, `organizationId`,
+`createdBy`, `createdAt`, `updatedAt` are never accepted — an unrecognized
+field is ignored, not treated as authority):
+
+```jsonc
+{
+  "name": "Main Canteen",
+  "slug": "main-canteen",
+  "description": "Main campus food outlet",
+  "phone": "0499xxxxxxx",
+  "address": { "line1": "Main Campus", "city": "Kasaragod", "state": "Kerala", "postalCode": "671xxx" },
+  "location": { "latitude": 12.5, "longitude": 74.9 }
+}
+```
+
+- `name`: trimmed, 1-100 characters.
+- `slug`: 3-50 characters, matching `^[a-z0-9]+(-[a-z0-9]+)*$`, unique only
+  **within this organization** — not globally unique like an organization's
+  own slug. **Immutable for this first implementation**, same reasoning as
+  an organization's slug (see [Organizations](#organizations) above).
+- `description` (≤500 chars), `phone` (≤30 chars), `address`, `location`
+  (latitude ∈ [-90, 90], longitude ∈ [-180, 180]) are all optional.
+
+A new outlet always starts `status: "active"`; `createdBy` always comes from
+the verified Descope session. Success: `201` with
+
+```jsonc
+{ "data": { "outlet": { "id": "...", "organizationId": "...", "name": "...", "slug": "...", "status": "active", "createdAt": "...", "updatedAt": "...", "createdBy": "..." } } }
+```
+
+Errors: `400 invalid_argument`, `401 unauthenticated`, `403 permission_denied`
+(not an active `owner`/`manager` member), `409 already_exists` (slug already
+taken in this organization), `503 unavailable`.
+
+Like `createOrganization`, `createOutlet` creates the outlet document and its
+`organizations/{organizationId}/outletSlugs/{slug}` uniqueness reservation in
+**one Firestore transaction**, so a slug conflict never leaves a partial
+outlet behind, and the same slug is always free to reuse in a *different*
+organization.
+
+### `GET /organizations/{organizationId}/outlets`
+
+Returns **every** outlet in the organization — active and inactive alike;
+this is an organization-management view, so inactive outlets are never
+hidden. Any active member (`owner`, `manager`, or `staff`) may call this.
+`200` with
+
+```jsonc
+{ "data": { "outlets": [ { "id": "...", "organizationId": "...", "name": "...", "slug": "...", "status": "active", "createdAt": "...", "updatedAt": "...", "createdBy": "..." } ] } }
+```
+
+ordered by `createdAt` ascending (a single-field index, automatic — no
+`firestore.indexes.json` entry needed, unlike `GET /organizations`'s
+collection-group query); `[]` if the organization has no outlets.
+
+### `PATCH /organizations/{organizationId}/outlets/{outletId}`
+
+Only an active `owner`/`manager` member may call this. Editable fields:
+`name`, `description`, `phone`, `address`, `location`, `status` (`"active"`
+or `"inactive"`) — every field is optional, but the body must contain at
+least one. `slug`, `id`, `organizationId`, `createdBy`, and `createdAt` can
+never be changed through this endpoint (present-but-ignored, same as the
+create-time authority fields above). `updatedAt` is set to the current time
+on every successful update. Success: `200` with the updated outlet, in the
+same shape as `POST`'s response.
+
+Errors: `400 invalid_argument` (bad body, including an empty one), `401
+unauthenticated`, `403 permission_denied`, `404 not_found` (no such outlet in
+this organization — including an outlet ID that belongs to a *different*
+organization: this never leaks whether that ID exists elsewhere), `503
+unavailable`.
 
 ## Local emulator setup
 

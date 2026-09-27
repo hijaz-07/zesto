@@ -35,7 +35,7 @@ describe("matchRoute", () => {
   it("finds a route matching both path and method", () => {
     const match = matchRoute(routes, "GET", "/me");
 
-    expect(match).toEqual({kind: "found", route: routes[0]});
+    expect(match).toEqual({kind: "found", route: routes[0], params: {}});
   });
 
   it("matches methods case-insensitively", () => {
@@ -65,6 +65,75 @@ describe("matchRoute", () => {
     if (match.kind === "method_not_allowed") {
       expect(new Set(match.allowedMethods)).toEqual(new Set(["GET", "POST"]));
     }
+  });
+});
+
+describe("matchRoute: dynamic segments", () => {
+  const paramRoutes: RouteDefinition[] = [
+    {
+      method: "GET",
+      path: "/organizations/:organizationId/outlets",
+      handler: async () => okResult,
+    },
+    {
+      method: "PATCH",
+      path: "/organizations/:organizationId/outlets/:outletId",
+      handler: async () => okResult,
+    },
+  ];
+
+  it("captures a single :param segment", () => {
+    const match = matchRoute(paramRoutes, "GET", "/organizations/org-1/outlets");
+
+    expect(match).toEqual({
+      kind: "found",
+      route: paramRoutes[0],
+      params: {organizationId: "org-1"},
+    });
+  });
+
+  it("captures multiple :param segments", () => {
+    const match = matchRoute(
+      paramRoutes, "PATCH", "/organizations/org-1/outlets/outlet-9",
+    );
+
+    expect(match).toEqual({
+      kind: "found",
+      route: paramRoutes[1],
+      params: {organizationId: "org-1", outletId: "outlet-9"},
+    });
+  });
+
+  it("does not match when the segment count differs from every registered route", () => {
+    expect(matchRoute(paramRoutes, "GET", "/organizations/org-1")).toEqual({kind: "not_found"});
+    expect(
+      matchRoute(paramRoutes, "GET", "/organizations/org-1/outlets/extra/toomany"),
+    ).toEqual({kind: "not_found"});
+  });
+
+  it("matches the longer (PATCH) pattern, not the shorter (GET) one, for a 4-segment path", () => {
+    // /organizations/org-1/outlets/extra has the same segment count as
+    // PATCH's pattern (.../outlets/:outletId), so it's a real match for
+    // PATCH — just not for GET, which only registers the 3-segment pattern.
+    const match = matchRoute(paramRoutes, "GET", "/organizations/org-1/outlets/extra");
+
+    expect(match).toEqual({kind: "method_not_allowed", allowedMethods: ["PATCH"]});
+  });
+
+  it("does not let an empty segment satisfy a :param", () => {
+    expect(matchRoute(paramRoutes, "GET", "/organizations//outlets")).toEqual({kind: "not_found"});
+  });
+
+  it("decodes a URL-encoded :param value", () => {
+    const match = matchRoute(paramRoutes, "GET", "/organizations/org%201/outlets");
+
+    expect(match).toMatchObject({params: {organizationId: "org 1"}});
+  });
+
+  it("reports method_not_allowed for a known dynamic path with the wrong method", () => {
+    const match = matchRoute(paramRoutes, "DELETE", "/organizations/org-1/outlets");
+
+    expect(match).toEqual({kind: "method_not_allowed", allowedMethods: ["GET"]});
   });
 });
 

@@ -30,13 +30,15 @@ function isMemberRole(value: unknown): value is OrganizationMemberRole {
 
 /**
  * Firestore document IDs cannot contain "/", be "." or "..", or match
- * `__.*__`. Rejecting these keeps a caller-supplied organization ID from
- * addressing any path other than `organizations/{organizationId}`.
+ * `__.*__`. Rejecting these keeps a caller-supplied ID (an organization ID,
+ * an outlet ID, etc.) from addressing any path other than the exact
+ * single-segment document it names. Exported so any domain module taking a
+ * caller-supplied document ID can reuse this same guard.
  *
  * @param {unknown} id The candidate document ID.
  * @return {boolean} Whether `id` is a safe single-segment document ID.
  */
-function isValidDocumentId(id: unknown): id is string {
+export function isValidDocumentId(id: unknown): id is string {
   return typeof id === "string" &&
     id.length > 0 &&
     id.length <= 1500 &&
