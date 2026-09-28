@@ -11,7 +11,7 @@ vi.mock('../features/organization/api', () => ({
 }));
 
 vi.mock('./OrganizationAppLayout', () => ({
-  OrganizationAppLayout: () => <div>Organization dashboard shell</div>,
+  OrganizationAppLayout: ({ role }: { role: string }) => <div>Organization dashboard shell (role: {role})</div>,
 }));
 
 vi.mock('../pages/organization/OrganizationOnboardingPage', () => ({
@@ -63,7 +63,15 @@ describe('OrganizationGate', () => {
 
     renderGate('/org/dashboard');
 
-    expect(await screen.findByText('Organization dashboard shell')).toBeInTheDocument();
+    expect(await screen.findByText(/Organization dashboard shell/)).toBeInTheDocument();
+  });
+
+  it("threads the caller's membership role through to OrganizationAppLayout", async () => {
+    getOrganizationsMock.mockResolvedValue({ organizations: [{ ...activeOrganization, role: 'manager' }] });
+
+    renderGate('/org/dashboard');
+
+    expect(await screen.findByText('Organization dashboard shell (role: manager)')).toBeInTheDocument();
   });
 
   it('shows an error state with a working retry when the fetch fails', async () => {
@@ -87,6 +95,6 @@ describe('OrganizationGate', () => {
 
     renderGate('/org/onboarding');
 
-    expect(await screen.findByText('Organization dashboard shell')).toBeInTheDocument();
+    expect(await screen.findByText(/Organization dashboard shell/)).toBeInTheDocument();
   });
 });

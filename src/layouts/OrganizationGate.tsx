@@ -41,7 +41,7 @@ export function OrganizationGate() {
     return pathname === ONBOARDING_PATH ? (
       <Navigate to={DASHBOARD_PATH} replace />
     ) : (
-      <OrganizationAppLayout organizationId={organizations[0].id} />
+      <OrganizationAppLayout organizationId={organizations[0].id} role={organizations[0].role} />
     );
   }
 

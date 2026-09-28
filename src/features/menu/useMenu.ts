@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { OrganizationId, OutletId } from '../../domain/types';
-import { getMenu, updateMenu as updateMenuRequest, type UpdateMenuInput } from './api';
+import {
+  archiveMenu as archiveMenuRequest,
+  getMenu,
+  publishMenu as publishMenuRequest,
+  updateMenu as updateMenuRequest,
+  type UpdateMenuInput,
+} from './api';
 import type { Menu, MenuId } from './types';
 
 export type MenuState =
@@ -14,6 +20,8 @@ export interface UseMenuResult {
   error: unknown;
   retry: () => void;
   updateMenu: (input: UpdateMenuInput) => Promise<Menu>;
+  publishMenu: () => Promise<Menu>;
+  archiveMenu: () => Promise<Menu>;
 }
 
 /**
@@ -59,11 +67,25 @@ export function useMenu(organizationId: OrganizationId, outletId: OutletId, menu
     [organizationId, outletId, menuId],
   );
 
+  const publishMenu = useCallback(async () => {
+    const response = await publishMenuRequest(organizationId, outletId, menuId);
+    setState({ status: 'ready', menu: response.menu });
+    return response.menu;
+  }, [organizationId, outletId, menuId]);
+
+  const archiveMenu = useCallback(async () => {
+    const response = await archiveMenuRequest(organizationId, outletId, menuId);
+    setState({ status: 'ready', menu: response.menu });
+    return response.menu;
+  }, [organizationId, outletId, menuId]);
+
   return {
     status: state.status,
     menu: state.status === 'ready' ? state.menu : null,
     error: state.status === 'error' ? state.error : null,
     retry,
     updateMenu,
+    publishMenu,
+    archiveMenu,
   };
 }

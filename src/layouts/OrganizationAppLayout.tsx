@@ -1,6 +1,6 @@
 import { IonRouterOutlet, IonSplitPane } from '@ionic/react';
 import { Navigate, Route, Routes } from 'react-router-dom';
-import type { OrganizationId } from '../domain/types';
+import type { OrganizationId, OrganizationMemberRole } from '../domain/types';
 import { OrganizationSideNav } from '../components/layout/OrganizationSideNav';
 import { OrganizationAnalyticsPage } from '../pages/organization/OrganizationAnalyticsPage';
 import { OrganizationCreateMenuPage } from '../pages/organization/OrganizationCreateMenuPage';
@@ -14,10 +14,12 @@ import { OrganizationSettingsPage } from '../pages/organization/OrganizationSett
 
 export interface OrganizationAppLayoutProps {
   organizationId: OrganizationId;
+  /** The caller's membership role in `organizationId`, from `GET /organizations` (see `OrganizationGate`). Threaded only to the routes that currently need it for mutation-control gating — not a global role context. */
+  role: OrganizationMemberRole;
 }
 
 /** Desktop-first organization shell: a persistent side menu over a routed outlet. */
-export function OrganizationAppLayout({ organizationId }: OrganizationAppLayoutProps) {
+export function OrganizationAppLayout({ organizationId, role }: OrganizationAppLayoutProps) {
   return (
     <IonSplitPane contentId="org-main-content" when="md">
       <OrganizationSideNav />
@@ -35,7 +37,7 @@ export function OrganizationAppLayout({ organizationId }: OrganizationAppLayoutP
           />
           <Route
             path="menus/:outletId/:menuId"
-            element={<OrganizationMenuEditorPage organizationId={organizationId} />}
+            element={<OrganizationMenuEditorPage organizationId={organizationId} role={role} />}
           />
           <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
           <Route path="orders" element={<OrganizationOrdersPage />} />

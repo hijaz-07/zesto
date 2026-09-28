@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react';
 import { IonContent, IonIcon, IonPage } from '@ionic/react';
 import { arrowBackOutline } from 'ionicons/icons';
 import { useNavigate, useParams } from 'react-router-dom';
-import type { OrganizationId } from '../../domain/types';
+import type { OrganizationId, OrganizationMemberRole } from '../../domain/types';
 import { OrganizationPageToolbar } from '../../components/layout/OrganizationPageToolbar';
 import { PageHeader } from '../../components/common/PageHeader';
 import { LoadingState } from '../../components/common/LoadingState';
@@ -12,15 +12,26 @@ import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
 import { MENU_STATUS_TONE, ORDERING_STATE_LABEL, ORDERING_STATE_TONE } from '../../features/menu/badges';
-import { getMenuEditPermissions } from '../../features/menu/editPermissions';
+import {
+  canManageMenu,
+  getMenuEditPermissions,
+  getMenuItemMutationPermissions,
+} from '../../features/menu/editPermissions';
 import { menuErrorMessage } from '../../features/menu/errors';
 import { MenuForm } from '../../features/menu/MenuForm';
+import { MenuLifecyclePanel } from '../../features/menu/MenuLifecyclePanel';
 import { useMenu } from '../../features/menu/useMenu';
+import { MenuItemsSection } from '../../features/menuItem/MenuItemsSection';
+import { useMenuItems } from '../../features/menuItem/useMenuItems';
+import { outletErrorMessage } from '../../features/outlet/errors';
+import { useOutlets } from '../../features/outlet/useOutlets';
 import { ApiError } from '../../lib/api/client';
 import { formatDate, formatTime, getOrderingState } from '../../utils/date';
 
 export interface OrganizationMenuEditorPageProps {
   organizationId: OrganizationId;
+  /** The caller's membership role in this organization (from `GET /organizations`, threaded down via `OrganizationGate` -> `OrganizationAppLayout`). Gates every mutation control on this page — see `canManageMenu`. */
+  role: OrganizationMemberRole;
 }
 
 /**
@@ -28,17 +39,27 @@ export interface OrganizationMenuEditorPageProps {
  * locally between a read-only detail view and `MenuForm` in edit mode
  * (mirroring `OrganizationOutletsPage`'s list/edit toggle), rather than a
  * separate `/edit` route — there is no independent "editor" URL state to
- * preserve. Menu item management and the real publish action are
- * deliberately out of scope here; see the placeholders below.
+ * preserve. Menu and menu items are two independent resources
+ * (`useMenu`/`useMenuItems`), matching how the backend treats them: the page
+ * blocks on the menu (and the outlet, needed for item/publish permission
+ * gating) loading, but lets `MenuItemsSection` show its own loading/error
+ * state independently. `role` gates mutation controls only — reads (menu
+ * details, status/ordering badges, the item list including disabled items)
+ * are shown to every organization member regardless of role, matching the
+ * backend's own `VIEW_ROLES` (all three roles) vs `MANAGE_ROLES`
+ * (owner/manager only) split.
  */
-export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuEditorPageProps) {
+export function OrganizationMenuEditorPage({ organizationId, role }: OrganizationMenuEditorPageProps) {
   const { outletId, menuId } = useParams<{ outletId: string; menuId: string }>();
   const navigate = useNavigate();
-  // Both params are guaranteed present: this component only ever renders
-  // under the "menus/:outletId/:menuId" route (see OrganizationAppLayout),
-  // which cannot match without both dynamic segments — react-router's own
-  // types just don't encode that route-shape guarantee.
-  const { status, menu, error, retry, updateMenu } = useMenu(organizationId, outletId!, menuId!);
+  // All three params are guaranteed present: this component only ever
+  // renders under the "menus/:outletId/:menuId" route (see
+  // OrganizationAppLayout), which cannot match without both dynamic
+  // segments — react-router's own types just don't encode that route-shape
+  // guarantee.
+  const menuResult = useMenu(organizationId, outletId!, menuId!);
+  const itemsResult = useMenuItems(organizationId, outletId!, menuId!);
+  const outletsResult = useOutlets(organizationId);
   const [editing, setEditing] = useState(false);
 
   const backToMenus = (
@@ -49,11 +70,11 @@ export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuE
   );
 
   let fallback: ReactNode;
-  if (status === 'loading') {
+  if (menuResult.status === 'loading' || outletsResult.status === 'loading') {
     fallback = <LoadingState label="Loading menu…" />;
-  } else if (status === 'error') {
+  } else if (menuResult.status === 'error') {
     fallback =
-      error instanceof ApiError && error.status === 404 ? (
+      menuResult.error instanceof ApiError && menuResult.error.status === 404 ? (
         <EmptyState
           title="Menu not found"
           description="This menu doesn't exist, or you don't have access to it."
@@ -66,14 +87,61 @@ export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuE
       ) : (
         <ErrorState
           title="Couldn't load this menu"
-          description={menuErrorMessage(error)}
-          action={<Button onClick={retry}>Try again</Button>}
+          description={menuErrorMessage(menuResult.error)}
+          action={<Button onClick={menuResult.retry}>Try again</Button>}
         />
       );
+  } else if (outletsResult.status === 'error') {
+    fallback = (
+      <ErrorState
+        title="Couldn't load this outlet"
+        description={outletErrorMessage(outletsResult.error)}
+        action={<Button onClick={outletsResult.retry}>Try again</Button>}
+      />
+    );
+  }
+
+  const menu = menuResult.menu;
+  const outlet = outletsResult.status === 'ready' ? outletsResult.outlets.find((candidate) => candidate.id === outletId) : undefined;
+  if (!fallback && menu && !outlet) {
+    fallback = (
+      <EmptyState
+        title="Outlet not found"
+        description="This outlet doesn't exist, or you don't have access to it."
+        action={
+          <Button variant="secondary" onClick={() => navigate('/org/menus')}>
+            Back to Outlets
+          </Button>
+        }
+      />
+    );
   }
 
   const orderingState = menu ? getOrderingState(menu.orderingOpensAt, menu.orderingClosesAt) : null;
   const permissions = menu && orderingState ? getMenuEditPermissions(menu.status, orderingState) : null;
+  const outletActive = outlet?.status === 'active';
+  const canManage = canManageMenu(role);
+  const itemPermissions =
+    menu && orderingState
+      ? getMenuItemMutationPermissions(menu.status, orderingState, outletActive, canManage)
+      : null;
+
+  const itemCount = itemsResult.items.length;
+  const enabledItemCount = itemsResult.items.filter((item) => item.enabled).length;
+  const itemsReady = itemsResult.status === 'ready';
+
+  const handlePublish = async () => {
+    try {
+      return await menuResult.publishMenu();
+    } catch (error) {
+      // A publish can be rejected because another process disabled or
+      // deleted the menu's last enabled item concurrently; re-fetch items so
+      // the list (and the checklist) reflect current truth rather than the
+      // stale state that looked publishable a moment ago.
+      itemsResult.retry();
+      throw error;
+    }
+  };
 
   return (
     <IonPage>
@@ -93,13 +161,19 @@ export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuE
             }
           />
 
-          {menu && permissions ? (
+          {menu && outlet && permissions && itemPermissions ? (
             <>
+              {!outletActive && (
+                <p className="rounded-lg bg-background px-3 py-2 text-xs text-muted">
+                  This outlet is inactive. Menu changes are unavailable.
+                </p>
+              )}
+
               {editing ? (
                 <MenuForm
                   mode="edit"
                   menu={menu}
-                  onSubmit={updateMenu}
+                  onSubmit={menuResult.updateMenu}
                   onSaved={() => setEditing(false)}
                   onCancel={() => setEditing(false)}
                 />
@@ -130,7 +204,7 @@ export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuE
                       </div>
                     </dl>
                   </Card>
-                  {permissions.canSave && (
+                  {permissions.canSave && outletActive && canManage && (
                     <div>
                       <Button onClick={() => setEditing(true)}>Edit Menu</Button>
                     </div>
@@ -138,19 +212,18 @@ export function OrganizationMenuEditorPage({ organizationId }: OrganizationMenuE
                 </>
               )}
 
-              <Card className="flex flex-col items-center gap-1 py-8 text-center">
-                <p className="text-sm font-medium text-text">Menu Items</p>
-                <p className="text-sm text-muted">Menu item management will be added in the next step.</p>
-              </Card>
+              <MenuItemsSection itemsResult={itemsResult} permissions={itemPermissions} />
 
-              {menu.status === 'draft' && (
-                <Card className="flex flex-col gap-1">
-                  <Button disabled aria-label="Publish — add an enabled menu item first">
-                    Publish
-                  </Button>
-                  <p className="text-xs text-muted">Add at least one enabled menu item before publishing.</p>
-                </Card>
-              )}
+              <MenuLifecyclePanel
+                menu={menu}
+                itemCount={itemCount}
+                enabledItemCount={enabledItemCount}
+                itemsReady={itemsReady}
+                outletActive={outletActive}
+                canManage={canManage}
+                onPublish={handlePublish}
+                onArchive={menuResult.archiveMenu}
+              />
             </>
           ) : (
             fallback

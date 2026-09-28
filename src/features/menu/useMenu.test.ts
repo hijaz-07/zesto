@@ -5,9 +5,13 @@ import { useMenu } from './useMenu';
 
 const getMenuMock = vi.hoisted(() => vi.fn());
 const updateMenuMock = vi.hoisted(() => vi.fn());
+const publishMenuMock = vi.hoisted(() => vi.fn());
+const archiveMenuMock = vi.hoisted(() => vi.fn());
 vi.mock('./api', () => ({
   getMenu: getMenuMock,
   updateMenu: updateMenuMock,
+  publishMenu: publishMenuMock,
+  archiveMenu: archiveMenuMock,
 }));
 
 const menu = {
@@ -30,6 +34,8 @@ describe('useMenu', () => {
   beforeEach(() => {
     getMenuMock.mockReset();
     updateMenuMock.mockReset();
+    publishMenuMock.mockReset();
+    archiveMenuMock.mockReset();
   });
 
   it('starts loading, then becomes ready with the fetched menu', async () => {
@@ -122,5 +128,91 @@ describe('useMenu', () => {
 
     expect(thrown).toBe(error);
     expect(result.current.menu).toEqual(menu);
+  });
+
+  it('replaces the displayed menu with the publish response, without refetching', async () => {
+    getMenuMock.mockResolvedValue({ menu });
+    const published = { ...menu, status: 'published', publishedAt: '2026-09-28T12:00:00.000Z' };
+    publishMenuMock.mockResolvedValue({ menu: published });
+
+    const { result } = renderHook(() => useMenu('org-1', 'outlet-1', 'menu-1'));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    let returned: unknown;
+    await act(async () => {
+      returned = await result.current.publishMenu();
+    });
+
+    expect(returned).toEqual(published);
+    expect(result.current.menu).toEqual(published);
+    expect(publishMenuMock).toHaveBeenCalledWith('org-1', 'outlet-1', 'menu-1');
+    expect(getMenuMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates a publish rejection and leaves the displayed menu unchanged', async () => {
+    getMenuMock.mockResolvedValue({ menu });
+    const error = new ApiError(
+      400,
+      'invalid_argument',
+      'A menu must have at least one enabled item before it can be published.',
+    );
+    publishMenuMock.mockRejectedValue(error);
+
+    const { result } = renderHook(() => useMenu('org-1', 'outlet-1', 'menu-1'));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    let thrown: unknown;
+    await act(async () => {
+      try {
+        await result.current.publishMenu();
+      } catch (caught) {
+        thrown = caught;
+      }
+    });
+
+    expect(thrown).toBe(error);
+    expect(result.current.menu).toEqual(menu);
+  });
+
+  it('replaces the displayed menu with the archive response, without refetching', async () => {
+    const published = { ...menu, status: 'published' as const };
+    getMenuMock.mockResolvedValue({ menu: published });
+    const archived = { ...published, status: 'archived' };
+    archiveMenuMock.mockResolvedValue({ menu: archived });
+
+    const { result } = renderHook(() => useMenu('org-1', 'outlet-1', 'menu-1'));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    let returned: unknown;
+    await act(async () => {
+      returned = await result.current.archiveMenu();
+    });
+
+    expect(returned).toEqual(archived);
+    expect(result.current.menu).toEqual(archived);
+    expect(archiveMenuMock).toHaveBeenCalledWith('org-1', 'outlet-1', 'menu-1');
+    expect(getMenuMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('propagates an archive rejection and leaves the displayed menu unchanged', async () => {
+    const published = { ...menu, status: 'published' as const };
+    getMenuMock.mockResolvedValue({ menu: published });
+    const error = new ApiError(400, 'invalid_argument', 'Only a published menu can be archived.');
+    archiveMenuMock.mockRejectedValue(error);
+
+    const { result } = renderHook(() => useMenu('org-1', 'outlet-1', 'menu-1'));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    let thrown: unknown;
+    await act(async () => {
+      try {
+        await result.current.archiveMenu();
+      } catch (caught) {
+        thrown = caught;
+      }
+    });
+
+    expect(thrown).toBe(error);
+    expect(result.current.menu).toEqual(published);
   });
 });
