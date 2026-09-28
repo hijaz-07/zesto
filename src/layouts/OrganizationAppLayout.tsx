@@ -6,6 +6,7 @@ import { OrganizationAnalyticsPage } from '../pages/organization/OrganizationAna
 import { OrganizationDashboardPage } from '../pages/organization/OrganizationDashboardPage';
 import { OrganizationMenusPage } from '../pages/organization/OrganizationMenusPage';
 import { OrganizationOrdersPage } from '../pages/organization/OrganizationOrdersPage';
+import { OrganizationOutletMenusPage } from '../pages/organization/OrganizationOutletMenusPage';
 import { OrganizationOutletsPage } from '../pages/organization/OrganizationOutletsPage';
 import { OrganizationSettingsPage } from '../pages/organization/OrganizationSettingsPage';
 
@@ -21,7 +22,11 @@ export function OrganizationAppLayout({ organizationId }: OrganizationAppLayoutP
       <IonRouterOutlet id="org-main-content">
         <Routes>
           <Route path="dashboard" element={<OrganizationDashboardPage />} />
-          <Route path="menus" element={<OrganizationMenusPage />} />
+          <Route path="menus" element={<OrganizationMenusPage organizationId={organizationId} />} />
+          <Route
+            path="menus/:outletId"
+            element={<OrganizationOutletMenusPage organizationId={organizationId} />}
+          />
           <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
           <Route path="orders" element={<OrganizationOrdersPage />} />
           <Route path="analytics" element={<OrganizationAnalyticsPage />} />

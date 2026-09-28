@@ -1,8 +1,33 @@
-import { describe, expect, it } from 'vitest';
-import { getOrderingState } from './date';
+import { afterEach, describe, expect, it } from 'vitest';
+import { formatDate, getOrderingState } from './date';
 
 const orderingOpensAt = '2026-09-28T04:00:00+05:30';
 const orderingClosesAt = '2026-09-29T10:00:00+05:30';
+
+describe('formatDate', () => {
+  const originalTz = process.env.TZ;
+
+  afterEach(() => {
+    process.env.TZ = originalTz;
+  });
+
+  it('formats a plain calendar date', () => {
+    expect(formatDate('2026-09-25')).toBe('25 Sept 2026');
+  });
+
+  it('does not shift the calendar date for a viewer west of UTC', () => {
+    // A date-only string like a menu's `menuDate` parses as UTC midnight; a
+    // viewer in a negative-offset zone (e.g. US Eastern) must still see the
+    // same calendar date, not the previous day.
+    process.env.TZ = 'EST5EDT';
+    expect(formatDate('2026-09-25')).toBe('25 Sept 2026');
+  });
+
+  it('does not shift the calendar date across a month/year boundary', () => {
+    process.env.TZ = 'EST5EDT';
+    expect(formatDate('2026-01-01')).toBe('1 Jan 2026');
+  });
+});
 
 describe('getOrderingState', () => {
   it('is "not_open" before ordering opens', () => {

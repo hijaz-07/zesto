@@ -8,12 +8,21 @@ export function formatTime(isoDateTime: ISODateString): string {
   }).format(new Date(isoDateTime));
 }
 
-/** Formats an ISO date as a short, locale-aware date, e.g. "25 Sep 2026". */
+/**
+ * Formats an ISO date as a short, locale-aware calendar date, e.g. "25 Sep
+ * 2026". `timeZone: 'UTC'` is deliberate: a date-only ISO string (no time
+ * component, e.g. a menu's `menuDate`) parses as UTC midnight, and without
+ * pinning the formatter to UTC too, `Intl.DateTimeFormat` would render it in
+ * the browser's local time zone instead — shifting the displayed calendar
+ * date back a day for any viewer west of UTC. Formatting in UTC reads the
+ * same calendar date back out regardless of the viewer's own time zone.
+ */
 export function formatDate(isoDate: ISODateString): string {
   return new Intl.DateTimeFormat('en-IN', {
     day: 'numeric',
     month: 'short',
     year: 'numeric',
+    timeZone: 'UTC',
   }).format(new Date(isoDate));
 }
 
