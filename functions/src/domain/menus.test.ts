@@ -537,11 +537,40 @@ describe("getMenu", () => {
   );
 });
 
-/** A fake Admin Firestore for `updateMenu`/`publishMenu`/`archiveMenu`. */
-function fakeMutateDb(existing: Menu | Record<string, unknown> | undefined) {
+/**
+ * A fake Admin Firestore for `updateMenu`/`publishMenu`/`archiveMenu`. The
+ * menu-doc token doubles as the root of `hasEnabledMenuItem`'s items query
+ * (`publishMenu` only) — distinguished from a plain menu-doc read by the
+ * `__kind` tag, since `tx.get` must respond differently to each.
+ * `hasEnabledItem` defaults to `true` so every existing `publishMenu` test
+ * that doesn't care about item state is unaffected by the new rule.
+ */
+function fakeMutateDb(
+  existing: Menu | Record<string, unknown> | undefined,
+  options: {hasEnabledItem?: boolean} = {},
+) {
+  const hasEnabledItem = options.hasEnabledItem ?? true;
   const updates: Array<{data: unknown}> = [];
+
+  const menuDocToken = {
+    __kind: "menuDoc" as const,
+    collection: (name: string) => {
+      if (name !== "items") throw new Error(`unexpected subcollection: ${name}`);
+      return {
+        where: () => ({
+          limit: () => ({__kind: "itemsQuery" as const}),
+        }),
+      };
+    },
+  };
+
   const tx = {
-    get: vi.fn(async () => ({exists: existing !== undefined, data: () => existing})),
+    get: vi.fn(async (ref: {__kind: string}) => {
+      if (ref.__kind === "menuDoc") {
+        return {exists: existing !== undefined, data: () => existing};
+      }
+      return {empty: !hasEnabledItem};
+    }),
     update: vi.fn((_ref: unknown, data: unknown) => {
       updates.push({data});
     }),
@@ -552,7 +581,7 @@ function fakeMutateDb(existing: Menu | Record<string, unknown> | undefined) {
         collection: () => ({
           doc: () => ({
             collection: () => ({
-              doc: () => ({/* opaque ref token, only ever passed to tx.get/tx.update below */}),
+              doc: () => menuDocToken,
             }),
           }),
         }),
@@ -560,7 +589,7 @@ function fakeMutateDb(existing: Menu | Record<string, unknown> | undefined) {
     }),
     runTransaction: vi.fn(async (fn: (t: typeof tx) => Promise<unknown>) => fn(tx)),
   };
-  return {db: db as unknown as Firestore, updates};
+  return {db: db as unknown as Firestore, updates, tx};
 }
 
 describe("updateMenu", () => {
@@ -708,6 +737,27 @@ describe("publishMenu", () => {
     const {db} = fakeMutateDb(undefined);
     await expect(publishMenu(db, ORG_ID, OUTLET_ID, "menu-1"))
       .rejects.toMatchObject({code: "not-found"});
+  });
+
+  it("rejects publishing when the menu has no enabled items, without writing anything", async () => {
+    const existing = validMenuDoc("menu-1", {status: "draft"});
+    const {db, updates} = fakeMutateDb(existing, {hasEnabledItem: false});
+
+    await expect(publishMenu(db, ORG_ID, OUTLET_ID, "menu-1"))
+      .rejects.toMatchObject({code: "failed-precondition"});
+    expect(updates).toHaveLength(0);
+  });
+
+  it("queries the items subcollection for an enabled item within the same transaction as the menu read/write", async () => {
+    const existing = validMenuDoc("menu-1", {status: "draft"});
+    const {db, tx} = fakeMutateDb(existing, {hasEnabledItem: true});
+
+    await publishMenu(db, ORG_ID, OUTLET_ID, "menu-1");
+
+    // First call reads the menu itself; second call is the enabled-item
+    // existence query — both inside the one transaction `tx` represents.
+    expect(tx.get).toHaveBeenCalledTimes(2);
+    expect(tx.get.mock.calls[1][0]).toMatchObject({__kind: "itemsQuery"});
   });
 
   it("rejects publishing an already-published menu", async () => {

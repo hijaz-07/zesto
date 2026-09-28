@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {Timestamp, type Firestore} from "firebase-admin/firestore";
+import {Timestamp, type Firestore, type Transaction} from "firebase-admin/firestore";
 import {describe, expect, it, vi} from "vitest";
 import type {Menu} from "./menus";
 import {
@@ -9,6 +9,7 @@ import {
   findItemDeletionViolation,
   findItemMutationViolation,
   getMenuItem,
+  hasEnabledMenuItem,
   listMenuItemsForMenu,
   toMenuItemResponse,
   updateMenuItem,
@@ -405,6 +406,67 @@ describe("listMenuItemsForMenu", () => {
   it("throws when a stored item's menuId does not match the path it was read from", async () => {
     const {db} = fakeListDb([validItemDoc("item-a", {menuId: "menu-other"})]);
     await expect(listMenuItemsForMenu(db, ORG_ID, OUTLET_ID, MENU_ID)).rejects.toThrow();
+  });
+});
+
+/** A fake Admin Firestore + transaction for `hasEnabledMenuItem`. */
+function fakeEnabledItemsQueryDb(empty: boolean) {
+  const limitFn = vi.fn(() => ({queryToken: true}));
+  const whereFn = vi.fn(() => ({limit: limitFn}));
+  const db = {
+    collection: (name: string) => {
+      if (name !== "organizations") throw new Error(`unexpected collection: ${name}`);
+      return {
+        doc: () => ({
+          collection: (n: string) => {
+            if (n !== "outlets") throw new Error(`unexpected subcollection: ${n}`);
+            return {
+              doc: () => ({
+                collection: (n2: string) => {
+                  if (n2 !== "menus") throw new Error(`unexpected subcollection: ${n2}`);
+                  return {
+                    doc: () => ({
+                      collection: (n3: string) => {
+                        if (n3 !== "items") throw new Error(`unexpected subcollection: ${n3}`);
+                        return {where: whereFn};
+                      },
+                    }),
+                  };
+                },
+              }),
+            };
+          },
+        }),
+      };
+    },
+  };
+  const tx = {get: vi.fn(async () => ({empty}))};
+  return {db: db as unknown as Firestore, tx: tx as unknown as Transaction, whereFn, limitFn, txGet: tx.get};
+}
+
+describe("hasEnabledMenuItem", () => {
+  it("returns true when the query finds at least one enabled item", async () => {
+    const {db, tx} = fakeEnabledItemsQueryDb(false);
+    expect(await hasEnabledMenuItem(db, ORG_ID, OUTLET_ID, MENU_ID, tx)).toBe(true);
+  });
+
+  it("returns false when the query finds no enabled items", async () => {
+    const {db, tx} = fakeEnabledItemsQueryDb(true);
+    expect(await hasEnabledMenuItem(db, ORG_ID, OUTLET_ID, MENU_ID, tx)).toBe(false);
+  });
+
+  it("filters on enabled === true and limits to 1 (a cheap existence check, not a full list)", async () => {
+    const {db, tx, whereFn, limitFn} = fakeEnabledItemsQueryDb(true);
+    await hasEnabledMenuItem(db, ORG_ID, OUTLET_ID, MENU_ID, tx);
+    expect(whereFn).toHaveBeenCalledWith("enabled", "==", true);
+    expect(limitFn).toHaveBeenCalledWith(1);
+  });
+
+  it("reads through the given transaction, not a standalone query.get()", async () => {
+    const {db, tx, txGet} = fakeEnabledItemsQueryDb(true);
+    await hasEnabledMenuItem(db, ORG_ID, OUTLET_ID, MENU_ID, tx);
+    expect(txGet).toHaveBeenCalledTimes(1);
+    expect(txGet).toHaveBeenCalledWith({queryToken: true});
   });
 });
 

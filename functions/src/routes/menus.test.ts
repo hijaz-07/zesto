@@ -119,6 +119,10 @@ interface FakeDbOptions {
   /** Undefined simulates "no such menu." */
   existingMenu?: Record<string, unknown>;
   menusSeed?: Array<Record<string, unknown>>;
+  /** Whether `publishMenu`'s enabled-item existence query finds a match.
+   * Defaults to true so every test that isn't specifically about the new
+   * item-based publish rule is unaffected by it. */
+  hasEnabledItem?: boolean;
 }
 
 /**
@@ -127,18 +131,27 @@ interface FakeDbOptions {
  * `getOutlet` performs, and the menus-subcollection reads/writes
  * `createMenu`/`listMenusForOutlet`/`getMenu`/`updateMenu`/`publishMenu`/
  * `archiveMenu` perform (one level deeper than `routes/outlets.test.ts`'s
- * equivalent fake, since Menu nests under Outlet).
+ * equivalent fake, since Menu nests under Outlet). The menu-doc object also
+ * doubles as the root of `publishMenu`'s enabled-item existence query (via
+ * `domain/menuItems.ts`'s `hasEnabledMenuItem`) — `tx.get` tells the two
+ * apart by the `__kind` tag the query chain produces.
  */
 function fakeDb(opts: FakeDbOptions = {}) {
   const menuAutoId = "menu-auto-1";
   const creates: Array<{data: unknown}> = [];
   const updates: Array<{data: unknown}> = [];
+  const hasEnabledItem = opts.hasEnabledItem ?? true;
 
   const tx = {
-    get: vi.fn(async () => ({
-      exists: opts.existingMenu !== undefined,
-      data: () => opts.existingMenu,
-    })),
+    get: vi.fn(async (ref?: {__kind?: string}) => {
+      if (ref?.__kind === "itemsQuery") {
+        return {empty: !hasEnabledItem};
+      }
+      return {
+        exists: opts.existingMenu !== undefined,
+        data: () => opts.existingMenu,
+      };
+    }),
     update: vi.fn((_ref: unknown, data: unknown) => {
       updates.push({data});
     }),
@@ -154,6 +167,14 @@ function fakeDb(opts: FakeDbOptions = {}) {
       create: vi.fn(async (data: unknown) => {
         creates.push({data});
       }),
+      collection: (name: string) => {
+        if (name !== "items") throw new Error(`unexpected subcollection: ${name}`);
+        return {
+          where: () => ({
+            limit: () => ({__kind: "itemsQuery" as const}),
+          }),
+        };
+      },
     }),
     orderBy: () => ({
       orderBy: () => ({
@@ -589,6 +610,19 @@ describe(`POST ${MENU_PATH}/:menuId/publish`, () => {
 
     expect(result).toMatchObject({kind: "success", status: 200});
     expect(updates[0].data).toMatchObject({status: "published"});
+  });
+
+  it("rejects publishing a menu with no enabled items, mapped to 400 invalid_argument", async () => {
+    const {db, updates} = fakeDb({
+      membership: {role: "owner", status: "active"}, outlet: validOutletDoc(), existingMenu: validMenuDoc({status: "draft"}),
+      hasEnabledItem: false,
+    });
+    const handler = routeFor("POST", handlerPath, db, acceptingValidator("U-1"));
+
+    const result = await handler(publishCtx());
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+    expect(updates).toHaveLength(0);
   });
 
   it("rejects publishing an already-published menu with 400 invalid_argument", async () => {

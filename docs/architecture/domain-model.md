@@ -72,7 +72,10 @@ schedule: when ordering opens, when ordering closes, and the pickup
 window. "Ordering open" vs. "ordering closed" is not a separate stored
 state — it is computed from the current time against
 `orderingOpensAt`/`orderingClosesAt`, never persisted. A menu owns a
-list of `MenuItem`s.
+list of `MenuItem`s. **A menu can be published only when it contains at
+least one enabled menu item** — checked against the real, persisted
+`MenuItem` documents at publish time (see [http-api.md](./http-api.md#menu-lifecycle)),
+never trusted from client-supplied state.
 
 The first implementation (`functions/src/domain/menus.ts`,
 [http-api.md](./http-api.md#menus)) keeps this minimal: `id` (Firestore

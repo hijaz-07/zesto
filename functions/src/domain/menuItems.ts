@@ -1,6 +1,7 @@
 import {
   Timestamp,
   type Firestore,
+  type Transaction,
 } from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
@@ -326,6 +327,55 @@ export async function listMenuItemsForMenu(
 
   return snapshot.docs.map((doc) =>
     toMenuItemResponse(parseMenuItem(doc.data(), doc.id, menuId)));
+}
+
+/**
+ * Whether at least one enabled item currently exists for `menuId`, read
+ * directly from Firestore. Used by `domain/menus.ts`'s `publishMenu` to
+ * enforce that a menu may only be published once it has at least one
+ * enabled item — the ONLY reason `domain/menus.ts` depends on this module
+ * at all. This is a one-directional runtime dependency, not a circular
+ * one: this module's own reference to `Menu` (above) is a type-only
+ * import, which `tsc` erases completely from the compiled output, so
+ * `menus.js` importing `menuItems.js` creates no cycle in the actual
+ * module graph. Deliberately a narrow existence query
+ * (`.where("enabled", "==", true).limit(1)`), not `listMenuItemsForMenu`,
+ * since the caller only needs a yes/no answer, not every item's full
+ * parsed shape — this also needs no composite index, unlike the list
+ * query, since Firestore auto-indexes single-field equality filters.
+ *
+ * @param {Firestore} db Admin Firestore instance (used only to build the
+ *   query; the read itself goes through `tx`).
+ * @param {string} organizationId The organization the menu belongs to
+ *   (already authorized by the caller).
+ * @param {string} outletId The outlet the menu belongs to (already
+ *   verified by the caller).
+ * @param {string} menuId The menu to check (already verified by the caller).
+ * @param {Transaction} tx The in-progress transaction to read within, so
+ *   this check participates in the same optimistic-concurrency guarantees
+ *   as the rest of the caller's transaction (see `publishMenu`): if any
+ *   item matching (or newly matching, or no longer matching) this query
+ *   changes before that transaction commits, Firestore retries the whole
+ *   transaction instead of letting it commit against a stale answer.
+ * @return {Promise<boolean>} Whether at least one enabled item exists.
+ */
+export async function hasEnabledMenuItem(
+  db: Firestore,
+  organizationId: string,
+  outletId: string,
+  menuId: string,
+  tx: Transaction,
+): Promise<boolean> {
+  const enabledItemsQuery = db
+    .collection("organizations").doc(organizationId)
+    .collection("outlets").doc(outletId)
+    .collection("menus").doc(menuId)
+    .collection("items")
+    .where("enabled", "==", true)
+    .limit(1);
+
+  const snapshot = await tx.get(enabledItemsQuery);
+  return !snapshot.empty;
 }
 
 /**

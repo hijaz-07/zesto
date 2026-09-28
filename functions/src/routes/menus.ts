@@ -375,8 +375,10 @@ async function handlePatchMenu(
 
 /**
  * `POST .../menus/{menuId}/publish`: an explicit lifecycle operation, not a
- * generic PATCH. Requires the menu is currently `draft` and the outlet is
- * active. Takes no request body.
+ * generic PATCH. Requires the menu is currently `draft`, the outlet is
+ * active, and (enforced inside `publishMenu` itself, against real
+ * Firestore item documents) the menu has at least one enabled item. Takes
+ * no request body.
  *
  * @param {RouteContext} ctx The route context.
  * @param {MenusRouteDeps} deps The route's dependencies.

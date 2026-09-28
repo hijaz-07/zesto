@@ -641,6 +641,11 @@ describe("PATCH .../items/:itemId (Firestore emulator)", () => {
     expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
   });
 
+  // Explicit timeout: comfortably inside vitest's 5000ms default in
+  // isolation, but this transaction retry occasionally runs long enough to
+  // miss it when the full suite shares one emulator instance across every
+  // *.emulator.test.ts file (observed intermittently, independent of this
+  // session's changes to publishMenu).
   it("concurrent updates to different fields both succeed, leaving a well-formed document", async () => {
     const {organizationId, ownerId, outletId, menuId, itemId} = await setupItem();
     const validator = acceptingValidator(ownerId);
@@ -656,7 +661,7 @@ describe("PATCH .../items/:itemId (Firestore emulator)", () => {
     expect(typeof stored?.name).toBe("string");
     expect(typeof stored?.priceInPaise).toBe("number");
     expect(Number.isInteger(stored?.priceInPaise)).toBe(true);
-  });
+  }, 15000);
 });
 
 describe("DELETE .../items/:itemId (Firestore emulator)", () => {

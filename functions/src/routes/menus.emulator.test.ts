@@ -4,6 +4,7 @@ import {getApps, initializeApp} from "firebase-admin/app";
 import {getFirestore, type Firestore} from "firebase-admin/firestore";
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import type {SessionValidator} from "../auth/session";
+import {createMenuItem, deleteMenuItem, updateMenuItem} from "../domain/menuItems";
 import {createOrganization} from "../domain/organizations";
 import {createOutlet, updateOutlet} from "../domain/outlets";
 import {handleRequest} from "../http/handleRequest";
@@ -360,6 +361,9 @@ describe("GET .../menus (list, Firestore emulator)", () => {
     const created = await callCreate(organizationId, outletId, validator, freshMenuInput());
     if (created.kind !== "success") throw new Error("setup failed");
     const menuId = (created.data as {menu: {id: string}}).menu.id;
+    await createMenuItem(db, organizationId, outletId, menuId, ownerId, {
+      name: "Test Item", priceInPaise: 12000, displayOrder: 1,
+    });
     await callPublish(organizationId, outletId, menuId, validator);
     await callArchive(organizationId, outletId, menuId, validator);
 
@@ -481,6 +485,9 @@ describe("PATCH .../menus/:menuId (Firestore emulator)", () => {
 
   it("an archived menu cannot be edited (400), and the stored document is left unchanged", async () => {
     const {organizationId, ownerId, outletId, menuId} = await setupMenu();
+    await createMenuItem(db, organizationId, outletId, menuId, ownerId, {
+      name: "Test Item", priceInPaise: 12000, displayOrder: 1,
+    });
     await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
     await callArchive(organizationId, outletId, menuId, acceptingValidator(ownerId));
     const before = await readMenuDoc(organizationId, outletId, menuId);
@@ -562,13 +569,23 @@ describe("PATCH .../menus/:menuId (Firestore emulator)", () => {
 });
 
 describe("POST .../menus/:menuId/publish (Firestore emulator)", () => {
+  /**
+   * A draft menu with one real, enabled item already on it — the minimum
+   * a menu needs to be publishable under the "at least one enabled item"
+   * rule (see domain/menus.ts's publishMenu). The item is created directly
+   * via the Menu Item domain layer, matching this file's existing
+   * convention for ancestor/incidental setup (createOutlet, updateOutlet).
+   */
   async function setupDraftMenu() {
     const {organizationId, ownerId} = await setupOrgWithOwner();
     const {outletId} = await setupOutlet(organizationId, ownerId);
     const created = await callCreate(organizationId, outletId, acceptingValidator(ownerId), freshMenuInput());
     if (created.kind !== "success") throw new Error("setup failed");
     const menuId = (created.data as {menu: {id: string}}).menu.id;
-    return {organizationId, ownerId, outletId, menuId};
+    const item = await createMenuItem(db, organizationId, outletId, menuId, ownerId, {
+      name: "Test Item", priceInPaise: 12000, displayOrder: 1,
+    });
+    return {organizationId, ownerId, outletId, menuId, itemId: item.id};
   }
 
   it("publishes a draft; publishedAt is generated; read-back confirms status and publishedAt", async () => {
@@ -585,6 +602,63 @@ describe("POST .../menus/:menuId/publish (Firestore emulator)", () => {
     const stored = await readMenuDoc(organizationId, outletId, menuId);
     expect(stored?.status).toBe("published");
     expect(stored?.publishedAt).toBeDefined();
+  });
+
+  it("rejects publishing a menu with zero items (400); read-back confirms it stays draft with no publishedAt", async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const {outletId} = await setupOutlet(organizationId, ownerId);
+    const created = await callCreate(organizationId, outletId, acceptingValidator(ownerId), freshMenuInput());
+    if (created.kind !== "success") throw new Error("setup failed");
+    const menuId = (created.data as {menu: {id: string}}).menu.id;
+
+    const result = await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+    const stored = await readMenuDoc(organizationId, outletId, menuId);
+    expect(stored?.status).toBe("draft");
+    expect(stored?.publishedAt).toBeUndefined();
+  });
+
+  it("rejects publishing a menu whose only item is disabled (400); read-back confirms it stays draft", async () => {
+    const {organizationId, ownerId, outletId, menuId, itemId} = await setupDraftMenu();
+    await updateMenuItem(db, organizationId, outletId, menuId, itemId, {enabled: false});
+
+    const result = await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+    const stored = await readMenuDoc(organizationId, outletId, menuId);
+    expect(stored?.status).toBe("draft");
+    expect(stored?.publishedAt).toBeUndefined();
+  });
+
+  it("publishes a menu that has both an enabled and a disabled item", async () => {
+    const {organizationId, ownerId, outletId, menuId} = await setupDraftMenu();
+    const disabledItem = await createMenuItem(db, organizationId, outletId, menuId, ownerId, {
+      name: "Disabled Item", priceInPaise: 8000, displayOrder: 2,
+    });
+    await updateMenuItem(db, organizationId, outletId, menuId, disabledItem.id, {enabled: false});
+
+    const result = await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
+
+    expect(result).toMatchObject({kind: "success", status: 200});
+  });
+
+  it("consults the real Firestore item collection, not any stale state: disabling the menu's only item after setup still blocks publish", async () => {
+    const {organizationId, ownerId, outletId, menuId, itemId} = await setupDraftMenu();
+
+    await updateMenuItem(db, organizationId, outletId, menuId, itemId, {enabled: false});
+    const result = await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("consults the real Firestore item collection: deleting the menu's only item after setup still blocks publish", async () => {
+    const {organizationId, ownerId, outletId, menuId, itemId} = await setupDraftMenu();
+
+    await deleteMenuItem(db, organizationId, outletId, menuId, itemId);
+    const result = await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
   });
 
   it("rejects publishing an already-published menu (400), and an archived one (400)", async () => {
@@ -633,6 +707,12 @@ describe("POST .../menus/:menuId/publish (Firestore emulator)", () => {
     }
   });
 
+  // Explicit timeout: this transaction now also reads the items
+  // subcollection (hasEnabledMenuItem) as part of resolving the race below,
+  // one more Firestore round-trip per attempt/retry than before that rule
+  // existed — comfortably inside vitest's 5000ms default in isolation, but
+  // occasionally not when run alongside this suite's other emulator-backed
+  // files sharing the one emulator instance.
   it("publish is atomic under concurrency: exactly one of two concurrent publishes succeeds, leaving no invalid state", async () => {
     const {organizationId, ownerId, outletId, menuId} = await setupDraftMenu();
     const validator = acceptingValidator(ownerId);
@@ -648,7 +728,7 @@ describe("POST .../menus/:menuId/publish (Firestore emulator)", () => {
     const stored = await readMenuDoc(organizationId, outletId, menuId);
     expect(stored?.status).toBe("published");
     expect(stored?.publishedAt).toBeDefined();
-  });
+  }, 15000);
 });
 
 describe("POST .../menus/:menuId/archive (Firestore emulator)", () => {
@@ -658,6 +738,9 @@ describe("POST .../menus/:menuId/archive (Firestore emulator)", () => {
     const created = await callCreate(organizationId, outletId, acceptingValidator(ownerId), freshMenuInput());
     if (created.kind !== "success") throw new Error("setup failed");
     const menuId = (created.data as {menu: {id: string}}).menu.id;
+    await createMenuItem(db, organizationId, outletId, menuId, ownerId, {
+      name: "Test Item", priceInPaise: 12000, displayOrder: 1,
+    });
     await callPublish(organizationId, outletId, menuId, acceptingValidator(ownerId));
     return {organizationId, ownerId, outletId, menuId};
   }

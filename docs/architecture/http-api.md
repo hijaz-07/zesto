@@ -399,6 +399,21 @@ transaction (read the current status, verify the transition, write), so a
 lifecycle change can never partially succeed, and two concurrent lifecycle
 mutations on the same menu can never both win.
 
+**A menu can be published only when it contains at least one enabled menu
+item.** This is checked by reading the menu's real `items` subcollection
+(`functions/src/domain/menuItems.ts`'s `hasEnabledMenuItem`) inside the same
+Firestore transaction as the status transition itself — never trusted from
+the request body or from frontend state — so a concurrent change to the
+menu's items while a publish is in flight cannot result in an
+effectively-empty menu being published. See
+[Menu items](#menu-items) below and
+[domain-model.md](./domain-model.md#menu) for the entity-level statement of
+this rule. This is a publish-**time** gate, not an ongoing invariant: an
+already-published menu's last enabled item can still be disabled afterward
+(see [Menu-lifecycle and ordering-window gate](#menu-lifecycle-and-ordering-window-gate)
+above) — a client must not assume every currently-published menu still has
+an enabled item.
+
 ### Outlet dependency
 
 | Endpoint | Outlet must be active? |
@@ -520,12 +535,15 @@ ordering-window-locked schedule edit, or an inactive outlet),
 No request body. Only an active `owner`/`manager` member may call this, and
 only for an active outlet. Requires the menu is currently `"draft"`;
 re-validates the stored schedule's business rules as a defense-in-depth
-step; then sets `status: "published"`, generates `publishedAt`, and bumps
+step; and requires the menu currently has at least one enabled item (see
+[Menu lifecycle](#menu-lifecycle) above) — read directly from Firestore
+inside the same transaction, never trusted from the request body. Only then
+does it set `status: "published"`, generate `publishedAt`, and bump
 `updatedAt` — all in one Firestore transaction. Success: `200` with the
 published menu.
 
-Errors: `400 invalid_argument` (not currently a draft, or an inactive
-outlet), `401 unauthenticated`, `403 permission_denied`, `404 not_found`,
+Errors: `400 invalid_argument` (not currently a draft, an inactive outlet,
+or no enabled item), `401 unauthenticated`, `403 permission_denied`, `404 not_found`,
 `503 unavailable`.
 
 ### `POST /organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/archive`

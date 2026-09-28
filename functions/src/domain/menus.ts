@@ -6,6 +6,7 @@ import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
 import {businessDateString} from "../time";
+import {hasEnabledMenuItem} from "./menuItems";
 
 /**
  * `organizations/{organizationId}/outlets/{outletId}/menus/{menuId}` — a
@@ -565,9 +566,24 @@ export async function updateMenu(
  * re-validates the stored schedule's business rules as a defense-in-depth
  * step (this can only fail if a stored document were ever written outside
  * the normal create/update path, since both already enforce
- * `findScheduleViolation`), then sets `status: "published"`, `publishedAt`,
- * and bumps `updatedAt` — all in one transaction, so a publish can never
- * partially succeed.
+ * `findScheduleViolation`), and requires at least one of the menu's items
+ * is currently enabled — read directly from Firestore's items subcollection
+ * inside this same transaction (`hasEnabledMenuItem`), never trusted from a
+ * request body or cached frontend state, and never satisfiable by a stale
+ * answer (see that function's own doc comment for the concurrency
+ * guarantee this relies on). Only then does it set `status: "published"`,
+ * `publishedAt`, and bump `updatedAt` — all in one transaction, so a
+ * publish can never partially succeed.
+ *
+ * KNOWN LIMITATION (by design, not a bug): "at least one enabled item"
+ * is a publish-TIME gate, not an ongoing invariant of a published menu.
+ * `findItemMutationViolation` (domain/menuItems.ts) still allows disabling
+ * a published menu's last enabled item while ordering is open — nothing
+ * here or elsewhere retroactively blocks that, since the demand a menu has
+ * already collected up to that point remains valid regardless. A caller
+ * must not assume every currently-published menu still has an enabled
+ * item; this function only guarantees it was true at the moment publish
+ * committed.
  *
  * @param {Firestore} db Admin Firestore instance.
  * @param {string} organizationId The organization the menu must belong to.
@@ -578,7 +594,8 @@ export async function updateMenu(
  * @throws {HttpsError} `invalid-argument` (400) if `menuId` is malformed.
  * @throws {HttpsError} `not-found` (404) if no such menu exists.
  * @throws {HttpsError} `failed-precondition` (400) if the menu is not
- *   currently `"draft"`, or its stored schedule is invalid.
+ *   currently `"draft"`, its stored schedule is invalid, or it has no
+ *   currently-enabled item.
  */
 export async function publishMenu(
   db: Firestore,
@@ -612,6 +629,18 @@ export async function publishMenu(
     const violation = findScheduleViolation(existing);
     if (violation) {
       throw new HttpsError("failed-precondition", violation);
+    }
+
+    // Firestore transactions require every read before any write; this
+    // read must therefore happen here, before tx.update below, not as a
+    // separate pre-check outside the transaction — otherwise a concurrent
+    // change to the menu's items between that pre-check and this write
+    // could publish an effectively-empty menu.
+    if (!(await hasEnabledMenuItem(db, organizationId, outletId, menuId, tx))) {
+      throw new HttpsError(
+        "failed-precondition",
+        "A menu must have at least one enabled item before it can be published.",
+      );
     }
 
     const updates = {
