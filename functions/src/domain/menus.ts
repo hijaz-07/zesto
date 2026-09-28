@@ -246,7 +246,9 @@ const menuDocSchema = z.object({
  * business rules (`findScheduleViolation`): `publishMenu` re-validates those
  * explicitly as its own defense-in-depth step, and GET/LIST must still be
  * able to display an existing menu even if its stored schedule were ever
- * invalid, rather than failing with a generic 500.
+ * invalid, rather than failing with a generic 500. Exported for
+ * `domain/explore.ts`, which resolves menus from collection-group query
+ * results rather than a known `organizationId`/`outletId` pair.
  *
  * @param {unknown} data The document's raw field data (`snapshot.data()`).
  * @param {string} expectedId The document ID it was read from.
@@ -255,7 +257,7 @@ const menuDocSchema = z.object({
  * @return {Menu} The parsed menu.
  * @throws {Error} If the stored document does not match the expected shape.
  */
-function parseMenu(
+export function parseMenu(
   data: unknown,
   expectedId: string,
   expectedOrganizationId: string,

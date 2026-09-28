@@ -60,6 +60,13 @@ organization's own slug uses) and **immutable for now**. Only an
 organization's `owner`/`manager` may create or edit an outlet; any active
 member (including `staff`) may view the list.
 
+An **active** outlet is also readable by anonymous customers, in reduced
+form, through the public `GET /explore/outlets[/{outletId}]` endpoints (see
+[http-api.md](./http-api.md#explore-public-customer-discovery)) — `id`,
+`name`, `description`, and only the `city`/`state` of `address`; never
+`slug`, `phone`, `location`, or any audit field. There is no customer ↔
+organization affiliation yet, and no GPS/location-based discovery.
+
 ### OutletMember
 A `User` granted a role scoped to a single `Outlet`, for staff who
 work at one location rather than across the whole organization.
@@ -93,6 +100,14 @@ matching Zesto's demand-driven design
 (see "How these fit the demand-driven model" below) — quantity is
 introduced later, at the `Order`/`OrderItem` level, as demand rather
 than a reservation against this menu.
+
+A **published** menu whose service date hasn't passed is also readable by
+anonymous customers, in reduced form, through the public
+`GET /explore/outlets/{outletId}[/menus/{menuId}]` endpoints (see
+[http-api.md](./http-api.md#explore-public-customer-discovery)); a
+`draft`/`archived` menu is never exposed there. The default customer
+discovery feed additionally excludes a published menu whose ordering has
+already closed, but a known direct link to it still resolves read-only.
 
 ### MenuItem
 A single dish offered on a `Menu` — name, description, price, image,
@@ -129,6 +144,12 @@ only be disabled (`enabled: false`), never deleted, so historical menu/
 order data is never destroyed. Reads are never gated by any of this.
 Only an organization's `owner`/`manager` may create, edit, or delete an
 item; any active member (including `staff`) may view it.
+
+Only an **enabled** item on a customer-visible published menu is ever
+returned by the public `GET /explore/outlets/{outletId}/menus/{menuId}`
+endpoint (see [http-api.md](./http-api.md#explore-public-customer-discovery))
+— a disabled item is omitted completely, not returned with
+`enabled: false`, and `priceInPaise` stays an integer there too.
 
 ### Order
 A customer's pre-order against a specific `Menu`. An `Order` records

@@ -118,7 +118,8 @@ const menuItemDocSchema = z.object({
 /**
  * Parses a stored menu item document, validating it was written in the
  * expected shape and that its `id`/`menuId` fields match the path it was
- * read from.
+ * read from. Exported for `domain/explore.ts`, which reads a published
+ * menu's enabled items for the public customer menu-detail endpoint.
  *
  * @param {unknown} data The document's raw field data (`snapshot.data()`).
  * @param {string} expectedId The document ID it was read from.
@@ -126,7 +127,7 @@ const menuItemDocSchema = z.object({
  * @return {MenuItem} The parsed menu item.
  * @throws {Error} If the stored document does not match the expected shape.
  */
-function parseMenuItem(
+export function parseMenuItem(
   data: unknown,
   expectedId: string,
   expectedMenuId: string,

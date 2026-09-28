@@ -29,6 +29,8 @@ functions/src/
                          POST .../menus/{menuId}/publish|archive
     menuItems.ts         POST/GET .../menus/{menuId}/items,
                          GET/PATCH/DELETE .../items/{itemId}
+    explore.ts           GET /explore/outlets[/{outletId}[/menus/{menuId}]]
+                         — public, unauthenticated customer discovery
   domain/
     users.ts             users/{userId} profile: schema + get-or-create
     organizations.ts     organizations/*, organizationSlugs/*, and the
@@ -36,6 +38,8 @@ functions/src/
     outlets.ts           organizations/*/outlets/*, organizations/*/outletSlugs/*
     menus.ts             organizations/*/outlets/*/menus/*
     menuItems.ts         organizations/*/outlets/*/menus/*/items/*
+    explore.ts           customer-safe read views of outlets/menus/menu
+                         items for the public /explore routes
   auth/
     session.ts           verifyDescopeSession / authenticateRequest
     membership.ts         organization role authorization (unrelated to /me)
@@ -740,6 +744,206 @@ remaining-quantity concept anywhere in the menu or menu item model (see
 [domain-model.md](./domain-model.md#menu)). Historical order pricing (an
 `Order`'s immutable `unitPriceInPaiseAtOrder` snapshot) is a future Orders
 concern, not part of this implementation.
+
+## Explore (public customer discovery)
+
+`GET /explore/outlets`, `GET /explore/outlets/{outletId}`, and
+`GET /explore/outlets/{outletId}/menus/{menuId}` (`functions/src/routes/explore.ts`
++ `functions/src/domain/explore.ts`) are Zesto's first **customer-facing**
+endpoints — everything above this section is organization-management only.
+This is Step 9A of the roadmap: public read APIs only. There is no customer
+React UI, cart, order, payment, GPS/location, or customer↔organization
+affiliation yet, and this v1 uses **"Explore Outlets"**, deliberately not
+"Nearby" — no geolocation feature exists yet, and `Outlet.location`
+(latitude/longitude) is never returned by these endpoints.
+
+### Public access model
+
+These are the only three routes in this codebase that never call
+`authenticateRequest`. They work identically:
+
+- with no `Authorization` header at all,
+- with a valid Descope session (the session is simply never inspected), and
+- for a caller with no organization membership whatsoever.
+
+Every other route (`/me`, `/organizations`, and all outlet/menu/menu-item
+management routes) is untouched and remains fully authenticated exactly as
+documented above. No new HTTP function and no router/auth-architecture
+change was needed: this codebase's router has never enforced authentication
+globally — every route file decides for itself whether to call
+`authenticateRequest` (see [Authentication pipeline](#authentication-pipeline)
+above) — so `routes/explore.ts` simply never does. Only `GET` is registered
+for these three paths; any other method gets the router's normal `405
+method_not_allowed`.
+
+### Customer-visible filtering rules
+
+- **Outlet:** visible only when `status === "active"`. Never exposed:
+  `organizationId`, `slug`, `status`, `phone`, `location`, `createdBy`,
+  `createdAt`, `updatedAt`. The address is reduced to `{ city?, state? }`
+  only — `line1`, `line2`, and `postalCode` are never returned.
+- **Menu:** visible only when `status === "published"` — a `draft` or
+  `archived` menu is treated exactly like a nonexistent one. Never exposed:
+  `organizationId`, `outletId`, `status`, `createdBy`, `createdAt`,
+  `updatedAt`, `publishedAt`.
+- **Menu item:** visible only when `enabled === true`; a disabled item is
+  omitted completely (never returned with `enabled: false`). Ordered by
+  `displayOrder` ascending, then `createdAt` ascending, matching the
+  management endpoint's convention. Never exposed: `menuId`, `enabled`,
+  `createdBy`, `createdAt`, `updatedAt`.
+- **Price:** `priceInPaise` is always a non-negative integer, exactly as in
+  the management API — never floating-point rupees (see root `CLAUDE.md`).
+
+For the **default Explore feed** (`GET /explore/outlets`) and the **outlet
+explore page** (`GET /explore/outlets/{outletId}`), a published menu must
+additionally satisfy:
+
+- `menuDate` is not before today in Zesto's business time zone
+  (`functions/src/time.ts`'s `businessDateString`, Asia/Kolkata), and
+- ordering has **not already closed** (`now < orderingClosesAt`).
+
+Ordering has **not yet opened** is fine — a published menu is visible before
+its ordering window opens and while it's open, just not once it's closed.
+The **menu detail endpoint** (`GET .../menus/{menuId}`) is deliberately
+looser: a known, direct link to an already-closed published menu still
+resolves, read-only — only `draft`/`archived`/nonexistent menus 404 there.
+
+`orderingState` (`"not_open" | "open" | "closed"`) is included on every
+menu representation these endpoints return. It is derived on every request
+from `orderingOpensAt`/`orderingClosesAt` versus the current instant — never
+persisted in Firestore. Boundary semantics match the existing convention in
+`domain/menuItems.ts`'s `findItemMutationViolation`: `"closed"` is inclusive
+of the exact `orderingClosesAt` instant.
+
+### `GET /explore/outlets`
+
+The default customer discovery feed: one entry per active outlet that has
+at least one upcoming, customer-visible published menu, paired with the
+earliest such menu. `200` with
+
+```jsonc
+{
+  "data": {
+    "outlets": [
+      {
+        "id": "...", "name": "Main Canteen", "description": "...",
+        "address": { "city": "Kasaragod", "state": "Kerala" },
+        "nextMenu": {
+          "id": "...", "menuDate": "2026-09-29", "title": "Tuesday Special Menu",
+          "orderingOpensAt": "...", "orderingClosesAt": "...",
+          "pickupStartsAt": "...", "pickupEndsAt": "...",
+          "orderingState": "not_open"
+        }
+      }
+    ]
+  }
+}
+```
+
+ordered by `nextMenu.menuDate` ascending, then that menu's `createdAt`
+ascending, then (only to break an otherwise-exact tie) the outlet's `name`
+then `id` ascending; `[]` if nothing qualifies.
+
+### `GET /explore/outlets/{outletId}`
+
+One active outlet and its upcoming customer-visible menus (no items). `404
+not_found` if the outlet doesn't exist or isn't active — the same
+secure-not-found behavior used throughout this codebase, so an anonymous
+caller can never distinguish "doesn't exist" from "isn't visible to you."
+`200` with
+
+```jsonc
+{
+  "data": {
+    "outlet": { "id": "...", "name": "...", "description": "...", "address": {"city": "...", "state": "..."} },
+    "menus": [
+      {
+        "id": "...", "menuDate": "...", "title": "...", "description": "...",
+        "orderingOpensAt": "...", "orderingClosesAt": "...",
+        "pickupStartsAt": "...", "pickupEndsAt": "...", "orderingState": "..."
+      }
+    ]
+  }
+}
+```
+
+ordered by `menuDate` then `createdAt` ascending; `[]` if none qualify.
+
+### `GET /explore/outlets/{outletId}/menus/{menuId}`
+
+One customer-safe published menu and its enabled items. `404 not_found` if
+the outlet doesn't exist/isn't active, the menu doesn't exist under that
+outlet, or the menu isn't `published` (draft/archived/wrong-outlet/wrong-
+organization are all indistinguishable 404s — never leaking which). `200`
+with
+
+```jsonc
+{
+  "data": {
+    "outlet": { "id": "...", "name": "...", "description": "...", "address": {"city": "...", "state": "..."} },
+    "menu": {
+      "id": "...", "menuDate": "...", "title": "...", "description": "...",
+      "orderingOpensAt": "...", "orderingClosesAt": "...",
+      "pickupStartsAt": "...", "pickupEndsAt": "...", "orderingState": "...",
+      "items": [
+        { "id": "...", "name": "Chicken Biriyani", "description": "...", "priceInPaise": 12000, "displayOrder": 1 }
+      ]
+    }
+  }
+}
+```
+
+### Discovery query design
+
+There is no global public-discovery collection: the existing hierarchy
+(`organizations/{organizationId}/outlets/{outletId}/menus/{menuId}`) is
+queried directly. `listExploreOutlets` (`domain/explore.ts`) runs one bounded
+**collection-group** query over every outlet's `menus` subcollection —
+`status == "published"`, `menuDate >= today`, ordered by `menuDate` then
+`createdAt`, `limit(200)` — then resolves the candidate menus' parent
+outlets with a single batched `db.getAll(...)` (the same "collection-group
+query, then `getAll` the resolved parents" shape as
+`domain/organizations.ts`'s `listOrganizationsForUser`). Inactive outlets,
+already-closed menus, and duplicate outlets are then filtered/deduplicated
+in memory, and the result is capped at 50 outlets. `GET
+/explore/outlets/{outletId}` reuses the same composite index for a
+single-outlet query (a `COLLECTION_GROUP`-scoped composite index also
+serves an equivalent single-collection query on that collection ID).
+
+Resolving `{outletId}` alone (the route carries no `organizationId`) uses a
+collection-group query on `outlets` filtered by the outlet's own `id` field
+(a field override enables this in `firestore.indexes.json`). Outlet IDs are
+Firestore auto-IDs — effectively globally unique — so this should return at
+most one match; if it were ever ambiguous, the lookup fails closed as
+"not found" rather than guessing.
+
+**Known v1 scalability limitation:** the 200-menu candidate scan and the
+50-outlet result cap mean the default feed has no pagination. If more than
+200 published, not-yet-closed future menus exist platform-wide before 50
+distinct qualifying outlets are found (ordered by `menuDate` then
+`createdAt`), an outlet whose only qualifying menu sorts after that cutoff
+will not appear in the feed. This is acceptable for a v1 read path at
+Zesto's current expected scale; a future iteration would need real
+pagination (or a denormalized discovery collection) rather than a larger
+hardcoded limit.
+
+### New indexes for this step
+
+`firestore.indexes.json` gained:
+
+- A composite index: `menus`, `COLLECTION_GROUP` scope, `status` + `menuDate`
+  + `createdAt` (all ascending) — powers both `/explore` menu queries above.
+- A composite index: `items`, `COLLECTION` scope, `enabled` + `displayOrder`
+  + `createdAt` (all ascending) — powers the menu-detail endpoint's
+  enabled-items-only query (`hasEnabledMenuItem`'s existing bare
+  `enabled == true` check needs no index, since it has no `orderBy`; this
+  query does).
+- A field override enabling collection-group indexing on `outlets.id`
+  (ascending) — powers `{outletId}` resolution above.
+
+No Firestore rules changed: these endpoints read exclusively through the
+Admin SDK, which bypasses `firestore.rules` entirely, exactly like every
+other route in this codebase (see `firestore.rules`'s own header comment).
 
 ## Local emulator setup
 

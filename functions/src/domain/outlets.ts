@@ -169,7 +169,7 @@ const outletDocSchema = z.object({
  * @return {Outlet} The parsed outlet.
  * @throws {Error} If the stored document does not match the expected shape.
  */
-function parseOutlet(
+export function parseOutlet(
   data: unknown,
   expectedId: string,
   expectedOrganizationId: string,
@@ -193,7 +193,9 @@ function parseOutlet(
  * read-only half of what `updateOutlet` already does — used by other
  * domain modules (e.g. `domain/menus.ts`, via `routes/menus.ts`) that need
  * to confirm an outlet exists and inspect its `status` before proceeding,
- * without needing to mutate it.
+ * without needing to mutate it. `parseOutlet` itself is also exported, for
+ * `domain/explore.ts`, which resolves outlets from a collection-group query
+ * result rather than a known `organizationId`/`outletId` pair.
  *
  * @param {Firestore} db Admin Firestore instance.
  * @param {string} organizationId The organization the outlet must belong to
