@@ -3,7 +3,9 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import type { OrganizationId } from '../domain/types';
 import { OrganizationSideNav } from '../components/layout/OrganizationSideNav';
 import { OrganizationAnalyticsPage } from '../pages/organization/OrganizationAnalyticsPage';
+import { OrganizationCreateMenuPage } from '../pages/organization/OrganizationCreateMenuPage';
 import { OrganizationDashboardPage } from '../pages/organization/OrganizationDashboardPage';
+import { OrganizationMenuEditorPage } from '../pages/organization/OrganizationMenuEditorPage';
 import { OrganizationMenusPage } from '../pages/organization/OrganizationMenusPage';
 import { OrganizationOrdersPage } from '../pages/organization/OrganizationOrdersPage';
 import { OrganizationOutletMenusPage } from '../pages/organization/OrganizationOutletMenusPage';
@@ -26,6 +28,14 @@ export function OrganizationAppLayout({ organizationId }: OrganizationAppLayoutP
           <Route
             path="menus/:outletId"
             element={<OrganizationOutletMenusPage organizationId={organizationId} />}
+          />
+          <Route
+            path="menus/:outletId/new"
+            element={<OrganizationCreateMenuPage organizationId={organizationId} />}
+          />
+          <Route
+            path="menus/:outletId/:menuId"
+            element={<OrganizationMenuEditorPage organizationId={organizationId} />}
           />
           <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
           <Route path="orders" element={<OrganizationOrdersPage />} />

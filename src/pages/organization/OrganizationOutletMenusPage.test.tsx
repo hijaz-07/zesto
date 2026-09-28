@@ -134,6 +134,8 @@ function renderPage(outletId = 'outlet-1') {
           path="/org/menus/:outletId"
           element={<OrganizationOutletMenusPage organizationId="org-1" />}
         />
+        <Route path="/org/menus/:outletId/new" element={<div>Create menu page</div>} />
+        <Route path="/org/menus/:outletId/:menuId" element={<div>Menu detail page</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -331,5 +333,27 @@ describe('OrganizationOutletMenusPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Back to Outlets' }));
 
     expect(screen.getByText('Outlet picker page')).toBeInTheDocument();
+  });
+
+  it('25. Create Menu navigates to the draft-menu creation form', () => {
+    mockOutlets({ status: 'ready', outlets: [activeOutlet] });
+    mockMenus({ status: 'ready', menus: [publishedOpen] });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create Menu' }));
+
+    expect(screen.getByText('Create menu page')).toBeInTheDocument();
+  });
+
+  it('26. Manage Menu navigates to that menu\'s detail page', () => {
+    mockOutlets({ status: 'ready', outlets: [activeOutlet] });
+    mockMenus({ status: 'ready', menus: [publishedOpen] });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: `Manage ${publishedOpen.title}` }));
+
+    expect(screen.getByText('Menu detail page')).toBeInTheDocument();
   });
 });

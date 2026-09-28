@@ -1,31 +1,14 @@
-import type { BadgeTone } from '../../components/ui/Badge';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
-import { formatDate, formatTime, getOrderingState, type OrderingState } from '../../utils/date';
-import type { Menu, MenuStatus } from './types';
+import { formatDate, formatTime, getOrderingState } from '../../utils/date';
+import { MENU_STATUS_TONE, ORDERING_STATE_LABEL, ORDERING_STATE_TONE } from './badges';
+import type { Menu } from './types';
 
 export interface MenuCardProps {
   menu: Menu;
+  onManage: () => void;
 }
-
-const STATUS_TONE: Record<MenuStatus, BadgeTone> = {
-  draft: 'warning',
-  published: 'success',
-  archived: 'neutral',
-};
-
-const ORDERING_STATE_LABEL: Record<OrderingState, string> = {
-  not_open: 'NOT OPEN',
-  open: 'OPEN',
-  closed: 'CLOSED',
-};
-
-const ORDERING_STATE_TONE: Record<OrderingState, BadgeTone> = {
-  not_open: 'neutral',
-  open: 'success',
-  closed: 'warning',
-};
 
 /**
  * One menu in an outlet's menu list. `status` (draft/published/archived) and
@@ -34,14 +17,8 @@ const ORDERING_STATE_TONE: Record<OrderingState, BadgeTone> = {
  * combined into a single label — a published menu can be "not open" or
  * "closed" just as easily as "open", and collapsing that into one status
  * would misrepresent it.
- *
- * "Manage Menu" is a disabled placeholder: the menu detail/editor page
- * (`/org/menus/{outletId}/{menuId}`) doesn't exist yet. Wiring it up in a
- * later step only needs an `onManage` callback added here and the
- * `disabled` prop dropped — this component and its caller don't need to be
- * restructured.
  */
-export function MenuCard({ menu }: MenuCardProps) {
+export function MenuCard({ menu, onManage }: MenuCardProps) {
   const orderingState = getOrderingState(menu.orderingOpensAt, menu.orderingClosesAt);
 
   return (
@@ -50,7 +27,7 @@ export function MenuCard({ menu }: MenuCardProps) {
         <div className="flex items-start justify-between gap-2">
           <h3 className="font-medium text-text">{menu.title}</h3>
           <div className="flex shrink-0 items-center gap-1.5">
-            <Badge tone={STATUS_TONE[menu.status]}>{menu.status.toUpperCase()}</Badge>
+            <Badge tone={MENU_STATUS_TONE[menu.status]}>{menu.status.toUpperCase()}</Badge>
             <Badge tone={ORDERING_STATE_TONE[orderingState]}>{ORDERING_STATE_LABEL[orderingState]}</Badge>
           </div>
         </div>
@@ -72,11 +49,10 @@ export function MenuCard({ menu }: MenuCardProps) {
         </div>
       </dl>
 
-      <div className="mt-1 flex flex-col gap-1">
-        <Button variant="secondary" disabled aria-label={`Manage ${menu.title}`}>
+      <div className="mt-1">
+        <Button variant="secondary" onClick={onManage} aria-label={`Manage ${menu.title}`}>
           Manage Menu
         </Button>
-        <p className="text-xs text-muted">Menu management is coming in a future update.</p>
       </div>
     </Card>
   );

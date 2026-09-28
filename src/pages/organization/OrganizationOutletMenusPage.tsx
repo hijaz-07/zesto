@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { IonContent, IonIcon, IonPage } from '@ionic/react';
 import { addOutline, arrowBackOutline } from 'ionicons/icons';
 import { useNavigate, useParams } from 'react-router-dom';
-import type { OrganizationId, Outlet } from '../../domain/types';
+import type { OrganizationId, Outlet, OutletId } from '../../domain/types';
 import { OrganizationPageToolbar } from '../../components/layout/OrganizationPageToolbar';
 import { PageHeader } from '../../components/common/PageHeader';
 import { LoadingState } from '../../components/common/LoadingState';
@@ -20,12 +20,15 @@ export interface OrganizationOutletMenusPageProps {
   organizationId: OrganizationId;
 }
 
-const CREATE_MENU_LABEL = 'Create Menu — not implemented yet';
+interface CreateMenuButtonProps {
+  outletId: OutletId;
+}
 
-/** Disabled placeholder for the menu-create action: the create form is a later step. */
-function CreateMenuButton() {
+/** Navigates to the draft-menu creation form for `outletId`. */
+function CreateMenuButton({ outletId }: CreateMenuButtonProps) {
+  const navigate = useNavigate();
   return (
-    <Button disabled aria-label={CREATE_MENU_LABEL}>
+    <Button onClick={() => navigate(`/org/menus/${outletId}/new`)}>
       <IonIcon icon={addOutline} />
       Create Menu
     </Button>
@@ -45,6 +48,7 @@ interface OutletMenuListProps {
  */
 function OutletMenuList({ organizationId, outlet }: OutletMenuListProps) {
   const { status, menus, error, retry } = useMenus(organizationId, outlet.id);
+  const navigate = useNavigate();
   const isActive = outlet.status === 'active';
 
   if (status === 'loading') {
@@ -70,7 +74,7 @@ function OutletMenuList({ organizationId, outlet }: OutletMenuListProps) {
             ? 'Create a future menu for this outlet.'
             : 'The outlet must be active before a new menu can be created.'
         }
-        action={isActive ? <CreateMenuButton /> : undefined}
+        action={isActive ? <CreateMenuButton outletId={outlet.id} /> : undefined}
       />
     );
   }
@@ -78,7 +82,7 @@ function OutletMenuList({ organizationId, outlet }: OutletMenuListProps) {
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
       {menus.map((menu) => (
-        <MenuCard key={menu.id} menu={menu} />
+        <MenuCard key={menu.id} menu={menu} onManage={() => navigate(`/org/menus/${outlet.id}/${menu.id}`)} />
       ))}
     </div>
   );
@@ -146,16 +150,15 @@ export function OrganizationOutletMenusPage({ organizationId }: OrganizationOutl
           <PageHeader
             title={outlet ? outlet.name : 'Menus'}
             subtitle={outlet ? 'Menus for this outlet.' : undefined}
-            actions={outlet ? (isActive ? <CreateMenuButton /> : <Badge tone="neutral">INACTIVE</Badge>) : undefined}
+            actions={
+              outlet ? (isActive ? <CreateMenuButton outletId={outlet.id} /> : <Badge tone="neutral">INACTIVE</Badge>) : undefined
+            }
           />
-          {outlet &&
-            (isActive ? (
-              <p className="text-xs text-muted">Menu creation is coming in a future update.</p>
-            ) : (
-              <p className="rounded-lg bg-background px-3 py-2 text-xs text-muted">
-                New menus cannot be created while this outlet is inactive.
-              </p>
-            ))}
+          {outlet && !isActive && (
+            <p className="rounded-lg bg-background px-3 py-2 text-xs text-muted">
+              New menus cannot be created while this outlet is inactive.
+            </p>
+          )}
           {outlet ? <OutletMenuList organizationId={organizationId} outlet={outlet} /> : fallback}
         </div>
       </IonContent>

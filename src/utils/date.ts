@@ -26,6 +26,62 @@ export function formatDate(isoDate: ISODateString): string {
   }).format(new Date(isoDate));
 }
 
+/**
+ * Zesto's business time zone (Asia/Kolkata) has no daylight-saving
+ * transitions, so its UTC offset is always exactly `+05:30` — safe to
+ * hardcode rather than resolve per-instant. Mirrors
+ * functions/src/time.ts#BUSINESS_TIME_ZONE.
+ */
+const BUSINESS_TIME_ZONE = 'Asia/Kolkata';
+const BUSINESS_UTC_OFFSET = '+05:30';
+
+const BUSINESS_DATE_FORMATTER = new Intl.DateTimeFormat('en-CA', {
+  timeZone: BUSINESS_TIME_ZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
+const BUSINESS_TIME_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: BUSINESS_TIME_ZONE,
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false,
+});
+
+/**
+ * Today's calendar date in Zesto's business time zone, `YYYY-MM-DD`. Mirrors
+ * functions/src/time.ts#businessDateString; takes an explicit `now` (like
+ * `getOrderingState` below) so callers can test it without fake timers.
+ */
+export function businessToday(now: Date = new Date()): string {
+  return BUSINESS_DATE_FORMATTER.format(now);
+}
+
+/** An ISO instant's calendar date in Zesto's business time zone, `YYYY-MM-DD`. */
+export function businessDateOf(isoDateTime: ISODateString): string {
+  return BUSINESS_DATE_FORMATTER.format(new Date(isoDateTime));
+}
+
+/** An ISO instant's local clock time in Zesto's business time zone, 24-hour `HH:mm`. */
+export function businessTimeOf(isoDateTime: ISODateString): string {
+  return BUSINESS_TIME_FORMATTER.format(new Date(isoDateTime));
+}
+
+/**
+ * Combines a calendar date (`YYYY-MM-DD`) and 24-hour local time (`HH:mm`),
+ * both already understood to be in Zesto's business time zone, into an ISO
+ * 8601 timestamp with an explicit offset — the shape the menus API expects.
+ * Deliberately NOT `new Date(`${date}T${time}`)`: that parses in the
+ * browser's own time zone, silently producing the wrong instant for any
+ * viewer outside Asia/Kolkata. Callers are expected to supply well-formed
+ * `date`/`time` (e.g. straight from an `<input type="date">`/`type="time">`);
+ * this does no parsing or validation of its own.
+ */
+export function toBusinessTimestamp(date: string, time: string): string {
+  return `${date}T${time}:00${BUSINESS_UTC_OFFSET}`;
+}
+
 export type OrderingState = 'not_open' | 'open' | 'closed';
 
 /**

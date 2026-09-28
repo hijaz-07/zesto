@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { formatDate, getOrderingState } from './date';
+import { businessDateOf, businessTimeOf, businessToday, formatDate, getOrderingState, toBusinessTimestamp } from './date';
 
 const orderingOpensAt = '2026-09-28T04:00:00+05:30';
 const orderingClosesAt = '2026-09-29T10:00:00+05:30';
@@ -76,5 +76,56 @@ describe('getOrderingState', () => {
     const farFutureOpensAt = '2099-01-01T00:00:00+05:30';
     const farFutureClosesAt = '2099-01-02T00:00:00+05:30';
     expect(getOrderingState(farFutureOpensAt, farFutureClosesAt)).toBe('not_open');
+  });
+});
+
+describe('businessToday', () => {
+  const originalTz = process.env.TZ;
+
+  afterEach(() => {
+    process.env.TZ = originalTz;
+  });
+
+  it('returns the Asia/Kolkata calendar date for the given instant', () => {
+    expect(businessToday(new Date('2026-09-28T20:00:00+05:30'))).toBe('2026-09-28');
+  });
+
+  it('rolls over to the next Asia/Kolkata day before UTC midnight', () => {
+    // 2026-09-28T19:00:00Z is 2026-09-29T00:30:00+05:30 — already tomorrow in Kolkata.
+    expect(businessToday(new Date('2026-09-28T19:00:00Z'))).toBe('2026-09-29');
+  });
+
+  it('is independent of the host machine\'s local time zone', () => {
+    process.env.TZ = 'America/Los_Angeles';
+    expect(businessToday(new Date('2026-09-28T19:00:00Z'))).toBe('2026-09-29');
+  });
+});
+
+describe('businessDateOf / businessTimeOf', () => {
+  it('reads the Asia/Kolkata calendar date and local time from an ISO instant', () => {
+    expect(businessDateOf('2026-09-28T08:00:00+05:30')).toBe('2026-09-28');
+    expect(businessTimeOf('2026-09-28T08:00:00+05:30')).toBe('08:00');
+  });
+
+  it('converts a UTC instant into its Asia/Kolkata date and time', () => {
+    // 2026-09-28T19:00:00Z == 2026-09-29T00:30:00+05:30.
+    expect(businessDateOf('2026-09-28T19:00:00Z')).toBe('2026-09-29');
+    expect(businessTimeOf('2026-09-28T19:00:00Z')).toBe('00:30');
+  });
+
+  it('pads a single-digit hour and minute to two digits', () => {
+    expect(businessTimeOf('2026-09-28T00:05:00+05:30')).toBe('00:05');
+  });
+});
+
+describe('toBusinessTimestamp', () => {
+  it('combines a calendar date and 24-hour time into an ISO timestamp with the +05:30 offset', () => {
+    expect(toBusinessTimestamp('2026-09-29', '08:00')).toBe('2026-09-29T08:00:00+05:30');
+  });
+
+  it('round-trips through businessDateOf/businessTimeOf', () => {
+    const timestamp = toBusinessTimestamp('2026-12-31', '23:59');
+    expect(businessDateOf(timestamp)).toBe('2026-12-31');
+    expect(businessTimeOf(timestamp)).toBe('23:59');
   });
 });
