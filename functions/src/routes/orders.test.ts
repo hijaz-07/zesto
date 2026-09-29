@@ -118,12 +118,13 @@ function validCreateBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("createOrderRoutes", () => {
-  it("registers exactly the 3 documented routes", () => {
+  it("registers exactly the 4 documented routes", () => {
     const routes = createOrderRoutes({db: {} as Firestore});
     expect(routes.map((r) => `${r.method} ${r.path}`).sort()).toEqual([
       "GET /orders/:orderId",
       "POST /orders",
       "POST /orders/:orderId/payment",
+      "POST /orders/:orderId/payment/verify",
     ]);
   });
 });
@@ -282,6 +283,101 @@ describe("POST /orders/:orderId/payment", () => {
     }));
 
     // Still 401 — the body is never even read before authentication.
+    expect(result).toMatchObject({kind: "error", status: 401});
+  });
+});
+
+function validVerifyBody(overrides: Record<string, unknown> = {}) {
+  return {
+    razorpayOrderId: "order_test1",
+    razorpayPaymentId: "pay_test1",
+    razorpaySignature: "deadbeef",
+    ...overrides,
+  };
+}
+
+describe("POST /orders/:orderId/payment/verify", () => {
+  it("maps a rejected session to 401 with WWW-Authenticate: Bearer, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), rejectingValidator());
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment/verify", body: validVerifyBody()}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({
+      kind: "error",
+      status: 401,
+      code: "unauthenticated",
+      headers: {"WWW-Authenticate": "Bearer"},
+    });
+  });
+
+  it("maps an infrastructure failure to 503, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), unavailableValidator());
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment/verify", body: validVerifyBody()}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 503, code: "unavailable"});
+  });
+
+  it("authenticates before ever parsing the body: an invalid body under a rejected session is still 401", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), rejectingValidator());
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment/verify", body: {not: "valid"}}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 401});
+  });
+
+  it("rejects a malformed order ID as 400, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), acceptingValidator("U-1"));
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/../payment/verify", body: validVerifyBody()}),
+      params: {orderId: ".."},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it.each([
+    ["missing razorpayOrderId", validVerifyBody({razorpayOrderId: undefined})],
+    ["missing razorpayPaymentId", validVerifyBody({razorpayPaymentId: undefined})],
+    ["missing razorpaySignature", validVerifyBody({razorpaySignature: undefined})],
+    ["empty razorpayOrderId", validVerifyBody({razorpayOrderId: ""})],
+    ["empty razorpaySignature", validVerifyBody({razorpaySignature: ""})],
+  ])("rejects an invalid body (%s) as 400, without touching Firestore", async (_label, body) => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), acceptingValidator("U-1"));
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment/verify", body}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("ignores client-supplied amount/currency/status/providerOrderId — the body is never even read before authentication", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment/verify", untouchedDb(), rejectingValidator());
+
+    const result = await handler(ctx({
+      request: request({
+        method: "POST",
+        path: "/orders/order-1/payment/verify",
+        body: validVerifyBody({
+          amountInPaise: 1, currency: "USD", status: "succeeded", providerOrderId: "attacker-order",
+        }),
+      }),
+      params: {orderId: "order-1"},
+    }));
+
+    // Still 401 — auth runs before the body is ever read, exactly like every other route.
     expect(result).toMatchObject({kind: "error", status: 401});
   });
 });

@@ -1,8 +1,8 @@
 // @vitest-environment node
-import {randomUUID} from "node:crypto";
+import {createHmac, randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
-import {beforeAll, describe, expect, it, vi} from "vitest";
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import {createMenuItem, type CreateMenuItemInput} from "./menuItems";
 import {createMenu, publishMenu, type Menu} from "./menus";
 import {createOrder, getOwnedOrder, type Order} from "./orders";
@@ -13,6 +13,7 @@ import {
   markPaymentFailed,
   markPaymentSucceeded,
   preparePayment,
+  verifyCheckoutPayment,
   type Payment,
 } from "./payments";
 import {businessDateString} from "../time";
@@ -55,6 +56,16 @@ let db: Firestore;
 // `orders.emulator.test.ts`'s own concurrent-transaction tests bump their
 // timeout for.
 vi.setConfig({testTimeout: 20000});
+
+// Only verifyCheckoutPayment (via providers/razorpay.ts's verifyCheckoutSignature)
+// reads RAZORPAY_KEY_SECRET; every other test in this file ignores it.
+beforeEach(() => {
+  vi.stubEnv("RAZORPAY_KEY_SECRET", "test_key_secret_for_verify");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 beforeAll(() => {
   if (!process.env.FIRESTORE_EMULATOR_HOST) {
@@ -533,5 +544,200 @@ describe("ensureProviderOrder", () => {
     await expect(ensureProviderOrder(db, "..", "payment-1", gateway))
       .rejects.toMatchObject({code: "invalid-argument"});
     expect(createOrder).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * @param {string} providerOrderId The trusted provider order ID.
+ * @param {string} razorpayPaymentId The submitted payment ID.
+ * @return {string} A valid Checkout signature for these values, computed
+ *   independently of `verifyCheckoutSignature`'s own implementation (same
+ *   reasoning as `razorpay.test.ts`'s identical helper), using the
+ *   `RAZORPAY_KEY_SECRET` this file's `beforeEach` stubs.
+ */
+function computeCheckoutSignature(providerOrderId: string, razorpayPaymentId: string): string {
+  return createHmac("sha256", "test_key_secret_for_verify")
+    .update(`${providerOrderId}|${razorpayPaymentId}`)
+    .digest("hex");
+}
+
+describe("verifyCheckoutPayment", () => {
+  /** A pending payment that already has a (fake-gateway) Razorpay provider
+   * order — the fixture every test here builds on, matching
+   * `ensureProviderOrder`'s own `preparedPayment` helper but carrying the
+   * provider order id forward too. */
+  async function preparedPaymentWithProviderOrder(
+    priceInPaise = 12000,
+  ): Promise<{order: Order; payment: Payment; providerOrderId: string; customerId: string}> {
+    const {order, customerId} = await setupPendingOrder(priceInPaise);
+    const {payment} = await preparePayment(db, customerId, order.id);
+    const {gateway} = fakeGateway();
+    const {payment: withProvider, providerOrderId} = await ensureProviderOrder(db, order.id, payment.id, gateway);
+    return {order, payment: withProvider, providerOrderId, customerId};
+  }
+
+  it("moves a pending payment to succeeded and the order to confirmed/paid with a valid signature", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const razorpaySignature = computeCheckoutSignature(providerOrderId, razorpayPaymentId);
+
+    const result = await verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId, razorpayPaymentId, razorpaySignature,
+    });
+
+    expect(result.payment.status).toBe("succeeded");
+    expect(result.payment.providerPaymentId).toBe(razorpayPaymentId);
+    expect(result.order.status).toBe("confirmed");
+    expect(result.order.paymentStatus).toBe("paid");
+
+    const reread = await getOwnedOrder(db, customerId, order.id);
+    expect(reread.status).toBe("confirmed");
+    expect(reread.paymentStatus).toBe("paid");
+  });
+
+  it("is idempotent: repeated verification with the same identifiers returns the same confirmed state", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const razorpaySignature = computeCheckoutSignature(providerOrderId, razorpayPaymentId);
+    const input = {razorpayOrderId: providerOrderId, razorpayPaymentId, razorpaySignature};
+
+    const first = await verifyCheckoutPayment(db, customerId, order.id, input);
+    const second = await verifyCheckoutPayment(db, customerId, order.id, input);
+
+    expect(second.payment.status).toBe("succeeded");
+    expect(second.payment.providerPaymentId).toBe(razorpayPaymentId);
+    expect(second.payment.updatedAt.toMillis()).toBe(first.payment.updatedAt.toMillis());
+  });
+
+  it("rejects a repeat verification carrying a different providerPaymentId as a conflict, without changing the stored payment", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    const firstPaymentId = `pay_test_${randomUUID()}`;
+    await verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId: firstPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, firstPaymentId),
+    });
+
+    const conflictingPaymentId = `pay_test_${randomUUID()}`;
+    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId: conflictingPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, conflictingPaymentId),
+    })).rejects.toMatchObject({code: "already-exists"});
+
+    const reread = await getOwnedOrder(db, customerId, order.id);
+    expect(reread.status).toBe("confirmed");
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.docs[0].data().providerPaymentId).toBe(firstPaymentId);
+  });
+
+  it("rejects a razorpayOrderId that doesn't match the stored providerOrderId, never marking the payment succeeded", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: "order_wrong",
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
+    })).rejects.toMatchObject({code: "failed-precondition"});
+
+    const reread = await getOwnedOrder(db, customerId, order.id);
+    expect(reread.status).toBe("pending_payment");
+  });
+
+  it("rejects an invalid signature, never marking the payment succeeded", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+
+    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId: `pay_test_${randomUUID()}`,
+      razorpaySignature: "not-a-valid-signature",
+    })).rejects.toMatchObject({code: "failed-precondition"});
+
+    const reread = await getOwnedOrder(db, customerId, order.id);
+    expect(reread.status).toBe("pending_payment");
+  });
+
+  it("rejects verification when the payment has no provider order yet", async () => {
+    const {order, customerId} = await setupPendingOrder();
+    await preparePayment(db, customerId, order.id);
+
+    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: "order_never_created",
+      razorpayPaymentId: "pay_x",
+      razorpaySignature: computeCheckoutSignature("order_never_created", "pay_x"),
+    })).rejects.toMatchObject({code: "failed-precondition"});
+  });
+
+  it("allows a previously-failed payment to succeed via a later valid verification", async () => {
+    const {order, payment, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    await markPaymentFailed(db, {orderId: order.id, paymentId: payment.id});
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    const result = await verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
+    });
+
+    expect(result.payment.status).toBe("succeeded");
+    expect(result.order.status).toBe("confirmed");
+  });
+
+  it("never confirms an already-cancelled order even with a valid signature", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    await db.collectionGroup("orders").where("id", "==", order.id).get()
+      .then((snapshot) => snapshot.docs[0].ref.update({status: "cancelled"}));
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
+    })).rejects.toMatchObject({code: "failed-precondition"});
+  });
+
+  it("rejects a different customer's verification attempt (not-found), never leaking payment existence", async () => {
+    const {order, providerOrderId} = await preparedPaymentWithProviderOrder();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    await expect(verifyCheckoutPayment(db, freshUserId(), order.id, {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
+    })).rejects.toMatchObject({code: "not-found"});
+  });
+
+  it("rejects a nonexistent order (not-found)", async () => {
+    await expect(verifyCheckoutPayment(db, freshUserId(), "no-such-order", {
+      razorpayOrderId: "order_x", razorpayPaymentId: "pay_x", razorpaySignature: "sig_x",
+    })).rejects.toMatchObject({code: "not-found"});
+  });
+
+  it("rejects a malformed order ID (invalid-argument), never touching Firestore", async () => {
+    await expect(verifyCheckoutPayment(db, freshUserId(), "a/b", {
+      razorpayOrderId: "order_x", razorpayPaymentId: "pay_x", razorpaySignature: "sig_x",
+    })).rejects.toMatchObject({code: "invalid-argument"});
+  });
+
+  it("two concurrent valid verification calls with the same identifiers converge to exactly one confirmed order", async () => {
+    const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const input = {
+      razorpayOrderId: providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
+    };
+
+    const [a, b] = await Promise.all([
+      verifyCheckoutPayment(db, customerId, order.id, input),
+      verifyCheckoutPayment(db, customerId, order.id, input),
+    ]);
+
+    expect(a.order.status).toBe("confirmed");
+    expect(b.order.status).toBe("confirmed");
+    const reread = await getOwnedOrder(db, customerId, order.id);
+    expect(reread.status).toBe("confirmed");
+    expect(reread.paymentStatus).toBe("paid");
   });
 });

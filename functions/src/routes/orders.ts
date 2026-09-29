@@ -8,7 +8,13 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
-import {ensureProviderOrder, preparePayment, toPaymentResponse} from "../domain/payments";
+import {
+  ensureProviderOrder,
+  preparePayment,
+  toPaymentResponse,
+  verifyCheckoutPayment,
+  verifyCheckoutPaymentBodySchema,
+} from "../domain/payments";
 import type {
   ApiResult,
   NormalizedRequest,
@@ -48,6 +54,11 @@ export function createOrderRoutes(deps: OrdersRouteDeps): RouteDefinition[] {
       method: "POST",
       path: "/orders/:orderId/payment",
       handler: (ctx) => handlePostOrderPayment(ctx, deps),
+    },
+    {
+      method: "POST",
+      path: "/orders/:orderId/payment/verify",
+      handler: (ctx) => handlePostOrderPaymentVerify(ctx, deps),
     },
   ];
 }
@@ -206,6 +217,67 @@ async function handlePostOrderPayment(
       kind: "success",
       status: paymentCreated || providerOrderCreated ? 201 : 200,
       data: {payment: toPaymentResponse(updatedPayment, providerKeyId)},
+      userId: session.userId,
+    };
+  } catch (error) {
+    return mapKnownError(error);
+  }
+}
+
+/**
+ * `POST /orders/{orderId}/payment/verify`: the trusted server-side
+ * verification endpoint for a completed Razorpay Checkout payment (see
+ * `domain/payments.ts`'s `verifyCheckoutPayment` for the full security
+ * model — ownership, the stored `providerOrderId`, and the HMAC signature
+ * are all independently verified there; nothing in the request body is
+ * trusted at face value). The browser calls this once Razorpay Checkout
+ * succeeds, handing back exactly the three identifiers Checkout gave it.
+ *
+ * Authenticates before ever parsing the request body, matching every other
+ * route in this codebase. This is the ONLY endpoint in this checkpoint that
+ * can move a payment/order from `pending`/`pending_payment` to
+ * `succeeded`/`confirmed` — see root CLAUDE.md's core payment rule and
+ * `verifyCheckoutPayment`'s doc comment: there is deliberately no endpoint
+ * that lets a client assert payment success directly.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with the
+ *   confirmed order/payment on success (including a safe idempotent
+ *   replay) — never exposes provider secrets (see `toPaymentResponse`).
+ */
+async function handlePostOrderPaymentVerify(
+  ctx: RouteContext,
+  deps: OrdersRouteDeps,
+): Promise<ApiResult> {
+  let session: VerifiedSession;
+  try {
+    session = await authenticateRequest(
+      {headers: {authorization: authorizationHeader(ctx.request)}},
+      deps.validator,
+    );
+  } catch (error) {
+    return mapKnownError(error);
+  }
+
+  const parsedBody = verifyCheckoutPaymentBodySchema.safeParse(ctx.request.body);
+  if (!parsedBody.success) {
+    return {
+      kind: "error",
+      status: 400,
+      code: "invalid_argument",
+      message: firstZodIssueMessage(parsedBody.error),
+    };
+  }
+
+  try {
+    const {payment, order} = await verifyCheckoutPayment(
+      deps.db, session.userId, ctx.params?.orderId, parsedBody.data,
+    );
+    return {
+      kind: "success",
+      status: 200,
+      data: {order: toOrderResponse(order), payment: toPaymentResponse(payment)},
       userId: session.userId,
     };
   } catch (error) {

@@ -1,3 +1,4 @@
+import {createHash, createHmac, timingSafeEqual} from "node:crypto";
 import RazorpaySdk from "razorpay";
 import {defineSecret, defineString} from "firebase-functions/params";
 import * as logger from "firebase-functions/logger";
@@ -63,6 +64,73 @@ export function getRazorpayKeySecret(): string {
     throw new Error("RAZORPAY_KEY_SECRET is not configured.");
   }
   return value;
+}
+
+/**
+ * Input to `verifyCheckoutSignature`: the trusted server-side Razorpay order
+ * ID for this payment (see that function's doc comment — NEVER a
+ * client-supplied `razorpay_order_id` taken at face value), and the
+ * `razorpay_payment_id`/`razorpay_signature` the browser received from
+ * Razorpay Checkout and submitted to
+ * `POST /orders/{orderId}/payment/verify`.
+ */
+export interface VerifyCheckoutSignatureInput {
+  providerOrderId: string;
+  razorpayPaymentId: string;
+  razorpaySignature: string;
+}
+
+/**
+ * @param {string} a One hex string.
+ * @param {string} b Another hex string.
+ * @return {boolean} Whether `a` and `b` are equal, compared in constant
+ *   time. Both are hashed to a fixed-length digest first, so this never has
+ *   to branch on a length mismatch (which `crypto.timingSafeEqual` itself
+ *   would throw on) before comparing — an attacker learns nothing about
+ *   either string's length, let alone its content, from response timing.
+ */
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const digestA = createHash("sha256").update(a).digest();
+  const digestB = createHash("sha256").update(b).digest();
+  return timingSafeEqual(digestA, digestB);
+}
+
+/**
+ * Verifies a Razorpay Checkout payment signature — the exact algorithm
+ * Razorpay's current documentation requires: an HMAC-SHA256 of
+ * `"{order_id}|{payment_id}"`, keyed with the server-side `key_secret`, must
+ * equal the `razorpay_signature` value Checkout handed the browser.
+ *
+ * `input.providerOrderId` MUST be the TRUSTED, server-stored
+ * `payment.providerOrderId` (see `domain/payments.ts`'s
+ * `verifyCheckoutPayment`, the only caller) — never a client-supplied
+ * `razorpay_order_id` taken at face value. Using an untrusted order ID here
+ * would let a caller compute a self-consistent but meaningless signature
+ * over an order ID of their own choosing; the entire point of this check is
+ * that the order ID came from OUR OWN prior `ensureProviderOrder` call, not
+ * from the request being verified.
+ *
+ * A pure, synchronous, local computation — no network call, and (unlike
+ * `createOrder`/`fetchOrder`) not part of the `PaymentProviderGateway`
+ * abstraction: it needs only the server-side key secret (via
+ * `getRazorpayKeySecret`), not a Razorpay SDK client instance, and tests can
+ * make it deterministic the same way `razorpay.test.ts` already does for
+ * `getRazorpayKeyId`/`getRazorpayKeySecret` — by stubbing
+ * `RAZORPAY_KEY_SECRET` — without needing a fake gateway.
+ *
+ * @param {VerifyCheckoutSignatureInput} input The trusted provider order ID
+ *   and the submitted payment ID/signature.
+ * @return {boolean} Whether the signature is valid for these exact values.
+ * @throws {Error} If `RAZORPAY_KEY_SECRET` is not configured (see
+ *   `getRazorpayKeySecret`) — a server misconfiguration, deliberately not
+ *   reported to the caller as "signature invalid", and never containing the
+ *   secret itself.
+ */
+export function verifyCheckoutSignature(input: VerifyCheckoutSignatureInput): boolean {
+  const expectedSignature = createHmac("sha256", getRazorpayKeySecret())
+    .update(`${input.providerOrderId}|${input.razorpayPaymentId}`)
+    .digest("hex");
+  return timingSafeEqualHex(expectedSignature, input.razorpaySignature);
 }
 
 /**

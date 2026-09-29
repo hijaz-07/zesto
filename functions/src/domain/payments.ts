@@ -9,6 +9,7 @@ import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
 import {
   PaymentProviderError,
+  verifyCheckoutSignature,
   type PaymentProviderGateway,
 } from "../providers/razorpay";
 import {resolveOrderById, type Order} from "./orders";
@@ -90,14 +91,13 @@ export interface Payment {
 }
 
 /**
- * The customer-safe API response shape for a `Payment` — deliberately just
- * enough for the NEXT checkpoint's frontend Checkout integration to act on
- * (see this checkpoint's "API response security" notes): never `userId`/
- * `organizationId`/`outletId`/`menuId` (internal Firestore path context),
- * and never `providerPaymentId` (not set by anything in this checkpoint,
- * and not needed by the client even once it is). `providerKeyId` is
- * Razorpay's PUBLIC `key_id` — safe to expose, unlike `key_secret`, which
- * this type has no field for at all.
+ * The customer-safe API response shape for a `Payment` — never `userId`/
+ * `organizationId`/`outletId`/`menuId` (internal Firestore path context) and
+ * never a provider secret (this type has no field for one at all).
+ * `providerPaymentId` is included once `verifyCheckoutPayment` has set it —
+ * Razorpay's own reference for a completed payment, safe to hand back to the
+ * frontend Checkout flow that just produced it. `providerKeyId` is
+ * Razorpay's PUBLIC `key_id` — likewise safe to expose, unlike `key_secret`.
  */
 export interface PaymentResponse {
   paymentId: string;
@@ -107,6 +107,7 @@ export interface PaymentResponse {
   status: PaymentStatus;
   provider: PaymentProviderName;
   providerOrderId?: string;
+  providerPaymentId?: string;
   providerKeyId?: string;
 }
 
@@ -191,6 +192,9 @@ export function toPaymentResponse(payment: Payment, providerKeyId?: string): Pay
   };
   if (payment.providerOrderId !== undefined) {
     response.providerOrderId = payment.providerOrderId;
+  }
+  if (payment.providerPaymentId !== undefined) {
+    response.providerPaymentId = payment.providerPaymentId;
   }
   if (providerKeyId !== undefined) {
     response.providerKeyId = providerKeyId;
@@ -696,5 +700,156 @@ async function claimProviderOrder(
     tx.update(paymentRef, update);
 
     return {payment: {...payment, ...update}, providerOrderId: candidateProviderOrderId, created: true};
+  });
+}
+
+/**
+ * Validates the `POST /orders/{orderId}/payment/verify` request body — the
+ * three identifiers Razorpay Checkout hands the browser once a payment
+ * attempt completes. Deliberately just these three: `amount`/`currency`/
+ * `userId`/`organizationId`/payment or order status/`providerOrderId` are
+ * never accepted from the client (see `verifyCheckoutPayment`'s doc
+ * comment) — there is nothing else in the body for a client to override,
+ * and any other field a client sends is silently stripped by `safeParse`,
+ * never trusted.
+ */
+export const verifyCheckoutPaymentBodySchema = z.object({
+  razorpayPaymentId: z.string().trim().min(1),
+  razorpayOrderId: z.string().trim().min(1),
+  razorpaySignature: z.string().trim().min(1),
+});
+
+export type VerifyCheckoutPaymentInput = z.infer<typeof verifyCheckoutPaymentBodySchema>;
+
+/**
+ * The trusted server-side verification path for a completed Razorpay
+ * Checkout payment (see root CLAUDE.md's "Never trust the frontend for
+ * security" and this checkpoint's security model). Called by `POST
+ * /orders/{orderId}/payment/verify` after Razorpay Checkout succeeds in the
+ * browser and hands it `razorpay_payment_id`/`razorpay_order_id`/
+ * `razorpay_signature` — this is the ONLY way (besides a future trusted
+ * webhook) those values can ever lead to `markPaymentSucceeded` being
+ * called. Nothing in `input` is trusted at face value:
+ *
+ * 1. `orderId`/`userId` resolve the CALLER'S OWN order and its payment,
+ *    exactly like `preparePayment` — an order that doesn't exist, or exists
+ *    but belongs to a different user, is indistinguishable (`not-found`),
+ *    never leaking another customer's payment.
+ * 2. The payment must already have `provider: "razorpay"` and a
+ *    `providerOrderId` (i.e. `ensureProviderOrder` already ran for it) —
+ *    otherwise there is nothing to verify against.
+ * 3. `input.razorpayOrderId` must equal the STORED `payment.providerOrderId`
+ *    — never the other way around. A client cannot substitute a different
+ *    provider order by sending a different value here; a mismatch is
+ *    rejected outright, before any signature work.
+ * 4. If the payment is already `succeeded`: a replay carrying the SAME
+ *    `providerPaymentId` returns the current state safely, with no further
+ *    writes (idempotent retry); a DIFFERENT `providerPaymentId` is a
+ *    conflict (`already-exists`) — an already-successful payment is never
+ *    silently overwritten by a second, different provider payment
+ *    reference.
+ * 5. Otherwise (payment is `pending` or `failed`), the Checkout signature is
+ *    verified (`providers/razorpay.ts`'s `verifyCheckoutSignature`) using
+ *    the SAME trusted `payment.providerOrderId` from step 3 — never a
+ *    client-supplied order ID — plus the submitted `razorpayPaymentId`/
+ *    `razorpaySignature`. An invalid signature is rejected outright; the
+ *    payment is left exactly as it was.
+ * 6. Only once the signature verifies does this call the existing trusted
+ *    `markPaymentSucceeded` transition — never a second, duplicate success
+ *    implementation. That function itself re-validates `amountInPaise`/
+ *    `currency` against the STORED payment (never from this request, which
+ *    carries no such fields at all) before atomically moving
+ *    `payment.status` to `succeeded` and `order.status`/`paymentStatus` to
+ *    `confirmed`/`paid`. `providerPaymentId` is persisted as
+ *    `input.razorpayPaymentId` — Razorpay's own reference for this
+ *    completed payment. A payment that previously `failed` is allowed to
+ *    succeed here (see `markPaymentSucceeded`'s own state-machine rules); a
+ *    cancelled order is not (that function rejects it independently).
+ *
+ * Deliberately does NOT call the Razorpay API to re-fetch the order/payment
+ * (`PaymentProviderGateway.fetchOrder`) as an extra check: the signature
+ * verified in step 5, computed over the TRUSTED `providerOrderId`
+ * established in step 3, is exactly Razorpay's own documented Checkout
+ * verification algorithm and is already sufficient proof that Razorpay
+ * itself produced this `razorpay_payment_id` for THIS provider order — an
+ * extra network round-trip would add latency and a new failure mode without
+ * closing any gap steps 3-5 leave open.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {string} userId The verified caller's Descope user ID.
+ * @param {unknown} orderId The order's document ID, from the request path.
+ * @param {VerifyCheckoutPaymentInput} input The validated request body.
+ * @return {Promise<PaymentTransitionResult>} The payment and order as they
+ *   stand after verification.
+ * @throws {HttpsError} `invalid-argument` (400) if `orderId` is not a
+ *   well-formed document ID.
+ * @throws {HttpsError} `not-found` (404) if no such order exists, or it
+ *   exists but has no payment yet, or belongs to a different user.
+ * @throws {HttpsError} `failed-precondition` (400) if the payment has no
+ *   provider order to verify against, the submitted `razorpayOrderId` does
+ *   not match the stored `providerOrderId`, or the signature is invalid.
+ * @throws {HttpsError} `already-exists` (409) if the payment already
+ *   succeeded with a DIFFERENT `providerPaymentId` than the one submitted.
+ */
+export async function verifyCheckoutPayment(
+  db: Firestore,
+  userId: string,
+  orderId: unknown,
+  input: VerifyCheckoutPaymentInput,
+): Promise<PaymentTransitionResult> {
+  if (!isValidDocumentId(orderId)) {
+    throw new HttpsError("invalid-argument", "Invalid order ID.");
+  }
+
+  const {order, payment} = await db.runTransaction(async (tx) => {
+    const resolved = await resolveOrderAndPayment(db, tx, orderId, orderId);
+    if (resolved.order.userId !== userId) {
+      throw new HttpsError("not-found", "Order not found.");
+    }
+    return resolved;
+  });
+
+  if (payment.provider !== "razorpay" || payment.providerOrderId === undefined) {
+    throw new HttpsError(
+      "failed-precondition",
+      "This payment has no provider order to verify against.",
+    );
+  }
+
+  if (payment.providerOrderId !== input.razorpayOrderId) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The submitted payment does not match this order's payment.",
+    );
+  }
+
+  if (payment.status === "succeeded") {
+    if (payment.providerPaymentId === input.razorpayPaymentId) {
+      return {payment, order};
+    }
+    throw new HttpsError(
+      "already-exists",
+      "This payment has already succeeded with a different payment reference.",
+    );
+  }
+
+  const signatureValid = verifyCheckoutSignature({
+    providerOrderId: payment.providerOrderId,
+    razorpayPaymentId: input.razorpayPaymentId,
+    razorpaySignature: input.razorpaySignature,
+  });
+  if (!signatureValid) {
+    throw new HttpsError(
+      "failed-precondition",
+      "The payment signature could not be verified.",
+    );
+  }
+
+  return markPaymentSucceeded(db, {
+    orderId: order.id,
+    paymentId: payment.id,
+    amountInPaise: payment.amountInPaise,
+    currency: payment.currency,
+    providerPaymentId: input.razorpayPaymentId,
   });
 }

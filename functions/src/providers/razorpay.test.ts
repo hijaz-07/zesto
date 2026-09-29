@@ -1,9 +1,11 @@
 // @vitest-environment node
+import {createHmac} from "node:crypto";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {
   createRazorpayGateway,
   getRazorpayKeyId,
   getRazorpayKeySecret,
+  verifyCheckoutSignature,
   PaymentProviderError,
 } from "./razorpay";
 
@@ -180,5 +182,116 @@ describe("createRazorpayGateway: fetchOrder", () => {
 
     await expect(createRazorpayGateway(client).fetchOrder("order_missing"))
       .rejects.toBeInstanceOf(PaymentProviderError);
+  });
+});
+
+/**
+ * @param {string} providerOrderId The trusted provider order ID.
+ * @param {string} razorpayPaymentId The submitted payment ID.
+ * @param {string} [secret] The key secret to sign with (defaults to the
+ *   `beforeEach`-stubbed `RAZORPAY_KEY_SECRET`).
+ * @return {string} A signature computed with the exact algorithm Razorpay's
+ *   documentation prescribes — independent of `verifyCheckoutSignature`'s
+ *   own implementation, so these tests prove the real algorithm, not just
+ *   internal self-consistency.
+ */
+function computeTestSignature(
+  providerOrderId: string,
+  razorpayPaymentId: string,
+  secret = "test_key_secret",
+): string {
+  return createHmac("sha256", secret)
+    .update(`${providerOrderId}|${razorpayPaymentId}`)
+    .digest("hex");
+}
+
+describe("verifyCheckoutSignature", () => {
+  it("accepts a signature computed with the documented algorithm and the real key secret", () => {
+    const signature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1");
+
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: signature,
+    })).toBe(true);
+  });
+
+  it("rejects an altered payment ID", () => {
+    const signature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1");
+
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_Attacker",
+      razorpaySignature: signature,
+    })).toBe(false);
+  });
+
+  it("rejects an altered (trusted) provider order ID", () => {
+    const signature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1");
+
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_DifferentOrder",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: signature,
+    })).toBe(false);
+  });
+
+  it("rejects a signature computed with the wrong secret", () => {
+    const signature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1", "wrong_secret");
+
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: signature,
+    })).toBe(false);
+  });
+
+  it("rejects a garbage signature of a completely different length, without throwing", () => {
+    const call = () => verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: "short",
+    });
+
+    expect(call).not.toThrow();
+    expect(call()).toBe(false);
+  });
+
+  it("rejects an empty signature, without throwing", () => {
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: "",
+    })).toBe(false);
+  });
+
+  it("fails safely (throws, never returns true/false) when RAZORPAY_KEY_SECRET is not configured", () => {
+    vi.stubEnv("RAZORPAY_KEY_SECRET", "");
+
+    expect(() => verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: "irrelevant",
+    })).toThrow("RAZORPAY_KEY_SECRET is not configured.");
+  });
+
+  it("never leaks the key secret through its return value or a thrown error", () => {
+    const signature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1");
+    const result = verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: signature,
+    });
+    expect(String(result)).not.toContain("test_key_secret");
+
+    vi.stubEnv("RAZORPAY_KEY_SECRET", "");
+    let caught: unknown;
+    try {
+      verifyCheckoutSignature({providerOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s"});
+      throw new Error("expected verifyCheckoutSignature to throw here");
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).not.toContain("test_key_secret");
   });
 });

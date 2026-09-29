@@ -1,5 +1,5 @@
 // @vitest-environment node
-import {randomUUID} from "node:crypto";
+import {createHmac, randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";
@@ -14,6 +14,7 @@ import {
 import {archiveMenu, createMenu, publishMenu, type Menu} from "../domain/menus";
 import {createOrganization} from "../domain/organizations";
 import {createOutlet, updateOutlet} from "../domain/outlets";
+import {preparePayment} from "../domain/payments";
 import {handleRequest} from "../http/handleRequest";
 import type {ApiResult, NormalizedRequest} from "../http/types";
 import {PaymentProviderError, type PaymentProviderGateway} from "../providers/razorpay";
@@ -55,6 +56,7 @@ beforeAll(() => {
 beforeEach(() => {
   vi.stubEnv("DESCOPE_PROJECT_ID", "P-test");
   vi.stubEnv("RAZORPAY_KEY_ID", "rzp_test_public_key");
+  vi.stubEnv("RAZORPAY_KEY_SECRET", "test_key_secret_for_verify");
 });
 
 afterEach(() => {
@@ -248,6 +250,7 @@ interface PaymentResponseShape {
   status: string;
   provider: string;
   providerOrderId?: string;
+  providerPaymentId?: string;
   providerKeyId?: string;
 }
 
@@ -286,6 +289,32 @@ async function callPreparePayment(
     request({method: "POST", path: `/orders/${orderId}/payment`, body}),
     () => {},
   );
+}
+
+async function callVerifyPayment(
+  validator: SessionValidator,
+  orderId: string,
+  body: unknown,
+): Promise<ApiResult> {
+  const routes = createOrderRoutes({db, validator});
+  return handleRequest(
+    routes,
+    request({method: "POST", path: `/orders/${orderId}/payment/verify`, body}),
+    () => {},
+  );
+}
+
+/**
+ * @param {string} providerOrderId The trusted provider order ID.
+ * @param {string} razorpayPaymentId The submitted payment ID.
+ * @return {string} A valid Checkout signature for these values, computed
+ *   independently of `verifyCheckoutSignature`'s own implementation, using
+ *   the `RAZORPAY_KEY_SECRET` this file's `beforeEach` stubs.
+ */
+function computeCheckoutSignature(providerOrderId: string, razorpayPaymentId: string): string {
+  return createHmac("sha256", "test_key_secret_for_verify")
+    .update(`${providerOrderId}|${razorpayPaymentId}`)
+    .digest("hex");
 }
 
 describe("POST /orders — success (Firestore emulator)", () => {
@@ -889,4 +918,268 @@ describe("POST /orders/:orderId/payment (Firestore emulator)", () => {
 
     expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
   });
+});
+
+describe("POST /orders/:orderId/payment/verify (Firestore emulator)", () => {
+  /** A real order with a real (fake-gateway) provider order already
+   * attached — the fixture every test here builds on. */
+  async function setupVerifiablePayment(priceInPaise = 8000) {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem({priceInPaise});
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: `verify-${randomUUID()}`,
+    });
+    const order = orderOf(created);
+    const prepared = await callPreparePayment(acceptingValidator(customerId), order.id);
+    const payment = paymentOf(prepared);
+    return {order, payment, customerId};
+  }
+
+  it("verifies a valid Checkout signature: payment succeeded, order confirmed/paid (200)", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const razorpaySignature = computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId);
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId, razorpayPaymentId, razorpaySignature,
+    });
+
+    expect(result).toMatchObject({kind: "success", status: 200});
+    const responseOrder = orderOf(result);
+    const responsePayment = paymentOf(result);
+    expect(responseOrder.status).toBe("confirmed");
+    expect(responseOrder.paymentStatus).toBe("paid");
+    expect(responseOrder.totalInPaise).toBe(order.totalInPaise);
+    expect(responsePayment.status).toBe("succeeded");
+    expect(responsePayment.providerPaymentId).toBe(razorpayPaymentId);
+
+    const reread = orderOf(await callGet(acceptingValidator(customerId), order.id));
+    expect(reread).toMatchObject({status: "confirmed", paymentStatus: "paid"});
+  });
+
+  it("never leaks the key secret or internal Firestore path context in the response", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const razorpaySignature = computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId);
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId, razorpayPaymentId, razorpaySignature,
+    });
+
+    expect(result).toMatchObject({kind: "success"});
+    const responsePayment = paymentOf(result) as unknown as Record<string, unknown>;
+    expect(responsePayment).not.toHaveProperty("userId");
+    expect(responsePayment).not.toHaveProperty("organizationId");
+    expect(responsePayment).not.toHaveProperty("outletId");
+    expect(responsePayment).not.toHaveProperty("menuId");
+    const serialized = JSON.stringify(result).toLowerCase();
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("test_key_secret_for_verify");
+  });
+
+  it("is idempotent: a repeated call with the same identifiers returns the same confirmed state (200)", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const body = {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId),
+    };
+
+    const first = await callVerifyPayment(acceptingValidator(customerId), order.id, body);
+    const second = await callVerifyPayment(acceptingValidator(customerId), order.id, body);
+
+    expect(first).toMatchObject({kind: "success", status: 200});
+    expect(second).toMatchObject({kind: "success", status: 200});
+    expect(paymentOf(second)).toEqual(paymentOf(first));
+  });
+
+  it("rejects a repeat verification with a different providerPaymentId as a conflict (409)", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const firstPaymentId = `pay_test_${randomUUID()}`;
+    await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId: firstPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, firstPaymentId),
+    });
+
+    const conflictingPaymentId = `pay_test_${randomUUID()}`;
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId: conflictingPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, conflictingPaymentId),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 409, code: "already_exists"});
+  });
+
+  it("rejects a wrong provider order ID (400), never confirming the order", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: "order_wrong",
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+    const reread = orderOf(await callGet(acceptingValidator(customerId), order.id));
+    expect(reread.status).toBe("pending_payment");
+  });
+
+  it("rejects an invalid signature (400), never confirming the order", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId, razorpayPaymentId: "pay_test_x", razorpaySignature: "not-valid",
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+    const reread = orderOf(await callGet(acceptingValidator(customerId), order.id));
+    expect(reread.status).toBe("pending_payment");
+  });
+
+  it("rejects verification when no payment has been prepared at all (404), never leaking whether a payment exists", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: `verify-none-${randomUUID()}`,
+    });
+    const order = orderOf(created);
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: "order_never_created",
+      razorpayPaymentId: "pay_x",
+      razorpaySignature: computeCheckoutSignature("order_never_created", "pay_x"),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("rejects verification when a payment exists but has no provider order yet (400)", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: `verify-no-provider-${randomUUID()}`,
+    });
+    const order = orderOf(created);
+    // Creates the internal payment record directly via the domain layer,
+    // deliberately skipping ensureProviderOrder — the one route
+    // (`POST /orders/{orderId}/payment`) always does both together, so this
+    // "payment exists, no provider order yet" state can only be reached
+    // through the domain layer directly, matching this file's established
+    // convention of setting up ancestor state via domain functions.
+    await preparePayment(db, customerId, order.id);
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: "order_never_created",
+      razorpayPaymentId: "pay_x",
+      razorpaySignature: computeCheckoutSignature("order_never_created", "pay_x"),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("ignores client-supplied amount/currency/status/providerOrderId: they have no effect on the outcome", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    const result = await callVerifyPayment(acceptingValidator(customerId), order.id, {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId),
+      amountInPaise: 1, currency: "USD", status: "succeeded", providerOrderId: "attacker-order",
+    });
+
+    expect(result).toMatchObject({kind: "success", status: 200});
+    const responseOrder = orderOf(result);
+    expect(responseOrder.totalInPaise).toBe(order.totalInPaise);
+    expect(responseOrder.currency).toBe("INR");
+  });
+
+  it("rejects an unauthenticated caller (401), without touching Firestore", async () => {
+    const result = await callVerifyPayment(rejectingValidator(), "some-order-id", {
+      razorpayOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s",
+    });
+    expect(result).toMatchObject({kind: "error", status: 401, code: "unauthenticated"});
+  });
+
+  it("denies a different authenticated customer from verifying someone else's payment (404)", async () => {
+    const {order, payment} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    const result = await callVerifyPayment(acceptingValidator(freshUserId()), order.id, {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("denies the organization's own owner using this endpoint as an ownership bypass (404)", async () => {
+    const {organizationId, ownerId, outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: `verify-owner-${randomUUID()}`,
+    });
+    const order = orderOf(created);
+    const prepared = await callPreparePayment(acceptingValidator(customerId), order.id);
+    await addMembership(organizationId, ownerId, "owner");
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+
+    const result = await callVerifyPayment(acceptingValidator(ownerId), order.id, {
+      razorpayOrderId: paymentOf(prepared).providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(paymentOf(prepared).providerOrderId as string, razorpayPaymentId),
+    });
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("rejects a malformed order ID (400)", async () => {
+    const result = await callVerifyPayment(acceptingValidator(freshUserId()), "..", {
+      razorpayOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s",
+    });
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("returns 404, not 500, for a nonexistent order", async () => {
+    const result = await callVerifyPayment(acceptingValidator(freshUserId()), "no-such-order", {
+      razorpayOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s",
+    });
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it.each([
+    ["missing razorpayPaymentId", {razorpayOrderId: "o", razorpaySignature: "s"}],
+    ["missing razorpayOrderId", {razorpayPaymentId: "p", razorpaySignature: "s"}],
+    ["missing razorpaySignature", {razorpayOrderId: "o", razorpayPaymentId: "p"}],
+    ["empty razorpaySignature", {razorpayOrderId: "o", razorpayPaymentId: "p", razorpaySignature: ""}],
+  ])("rejects an invalid body (%s) as 400", async (_label, body) => {
+    const result = await callVerifyPayment(acceptingValidator(freshUserId()), "some-order-id", body);
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("two concurrent verification calls with the same valid identifiers converge safely (200 both)", async () => {
+    const {order, payment, customerId} = await setupVerifiablePayment();
+    const razorpayPaymentId = `pay_test_${randomUUID()}`;
+    const body = {
+      razorpayOrderId: payment.providerOrderId,
+      razorpayPaymentId,
+      razorpaySignature: computeCheckoutSignature(payment.providerOrderId as string, razorpayPaymentId),
+    };
+
+    const [a, b] = await Promise.all([
+      callVerifyPayment(acceptingValidator(customerId), order.id, body),
+      callVerifyPayment(acceptingValidator(customerId), order.id, body),
+    ]);
+
+    expect(a).toMatchObject({kind: "success", status: 200});
+    expect(b).toMatchObject({kind: "success", status: 200});
+    const reread = orderOf(await callGet(acceptingValidator(customerId), order.id));
+    expect(reread.status).toBe("confirmed");
+    expect(reread.paymentStatus).toBe("paid");
+  }, 15000);
 });

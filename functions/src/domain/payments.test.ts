@@ -101,7 +101,7 @@ describe("parsePayment", () => {
 
 describe("toPaymentResponse", () => {
   it("maps to exactly the customer-safe fields, excluding internal Firestore path context", () => {
-    const payment = validPayment({providerPaymentId: "provider-ref-1"});
+    const payment = validPayment();
     const response = toPaymentResponse(payment);
 
     expect(response).toEqual({
@@ -136,6 +136,17 @@ describe("toPaymentResponse", () => {
   it("omits providerOrderId when not set", () => {
     const response = toPaymentResponse(validPayment());
     expect(response).not.toHaveProperty("providerOrderId");
+  });
+
+  it("includes providerPaymentId when set (e.g. after verifyCheckoutPayment)", () => {
+    const payment = validPayment({provider: "razorpay", providerPaymentId: "pay_RazorpayTest1"});
+    const response = toPaymentResponse(payment);
+    expect(response.providerPaymentId).toBe("pay_RazorpayTest1");
+  });
+
+  it("omits providerPaymentId when not set", () => {
+    const response = toPaymentResponse(validPayment());
+    expect(response).not.toHaveProperty("providerPaymentId");
   });
 
   it("includes providerKeyId when given one, omits it otherwise", () => {
