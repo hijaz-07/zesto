@@ -238,6 +238,28 @@ function orderOf(result: ApiResult): OrderResponseShape {
   return (result.data as {order: OrderResponseShape}).order;
 }
 
+interface PaymentResponseShape {
+  paymentId: string;
+  orderId: string;
+  amountInPaise: number;
+  currency: string;
+  status: string;
+}
+
+function paymentOf(result: ApiResult): PaymentResponseShape {
+  if (result.kind !== "success") throw new Error(`expected success, got ${JSON.stringify(result)}`);
+  return (result.data as {payment: PaymentResponseShape}).payment;
+}
+
+async function callPreparePayment(validator: SessionValidator, orderId: string, body: unknown = undefined): Promise<ApiResult> {
+  const routes = createOrderRoutes({db, validator});
+  return handleRequest(
+    routes,
+    request({method: "POST", path: `/orders/${orderId}/payment`, body}),
+    () => {},
+  );
+}
+
 describe("POST /orders — success (Firestore emulator)", () => {
   it("creates an order with correct snapshots, subtotal, total, and initial status", async () => {
     const {organizationId, ownerId, outletId, menuId, item: itemA} =
@@ -643,5 +665,122 @@ describe("GET /orders/:orderId (Firestore emulator)", () => {
   it("returns 404, not 500, for a nonexistent order", async () => {
     const result = await callGet(acceptingValidator(freshUserId()), "no-such-order");
     expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+});
+
+describe("POST /orders/:orderId/payment (Firestore emulator)", () => {
+  it("creates a pending payment for the order's owner, amount/currency from the order", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem({priceInPaise: 8000});
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 3}], idempotencyKey: "pay-key",
+    });
+    const order = orderOf(created);
+
+    const result = await callPreparePayment(acceptingValidator(customerId), order.id);
+
+    expect(result).toMatchObject({kind: "success", status: 201});
+    const payment = paymentOf(result);
+    expect(payment).toEqual({
+      paymentId: order.id,
+      orderId: order.id,
+      amountInPaise: order.totalInPaise,
+      currency: "INR",
+      status: "pending",
+    });
+  });
+
+  it("never returns provider internals or Firestore paths", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-2",
+    });
+    const order = orderOf(created);
+
+    const result = await callPreparePayment(acceptingValidator(customerId), order.id);
+
+    expect(result).toMatchObject({kind: "success"});
+    const payment = paymentOf(result) as unknown as Record<string, unknown>;
+    expect(payment).not.toHaveProperty("provider");
+    expect(payment).not.toHaveProperty("providerPaymentId");
+    expect(payment).not.toHaveProperty("userId");
+    expect(payment).not.toHaveProperty("organizationId");
+  });
+
+  it("is idempotent: a repeated call reuses the same payment (200, not 201)", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-3",
+    });
+    const order = orderOf(created);
+
+    const first = await callPreparePayment(acceptingValidator(customerId), order.id);
+    const second = await callPreparePayment(acceptingValidator(customerId), order.id);
+
+    expect(first).toMatchObject({kind: "success", status: 201});
+    expect(second).toMatchObject({kind: "success", status: 200});
+    expect(paymentOf(second)).toEqual(paymentOf(first));
+
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.size).toBe(1);
+  });
+
+  it("denies a different authenticated customer from preparing payment for someone else's order (404)", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const created = await callCreate(acceptingValidator(freshUserId()), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-4",
+    });
+    const order = orderOf(created);
+
+    const result = await callPreparePayment(acceptingValidator(freshUserId()), order.id);
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("denies the organization's own owner using the customer payment endpoint as an ownership bypass (404)", async () => {
+    const {organizationId, ownerId, outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const created = await callCreate(acceptingValidator(freshUserId()), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-5",
+    });
+    const order = orderOf(created);
+    await addMembership(organizationId, ownerId, "owner");
+
+    const result = await callPreparePayment(acceptingValidator(ownerId), order.id);
+
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("rejects an unauthenticated caller (401), without touching Firestore", async () => {
+    const result = await callPreparePayment(rejectingValidator(), "some-order-id");
+    expect(result).toMatchObject({kind: "error", status: 401, code: "unauthenticated"});
+  });
+
+  it("returns 404, not 500, for a nonexistent order", async () => {
+    const result = await callPreparePayment(acceptingValidator(freshUserId()), "no-such-order");
+    expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+
+  it("rejects a malformed order ID (400)", async () => {
+    // ".." (not a "/"-containing value — that would just fail to match the
+    // route at all, a router-level 404, before ever reaching the handler).
+    const result = await callPreparePayment(acceptingValidator(freshUserId()), "..");
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("rejects preparing payment for an order that is not pending_payment (400)", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-6",
+    });
+    const order = orderOf(created);
+    await db.collectionGroup("orders").where("id", "==", order.id).get()
+      .then((snapshot) => snapshot.docs[0].ref.update({status: "cancelled"}));
+
+    const result = await callPreparePayment(acceptingValidator(customerId), order.id);
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
   });
 });

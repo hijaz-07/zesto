@@ -460,6 +460,143 @@ describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/men
   });
 });
 
+describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders/{orderId}/payments/{paymentId}', () => {
+  const OUTLET_ID = 'outlet-1';
+  const MENU_ID = 'menu-1';
+  const ORDER_ID = 'order-1';
+  const PAYMENT_ID = ORDER_ID;
+
+  function menuDoc(menuId: string, outletId: string, organizationId: string) {
+    return {
+      id: menuId,
+      organizationId,
+      outletId,
+      menuDate: '2026-09-28',
+      title: 'Tuesday Special Menu',
+      status: 'published',
+      orderingOpensAt: Timestamp.now(),
+      orderingClosesAt: Timestamp.now(),
+      pickupStartsAt: Timestamp.now(),
+      pickupEndsAt: Timestamp.now(),
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+      createdBy: USER_ID,
+    };
+  }
+
+  function orderDoc(orderId: string, menuId: string, outletId: string, organizationId: string) {
+    return {
+      id: orderId,
+      userId: USER_ID,
+      organizationId,
+      outletId,
+      menuId,
+      status: 'pending_payment',
+      paymentStatus: 'pending',
+      currency: 'INR',
+      subtotalInPaise: 12000,
+      totalInPaise: 12000,
+      items: [
+        { itemId: 'item-1', name: 'Chicken Biriyani', priceInPaise: 12000, quantity: 1, lineTotalInPaise: 12000 },
+      ],
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    };
+  }
+
+  function paymentDoc(paymentId: string, orderId: string, menuId: string, outletId: string, organizationId: string) {
+    return {
+      id: paymentId,
+      orderId,
+      userId: USER_ID,
+      organizationId,
+      outletId,
+      menuId,
+      amountInPaise: 12000,
+      currency: 'INR',
+      status: 'pending',
+      provider: 'none',
+      createdAt: Timestamp.now(),
+      updatedAt: Timestamp.now(),
+    };
+  }
+
+  it('denies a client reading its own payment even when the caller id matches userId', async () => {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID),
+        outletDoc(OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID),
+        menuDoc(MENU_ID, OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(context.firestore(), 'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID),
+        orderDoc(ORDER_ID, MENU_ID, OUTLET_ID, ORG_A),
+      );
+      await setDoc(
+        doc(
+          context.firestore(),
+          'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+        ),
+        paymentDoc(PAYMENT_ID, ORDER_ID, MENU_ID, OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        getDoc(doc(
+          db,
+          'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+        )),
+      );
+    }
+  });
+
+  it('denies all client writes, including a client trying to mark its own payment succeeded', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(
+          doc(
+            db,
+            'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+          ),
+          paymentDoc(PAYMENT_ID, ORDER_ID, MENU_ID, OUTLET_ID, ORG_A),
+        ),
+      );
+    }
+
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(
+          context.firestore(),
+          'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+        ),
+        paymentDoc(PAYMENT_ID, ORDER_ID, MENU_ID, OUTLET_ID, ORG_A),
+      );
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        updateDoc(
+          doc(
+            db,
+            'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+          ),
+          { status: 'succeeded' },
+        ),
+      );
+      await assertFails(
+        deleteDoc(doc(
+          db,
+          'organizations', ORG_A, 'outlets', OUTLET_ID, 'menus', MENU_ID, 'orders', ORDER_ID, 'payments', PAYMENT_ID,
+        )),
+      );
+    }
+  });
+});
+
 describe('firestore.rules: users/{userId}/orderIdempotencyKeys/{idempotencyKey}', () => {
   const IDEMPOTENCY_KEY = 'idem-key-1';
 

@@ -8,6 +8,7 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
+import {preparePayment, toPaymentResponse} from "../domain/payments";
 import type {
   ApiResult,
   NormalizedRequest,
@@ -40,6 +41,11 @@ export function createOrderRoutes(deps: OrdersRouteDeps): RouteDefinition[] {
   return [
     {method: "POST", path: "/orders", handler: (ctx) => handlePostOrders(ctx, deps)},
     {method: "GET", path: "/orders/:orderId", handler: (ctx) => handleGetOrder(ctx, deps)},
+    {
+      method: "POST",
+      path: "/orders/:orderId/payment",
+      handler: (ctx) => handlePostOrderPayment(ctx, deps),
+    },
   ];
 }
 
@@ -141,6 +147,53 @@ async function handleGetOrder(
       kind: "success",
       status: 200,
       data: {order: toOrderResponse(order)},
+      userId: session.userId,
+    };
+  } catch (error) {
+    return mapKnownError(error);
+  }
+}
+
+/**
+ * `POST /orders/{orderId}/payment`: prepares a payment for the caller's own
+ * `pending_payment` order (see `domain/payments.ts`'s `preparePayment` and
+ * this checkpoint's "Payment creation"/"API endpoints" notes). Takes no
+ * request body — `amountInPaise`/`currency` always come from the order,
+ * never from the client, so there is nothing in the body to even read.
+ *
+ * This is the ONLY payment-related endpoint this checkpoint adds. There is
+ * deliberately no endpoint that can mark a payment/order succeeded — see
+ * root CLAUDE.md's core payment rule: only a future trusted provider
+ * webhook, calling `domain/payments.ts`'s `markPaymentSucceeded` directly,
+ * may do that.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome. `201` for a newly
+ *   created payment; `200` when the order already had one (see
+ *   `preparePayment`'s idempotency design) — either way, the response body
+ *   shape is identical.
+ */
+async function handlePostOrderPayment(
+  ctx: RouteContext,
+  deps: OrdersRouteDeps,
+): Promise<ApiResult> {
+  let session: VerifiedSession;
+  try {
+    session = await authenticateRequest(
+      {headers: {authorization: authorizationHeader(ctx.request)}},
+      deps.validator,
+    );
+  } catch (error) {
+    return mapKnownError(error);
+  }
+
+  try {
+    const {payment, created} = await preparePayment(deps.db, session.userId, ctx.params?.orderId);
+    return {
+      kind: "success",
+      status: created ? 201 : 200,
+      data: {payment: toPaymentResponse(payment)},
       userId: session.userId,
     };
   } catch (error) {

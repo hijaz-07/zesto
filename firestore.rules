@@ -219,6 +219,36 @@ rules_version = '2';
 // demand-driven, not inventory-driven: creating an order never writes to
 // the menu or its items.
 //
+// Subcollection: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders/{orderId}/payments
+// Document ID: {paymentId} — for v1 always equal to the parent order's own
+// ID (see functions/src/domain/payments.ts's module doc comment): there is
+// exactly one payment per order, ever. Fields:
+//   - id, orderId, userId, organizationId, outletId, menuId: string
+//     (required, immutable) — id/organizationId/outletId/menuId must equal
+//     the path this document is read from; orderId must equal the parent
+//     order's id; userId is the same customer who placed the order.
+//   - amountInPaise: number (required, non-negative integer) — always
+//     equal to the parent order's totalInPaise, never accepted from a
+//     client (functions/src/domain/payments.ts's preparePayment).
+//   - currency: string (required) — 'INR' for v1, always inherited from the
+//     parent order.
+//   - status: string (required) — one of 'pending' | 'succeeded' | 'failed'.
+//     A new payment always starts 'pending'. Only trusted backend code
+//     (functions/src/domain/payments.ts's markPaymentSucceeded/
+//     markPaymentFailed) ever transitions it — there is no client-reachable
+//     way to mark a payment (or its order) succeeded; see root CLAUDE.md's
+//     "Never trust the frontend for security".
+//   - provider: string (required) — 'none' for v1; no external payment
+//     provider is connected yet.
+//   - providerPaymentId: string (optional) — the provider's own reference,
+//     once a real provider exists. Never fabricated; absent for every
+//     payment v1 creates or transitions.
+//   - createdAt, updatedAt: timestamp (required)
+// Provisioned and transitioned by trusted backend code only. A successful
+// transition (pending -> succeeded) happens atomically, in the same
+// transaction, with the parent order's status becoming 'confirmed' and its
+// paymentStatus becoming 'paid'.
+//
 // ===============================================================
 
 service cloud.firestore {
@@ -259,6 +289,14 @@ service cloud.firestore {
           // Customer orders belonging to this menu. Backend-only, always.
           match /orders/{orderId} {
             allow read, write: if false;
+
+            // Payments belonging to this order. Backend-only, always — a
+            // client must never be able to read a payment's status, let
+            // alone write one (see root CLAUDE.md's core payment rule: the
+            // browser must never be able to mark an order as paid).
+            match /payments/{paymentId} {
+              allow read, write: if false;
+            }
           }
         }
       }

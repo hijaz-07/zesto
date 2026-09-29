@@ -90,11 +90,12 @@ function validCreateBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("createOrderRoutes", () => {
-  it("registers exactly the 2 documented routes", () => {
+  it("registers exactly the 3 documented routes", () => {
     const routes = createOrderRoutes({db: {} as Firestore});
     expect(routes.map((r) => `${r.method} ${r.path}`).sort()).toEqual([
       "GET /orders/:orderId",
       "POST /orders",
+      "POST /orders/:orderId/payment",
     ]);
   });
 });
@@ -198,5 +199,61 @@ describe("GET /orders/:orderId", () => {
     }));
 
     expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+});
+
+describe("POST /orders/:orderId/payment", () => {
+  it("maps a rejected session to 401 with WWW-Authenticate: Bearer, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment", untouchedDb(), rejectingValidator());
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment", body: undefined}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({
+      kind: "error",
+      status: 401,
+      code: "unauthenticated",
+      headers: {"WWW-Authenticate": "Bearer"},
+    });
+  });
+
+  it("maps an infrastructure failure to 503, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment", untouchedDb(), unavailableValidator());
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/order-1/payment", body: undefined}),
+      params: {orderId: "order-1"},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 503, code: "unavailable"});
+  });
+
+  it("rejects a malformed order ID as 400, without touching Firestore", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment", untouchedDb(), acceptingValidator("U-1"));
+
+    const result = await handler(ctx({
+      request: request({method: "POST", path: "/orders/../payment", body: undefined}),
+      params: {orderId: ".."},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("ignores any request body — there is nothing for a client to override", async () => {
+    const handler = routeFor("POST", "/orders/:orderId/payment", untouchedDb(), rejectingValidator());
+
+    const result = await handler(ctx({
+      request: request({
+        method: "POST",
+        path: "/orders/order-1/payment",
+        body: {amountInPaise: 1, currency: "USD", status: "succeeded"},
+      }),
+      params: {orderId: "order-1"},
+    }));
+
+    // Still 401 — the body is never even read before authentication.
+    expect(result).toMatchObject({kind: "error", status: 401});
   });
 });

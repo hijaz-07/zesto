@@ -1,5 +1,6 @@
 import {
   Timestamp,
+  type DocumentReference,
   type Firestore,
   type Transaction,
 } from "firebase-admin/firestore";
@@ -33,14 +34,15 @@ export type OrderStatus = "pending_payment" | "confirmed" | "cancelled";
 const ORDER_STATUS_VALUES = ["pending_payment", "confirmed", "cancelled"] as const;
 
 /**
- * v1 only ever writes `"pending"` (see `createOrder`) — payment integration,
- * a later checkpoint, will extend this union (and `ORDER_PAYMENT_STATUS_VALUES`
- * below) when it starts transitioning an order's `paymentStatus` to other
- * values. Not guessed at here, matching root CLAUDE.md's "do not invent"
- * guidance for anything payment-shaped this checkpoint doesn't own.
+ * `createOrder` always writes `"pending"`. `"paid"` is set exactly once, by
+ * `domain/payments.ts`'s `markPaymentSucceeded`, atomically with that same
+ * order's `status` becoming `"confirmed"` — see that module's doc comment
+ * for the full payment state machine. There is no client-reachable way to
+ * set `"paid"` directly (see root CLAUDE.md's "Never trust the frontend for
+ * security").
  */
-export type OrderPaymentStatus = "pending";
-const ORDER_PAYMENT_STATUS_VALUES = ["pending"] as const;
+export type OrderPaymentStatus = "pending" | "paid";
+const ORDER_PAYMENT_STATUS_VALUES = ["pending", "paid"] as const;
 
 /** v1 supports exactly one currency; see `Order`'s doc comment. */
 export type OrderCurrency = "INR";
@@ -633,4 +635,66 @@ export async function getOwnedOrder(
   }
 
   return order;
+}
+
+/**
+ * Resolves an order by its document ID alone, reading within an in-progress
+ * transaction — the transaction-scoped counterpart to `getOwnedOrder`, for
+ * `domain/payments.ts`'s payment operations, which all need to read and
+ * later write the order atomically alongside its payment. Deliberately
+ * duplicates `getOwnedOrder`'s parent-chain walk rather than sharing it (the
+ * same reasoning `resolveOutletForOrder`'s doc comment gives): the two have
+ * different transaction/ownership shapes, so factoring them together would
+ * cost more than the few duplicated lines it would save.
+ *
+ * Ownership is NOT checked here — callers that need it (e.g.
+ * `domain/payments.ts`'s `preparePayment`, called on behalf of an
+ * authenticated customer) must compare `order.userId` themselves; callers
+ * that don't (the trusted `markPaymentSucceeded`/`markPaymentFailed`
+ * transitions, which have no customer session in scope at all) simply don't.
+ *
+ * @param {Firestore} db Admin Firestore instance (used only to build the
+ *   query; the read itself goes through `tx`).
+ * @param {Transaction} tx The in-progress transaction to read within.
+ * @param {unknown} orderId The order's document ID.
+ * @return {Promise<{order: Order; orderRef: DocumentReference}>} The
+ *   resolved order and its document reference, for the caller's own
+ *   subsequent reads/writes within the same transaction.
+ * @throws {HttpsError} `invalid-argument` (400) if `orderId` is not a
+ *   well-formed document ID.
+ * @throws {HttpsError} `not-found` (404) if no such order exists, or the
+ *   match is ambiguous.
+ */
+export async function resolveOrderById(
+  db: Firestore,
+  tx: Transaction,
+  orderId: unknown,
+): Promise<{order: Order; orderRef: DocumentReference}> {
+  if (!isValidDocumentId(orderId)) {
+    throw new HttpsError("invalid-argument", "Invalid order ID.");
+  }
+
+  const snapshot = await tx.get(
+    db.collectionGroup("orders").where("id", "==", orderId).limit(2),
+  );
+  if (snapshot.size !== 1) {
+    throw new HttpsError("not-found", "Order not found.");
+  }
+
+  const doc = snapshot.docs[0];
+  const menuRef = doc.ref.parent.parent;
+  if (!menuRef) {
+    throw new Error(`Order document has no parent menu: ${doc.ref.path}.`);
+  }
+  const outletRef = menuRef.parent.parent;
+  if (!outletRef) {
+    throw new Error(`Order document has no parent outlet: ${doc.ref.path}.`);
+  }
+  const organizationRef = outletRef.parent.parent;
+  if (!organizationRef) {
+    throw new Error(`Order document has no parent organization: ${doc.ref.path}.`);
+  }
+
+  const order = parseOrder(doc.data(), doc.id, organizationRef.id, outletRef.id, menuRef.id);
+  return {order, orderRef: doc.ref};
 }
