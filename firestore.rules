@@ -39,6 +39,25 @@ rules_version = '2';
 // role or organization fields — organization access is granted exclusively
 // through the `members` subcollection below, never through this document.
 //
+// Subcollection: users/{userId}/orderIdempotencyKeys
+// Document ID: {idempotencyKey} — the opaque, client-supplied idempotency
+// key from a POST /orders request, bounded/validated server-side (see
+// functions/src/domain/orders.ts). Fields:
+//   - idempotencyKey, userId: string (required, immutable) — must equal the
+//     document id / the parent user id respectively.
+//   - requestFingerprint: string (required, immutable) — a deterministic
+//     digest of the logical order request, used to tell a safe retry (same
+//     key, same request) apart from a reused key with a different request.
+//   - organizationId, outletId, menuId, orderId: string (required,
+//     immutable) — identify the order this key produced.
+//   - createdAt: timestamp (required, immutable)
+// Exists so order creation can atomically check-and-reserve an idempotency
+// key inside one Firestore transaction, the same pattern outletSlugs/
+// organizationSlugs use for uniqueness. Nesting under users/{userId} is
+// what makes cross-user idempotency-key reuse impossible: only trusted
+// backend code, acting on the verified session's own user id, ever reads or
+// writes this path. Never read or written directly by clients.
+//
 // Collection: organizations
 // Document ID: {organizationId} — a Firestore auto-ID.
 // Fields:
@@ -169,6 +188,37 @@ rules_version = '2';
 // demand-driven, not inventory-driven: this document deliberately has no
 // stock/inventory/remaining-quantity fields.
 //
+// Subcollection: organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders
+// Document ID: {orderId} — a Firestore auto-ID.
+// Fields:
+//   - id, userId, organizationId, outletId, menuId: string (required,
+//     immutable) — id/organizationId/outletId/menuId must equal the path
+//     this document is read from; userId is the customer who placed the
+//     order, always derived server-side from the verified Descope session
+//     (functions/src/auth/session.ts), never accepted from a client.
+//   - status: string (required) — one of 'pending_payment' | 'confirmed' |
+//     'cancelled'. A new order always starts 'pending_payment'; payment
+//     integration (a later checkpoint) will transition it.
+//   - paymentStatus: string (required) — 'pending' for v1; a new order
+//     always starts here, payment integration transitions it later.
+//   - currency: string (required) — 'INR' for v1.
+//   - subtotalInPaise, totalInPaise: number (required, non-negative
+//     integer) — totalInPaise equals subtotalInPaise for v1; there is no
+//     tax/fee/discount system yet. Money is always integer paise, never a
+//     floating-point rupee amount (see root CLAUDE.md).
+//   - items: array (required, non-empty) of { itemId, name, priceInPaise,
+//     quantity, lineTotalInPaise } — a point-in-time SNAPSHOT of the menu
+//     items ordered, resolved from authoritative Firestore data at order
+//     creation. Changing the source menu item's name, price, or enabled
+//     state afterward never changes an existing order.
+//   - createdAt, updatedAt: timestamp (required)
+// Provisioned by trusted backend code only
+// (functions/src/domain/orders.ts's createOrder), inside one Firestore
+// transaction together with the idempotency record at
+// users/{userId}/orderIdempotencyKeys/{idempotencyKey} above. Zesto is
+// demand-driven, not inventory-driven: creating an order never writes to
+// the menu or its items.
+//
 // ===============================================================
 
 service cloud.firestore {
@@ -177,6 +227,11 @@ service cloud.firestore {
     // Profile PII. Read/written via Cloud Functions only.
     match /users/{userId} {
       allow read, write: if false;
+
+      // Order idempotency-key reservations. Backend-only, always.
+      match /orderIdempotencyKeys/{idempotencyKey} {
+        allow read, write: if false;
+      }
     }
 
     // Tenant data. Read/written via Cloud Functions only.
@@ -198,6 +253,11 @@ service cloud.firestore {
 
           // Items belonging to this menu. Backend-only, always.
           match /items/{itemId} {
+            allow read, write: if false;
+          }
+
+          // Customer orders belonging to this menu. Backend-only, always.
+          match /orders/{orderId} {
             allow read, write: if false;
           }
         }

@@ -12,6 +12,7 @@ import {createExploreRoutes} from "./routes/explore";
 import {createMeRoutes} from "./routes/me";
 import {createMenuItemRoutes} from "./routes/menuItems";
 import {createMenuRoutes} from "./routes/menus";
+import {createOrderRoutes} from "./routes/orders";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
 
@@ -27,6 +28,7 @@ const ROUTES = [
   ...createOutletRoutes({db: getAdminFirestore()}),
   ...createMenuRoutes({db: getAdminFirestore()}),
   ...createMenuItemRoutes({db: getAdminFirestore()}),
+  ...createOrderRoutes({db: getAdminFirestore()}),
   ...createExploreRoutes({db: getAdminFirestore()}),
 ];
 
