@@ -15,6 +15,7 @@ import {createMenuRoutes} from "./routes/menus";
 import {createOrderRoutes} from "./routes/orders";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
+import {razorpayKeySecret} from "./providers/razorpay";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
@@ -74,7 +75,12 @@ function sendResult(
  * docs/architecture/http-api.md for the full request/response contract.
  */
 export const api = onRequest(
-  {region: "asia-south1"},
+  // `secrets` makes RAZORPAY_KEY_SECRET available via `process.env` when
+  // deployed (backed by Cloud Secret Manager) — required for any deployed
+  // invocation that ends up calling `providers/razorpay.ts`'s
+  // `getRazorpayGateway()`. RAZORPAY_KEY_ID is a plain `defineString` param
+  // (like DESCOPE_PROJECT_ID) and needs no such declaration.
+  {region: "asia-south1", secrets: [razorpayKeySecret]},
   async (request, response) => {
     const requestId = randomUUID();
     const startedAt = Date.now();

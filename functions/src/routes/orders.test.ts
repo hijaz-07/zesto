@@ -4,12 +4,17 @@ import {HttpsError} from "firebase-functions/v2/https";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import type {SessionValidator} from "../auth/session";
 import type {NormalizedRequest, RouteContext, RouteHandler} from "../http/types";
+import type {PaymentProviderGateway} from "../providers/razorpay";
 import {createOrderRoutes} from "./orders";
 
 // verifyDescopeSession reads the expected audience from DESCOPE_PROJECT_ID
 // even when a fake SessionValidator is injected, so every test needs it set.
+// RAZORPAY_KEY_ID is read directly by handlePostOrderPayment (to build the
+// response), so any test reaching past authentication on that route needs
+// it set too, whether or not the test cares about payments at all.
 beforeEach(() => {
   vi.stubEnv("DESCOPE_PROJECT_ID", "P-test");
+  vi.stubEnv("RAZORPAY_KEY_ID", "rzp_test_public_key");
 });
 
 afterEach(() => {
@@ -68,8 +73,31 @@ function request(overrides: Partial<NormalizedRequest> = {}): NormalizedRequest 
   };
 }
 
-function routeFor(method: string, path: string, db: Firestore, validator: SessionValidator): RouteHandler {
-  const routes = createOrderRoutes({db, validator});
+/** A fake `PaymentProviderGateway` that never hits the real Razorpay
+ * API — the default for every route test here (see this checkpoint's "unit
+ * tests should mock the provider abstraction" requirement). Tests that care
+ * about provider behavior pass their own instead. */
+function fakePaymentProvider(overrides: Partial<PaymentProviderGateway> = {}): PaymentProviderGateway {
+  return {
+    createOrder: vi.fn(async (input) => ({
+      id: "order_fake_test", amountInPaise: input.amountInPaise, currency: input.currency,
+      receipt: input.receipt, status: "created",
+    })),
+    fetchOrder: vi.fn(async (providerOrderId) => (
+      {id: providerOrderId, amountInPaise: 0, currency: "INR", status: "created"}
+    )),
+    ...overrides,
+  };
+}
+
+function routeFor(
+  method: string,
+  path: string,
+  db: Firestore,
+  validator: SessionValidator,
+  paymentProvider: PaymentProviderGateway = fakePaymentProvider(),
+): RouteHandler {
+  const routes = createOrderRoutes({db, validator, paymentProvider});
   const route = routes.find((r) => r.method === method && r.path === path);
   if (!route) throw new Error(`${method} ${path} route not registered`);
   return route.handler;

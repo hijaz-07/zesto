@@ -49,6 +49,20 @@ describe("parsePayment", () => {
     expect(payment.providerPaymentId).toBeUndefined();
   });
 
+  it("accepts a razorpay payment with a providerOrderId set", () => {
+    const payment = parsePayment(
+      validPayment({provider: "razorpay", providerOrderId: "order_RazorpayTest1"}),
+      ORDER_ID, ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID,
+    );
+    expect(payment.provider).toBe("razorpay");
+    expect(payment.providerOrderId).toBe("order_RazorpayTest1");
+  });
+
+  it("accepts a payment with no providerOrderId at all", () => {
+    const payment = parsePayment(validPayment(), ORDER_ID, ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID);
+    expect(payment.providerOrderId).toBeUndefined();
+  });
+
   it.each([
     ["id", "payment-other"],
     ["orderId", "order-other"],
@@ -86,7 +100,7 @@ describe("parsePayment", () => {
 });
 
 describe("toPaymentResponse", () => {
-  it("maps to exactly the customer-safe fields, excluding provider internals", () => {
+  it("maps to exactly the customer-safe fields, excluding internal Firestore path context", () => {
     const payment = validPayment({providerPaymentId: "provider-ref-1"});
     const response = toPaymentResponse(payment);
 
@@ -96,12 +110,12 @@ describe("toPaymentResponse", () => {
       amountInPaise: payment.amountInPaise,
       currency: payment.currency,
       status: payment.status,
+      provider: payment.provider,
     });
     expect(response).not.toHaveProperty("userId");
     expect(response).not.toHaveProperty("organizationId");
     expect(response).not.toHaveProperty("outletId");
     expect(response).not.toHaveProperty("menuId");
-    expect(response).not.toHaveProperty("provider");
     expect(response).not.toHaveProperty("providerPaymentId");
     expect(response).not.toHaveProperty("createdAt");
     expect(response).not.toHaveProperty("updatedAt");
@@ -110,5 +124,33 @@ describe("toPaymentResponse", () => {
   it("reflects the current status (e.g. succeeded)", () => {
     const response = toPaymentResponse(validPayment({status: "succeeded"}));
     expect(response.status).toBe("succeeded");
+  });
+
+  it("includes providerOrderId when set", () => {
+    const payment = validPayment({provider: "razorpay", providerOrderId: "order_RazorpayTest1"});
+    const response = toPaymentResponse(payment);
+    expect(response.provider).toBe("razorpay");
+    expect(response.providerOrderId).toBe("order_RazorpayTest1");
+  });
+
+  it("omits providerOrderId when not set", () => {
+    const response = toPaymentResponse(validPayment());
+    expect(response).not.toHaveProperty("providerOrderId");
+  });
+
+  it("includes providerKeyId when given one, omits it otherwise", () => {
+    const payment = validPayment();
+    expect(toPaymentResponse(payment, "rzp_test_public_key").providerKeyId).toBe("rzp_test_public_key");
+    expect(toPaymentResponse(payment)).not.toHaveProperty("providerKeyId");
+  });
+
+  it("never exposes anything secret-shaped regardless of input", () => {
+    const response = toPaymentResponse(
+      validPayment({provider: "razorpay", providerOrderId: "order_RazorpayTest1"}),
+      "rzp_test_public_key",
+    );
+    const serialized = JSON.stringify(response).toLowerCase();
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("key_secret");
   });
 });

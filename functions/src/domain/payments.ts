@@ -7,6 +7,10 @@ import {
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
+import {
+  PaymentProviderError,
+  type PaymentProviderGateway,
+} from "../providers/razorpay";
 import {resolveOrderById, type Order} from "./orders";
 
 /**
@@ -16,14 +20,25 @@ import {resolveOrderById, type Order} from "./orders";
  * notes). Nested one level under the order it belongs to, the same
  * relationship `items` has to its parent `Menu`.
  *
- * v1 is provider-independent by design: no external payment provider is
- * called from this module, and `provider` only ever has one value, `"none"`
- * — a placeholder a future provider adapter will extend, matching this
- * checkpoint's explicit "do not connect a real provider yet" scope.
- * `providerPaymentId` therefore stays unset for every payment this module
- * creates or transitions; it exists only so a future webhook adapter has
- * somewhere to record the provider's own reference once one exists. Never
- * fabricated.
+ * `preparePayment` itself stays provider-independent: it always writes
+ * `provider: "none"` and never touches `providers/razorpay.ts` (see root
+ * CLAUDE.md's "Keep Razorpay-specific behavior isolated from the core
+ * payment domain as much as practical"). `ensureProviderOrder` is the one
+ * function that talks to a provider (through the `PaymentProviderGateway`
+ * abstraction, never the Razorpay SDK directly) and is what actually moves
+ * `provider` to `"razorpay"` and sets `providerOrderId`. Creating a provider
+ * order is NOT a payment: `payment.status` stays `pending` and
+ * `order.status` stays `pending_payment` throughout — see that function's
+ * doc comment.
+ *
+ * `providerPaymentId` is a DIFFERENT identifier from `providerOrderId`: the
+ * former is the provider's reference for a completed PAYMENT (set only by
+ * `markPaymentSucceeded`/`markPaymentFailed`, a later checkpoint's
+ * concern), the latter is the provider's reference for the Razorpay ORDER
+ * created to collect that payment (set by `ensureProviderOrder`). Never
+ * confuse them, and never confuse either with this document's own `id`
+ * (Zesto's internal payment ID) — three distinct identifiers on purpose.
+ * Neither provider field is ever fabricated by this module.
  *
  * For v1, a payment's `id` always equals its parent order's `id` — there is
  * exactly one payment per order, ever (see `preparePayment`), so this
@@ -40,9 +55,13 @@ import {resolveOrderById, type Order} from "./orders";
 export type PaymentStatus = "pending" | "succeeded" | "failed";
 const PAYMENT_STATUS_VALUES = ["pending", "succeeded", "failed"] as const;
 
-/** v1 supports exactly one provider value: no real provider is connected yet. */
-export type PaymentProvider = "none";
-const PAYMENT_PROVIDER_VALUES = ["none"] as const;
+/** `"none"` until `ensureProviderOrder` connects a real provider order to
+ * this payment; `"razorpay"` from then on. See the module doc comment for
+ * why this is a separate concern from `PaymentProviderGateway` (the
+ * provider abstraction itself, in `providers/razorpay.ts`) — this is just
+ * the stored tag identifying WHICH provider, if any. */
+export type PaymentProviderName = "none" | "razorpay";
+const PAYMENT_PROVIDER_VALUES = ["none", "razorpay"] as const;
 
 /** v1 supports exactly one currency, always inherited from the order. */
 export type PaymentCurrency = "INR";
@@ -57,9 +76,14 @@ export interface Payment {
   amountInPaise: number;
   currency: PaymentCurrency;
   status: PaymentStatus;
-  provider: PaymentProvider;
-  /** The provider's own reference for this payment, once one exists. Never
-   * fabricated — absent for every payment v1 creates or transitions. */
+  provider: PaymentProviderName;
+  /** The provider's ORDER reference (e.g. Razorpay's `order_...` ID), set
+   * once `ensureProviderOrder` creates or reuses one. Distinct from
+   * `providerPaymentId` — see the module doc comment. */
+  providerOrderId?: string;
+  /** The provider's own reference for a completed PAYMENT, once one
+   * exists. Never fabricated — absent for every payment this checkpoint (or
+   * the last) creates or transitions. */
   providerPaymentId?: string;
   createdAt: Timestamp;
   updatedAt: Timestamp;
@@ -67,11 +91,13 @@ export interface Payment {
 
 /**
  * The customer-safe API response shape for a `Payment` — deliberately just
- * enough for a future provider integration to act on (see this checkpoint's
- * "Payment creation" notes): never `userId`/`organizationId`/`outletId`/
- * `menuId` (internal Firestore path context, not needed by the client), and
- * never `provider`/`providerPaymentId` (provider internals the client has no
- * business seeing, and which don't exist yet for v1 anyway).
+ * enough for the NEXT checkpoint's frontend Checkout integration to act on
+ * (see this checkpoint's "API response security" notes): never `userId`/
+ * `organizationId`/`outletId`/`menuId` (internal Firestore path context),
+ * and never `providerPaymentId` (not set by anything in this checkpoint,
+ * and not needed by the client even once it is). `providerKeyId` is
+ * Razorpay's PUBLIC `key_id` — safe to expose, unlike `key_secret`, which
+ * this type has no field for at all.
  */
 export interface PaymentResponse {
   paymentId: string;
@@ -79,6 +105,9 @@ export interface PaymentResponse {
   amountInPaise: number;
   currency: PaymentCurrency;
   status: PaymentStatus;
+  provider: PaymentProviderName;
+  providerOrderId?: string;
+  providerKeyId?: string;
 }
 
 const paymentDocSchema = z.object({
@@ -92,6 +121,7 @@ const paymentDocSchema = z.object({
   currency: z.literal("INR"),
   status: z.enum(PAYMENT_STATUS_VALUES),
   provider: z.enum(PAYMENT_PROVIDER_VALUES),
+  providerOrderId: z.string().min(1).optional(),
   providerPaymentId: z.string().min(1).optional(),
   createdAt: z.custom<Timestamp>(
     (value) => value instanceof Timestamp,
@@ -144,16 +174,28 @@ export function parsePayment(
 
 /**
  * @param {Payment} payment A stored payment.
+ * @param {string} [providerKeyId] The provider's current PUBLIC key_id
+ *   (e.g. `getRazorpayKeyId()`), to include in the response. Omitted when
+ *   the caller has no provider context to give (e.g. a future endpoint that
+ *   reads a payment without preparing a provider order).
  * @return {PaymentResponse} The customer-safe API response shape for it.
  */
-export function toPaymentResponse(payment: Payment): PaymentResponse {
-  return {
+export function toPaymentResponse(payment: Payment, providerKeyId?: string): PaymentResponse {
+  const response: PaymentResponse = {
     paymentId: payment.id,
     orderId: payment.orderId,
     amountInPaise: payment.amountInPaise,
     currency: payment.currency,
     status: payment.status,
+    provider: payment.provider,
   };
+  if (payment.providerOrderId !== undefined) {
+    response.providerOrderId = payment.providerOrderId;
+  }
+  if (providerKeyId !== undefined) {
+    response.providerKeyId = providerKeyId;
+  }
+  return response;
 }
 
 /**
@@ -494,5 +536,165 @@ export async function markPaymentFailed(
     tx.update(paymentRef, paymentUpdate);
 
     return {...payment, ...paymentUpdate};
+  });
+}
+
+/** The result of `ensureProviderOrder`: the payment as it stands after the
+ * call, its authoritative `providerOrderId`, and whether THIS call is the
+ * one that created the provider order (as opposed to reusing one that
+ * already existed, or losing a race to a concurrent call — see the
+ * function's doc comment). */
+export interface EnsureProviderOrderResult {
+  payment: Payment;
+  providerOrderId: string;
+  created: boolean;
+}
+
+/**
+ * Ensures the given payment has a Razorpay order to collect payment
+ * against, creating one through `gateway` if it doesn't already — the
+ * provider-order half of this checkpoint's extended `POST
+ * /orders/{orderId}/payment` flow (`preparePayment` establishes the
+ * internal payment; this connects it to a provider order). Creating a
+ * provider order is NOT a payment: it never changes `payment.status` (stays
+ * `pending`) or the order's `status`/`paymentStatus` (stay `pending_payment`/
+ * `pending`) — see root CLAUDE.md's core payment rule.
+ *
+ * `amountInPaise`/`currency` sent to the provider always come from the
+ * ALREADY-authoritative stored payment (itself set from the order's own
+ * total at `preparePayment` time) — never recomputed from the order or
+ * accepted from a caller. `receipt` is the payment's own `id` — deterministic
+ * and bounded (a Firestore auto-ID, well under Razorpay's 40-character
+ * receipt limit), so the created provider order is always traceable back to
+ * this exact Zesto payment.
+ *
+ * Concurrency and the Firestore/HTTP atomicity gap (see this checkpoint's
+ * "Idempotency"/"Concurrency" notes) — deliberately NOT pretending a
+ * Firestore transaction and a remote Razorpay HTTP call are one atomic
+ * operation:
+ * 1. Read the payment (its own small transaction, no provider call inside
+ *    it). If `providerOrderId` is already set, return it immediately — no
+ *    provider call at all. This is the common case for every call after the
+ *    first.
+ * 2. Otherwise, call `gateway.createOrder` OUTSIDE any transaction — a
+ *    provider order is created (or the call fails, in which case nothing
+ *    else happens; see below).
+ * 3. Persist the result with a GUARDED update (`claimProviderOrder`, its own
+ *    fresh transaction): re-read the payment, and only write
+ *    `providerOrderId` if it is STILL absent. If a concurrent call already
+ *    won (see below), this call's own freshly-created provider order is
+ *    simply discarded — an unpaid Razorpay order has no side effects and is
+ *    never referenced again, so this is safe, not just convenient.
+ *
+ * This makes two simultaneous calls for the same payment (the "request A
+ * sees no providerOrderId, request B sees no providerOrderId, both call
+ * Razorpay" race this checkpoint calls out) resolve to exactly one
+ * authoritative `providerOrderId` — both calls return the SAME id, whichever
+ * one's guarded update actually won.
+ *
+ * Accepted, documented limitation: if step 2 succeeds but this process
+ * crashes or loses network before step 3 runs, that created order is
+ * orphaned (never persisted, never retried-into) and a later retry creates
+ * a NEW one instead of finding it. This is deliberate, not an oversight —
+ * reconciling it would mean querying Razorpay for a matching receipt before
+ * every single call (including the overwhelmingly common case where no
+ * such orphan exists), which this checkpoint's own "do not introduce
+ * unnecessary complexity" guidance weighs against. The orphaned order is
+ * inert (nothing is ever charged against it) and its deterministic
+ * `receipt` (the payment's own `id`) leaves it identifiable by hand if it
+ * ever needs cleaning up.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {unknown} orderId The order's document ID.
+ * @param {unknown} paymentId The payment's document ID.
+ * @param {PaymentProviderGateway} gateway The provider abstraction
+ *   (defaults to the real Razorpay gateway; tests inject a fake).
+ * @return {Promise<EnsureProviderOrderResult>} The payment, its
+ *   authoritative `providerOrderId`, and whether this call created it.
+ * @throws {HttpsError} `invalid-argument` (400) for a malformed `orderId` or
+ *   `paymentId`.
+ * @throws {HttpsError} `not-found` (404) if no such order or payment exists.
+ * @throws {HttpsError} `unavailable` (503) if the provider call fails — the
+ *   payment is left exactly as it was (still `pending`, no `providerOrderId`),
+ *   so a retry remains possible.
+ */
+export async function ensureProviderOrder(
+  db: Firestore,
+  orderId: unknown,
+  paymentId: unknown,
+  gateway: PaymentProviderGateway,
+): Promise<EnsureProviderOrderResult> {
+  if (!isValidDocumentId(orderId)) {
+    throw new HttpsError("invalid-argument", "Invalid order ID.");
+  }
+  if (!isValidDocumentId(paymentId)) {
+    throw new HttpsError("invalid-argument", "Invalid payment ID.");
+  }
+
+  const {payment: initialPayment} = await db.runTransaction((tx) =>
+    resolveOrderAndPayment(db, tx, orderId, paymentId));
+
+  if (initialPayment.providerOrderId !== undefined) {
+    return {payment: initialPayment, providerOrderId: initialPayment.providerOrderId, created: false};
+  }
+
+  let providerOrderId: string;
+  try {
+    const providerOrder = await gateway.createOrder({
+      amountInPaise: initialPayment.amountInPaise,
+      currency: initialPayment.currency,
+      receipt: initialPayment.id,
+    });
+    providerOrderId = providerOrder.id;
+  } catch (error) {
+    if (error instanceof PaymentProviderError) {
+      throw new HttpsError(
+        "unavailable",
+        "The payment provider is temporarily unavailable. Please try again.",
+      );
+    }
+    throw error;
+  }
+
+  return claimProviderOrder(db, orderId, paymentId, providerOrderId);
+}
+
+/**
+ * The guarded-update half of `ensureProviderOrder`: persists
+ * `candidateProviderOrderId` onto the payment ONLY if it still has none,
+ * inside a fresh transaction that never touches the provider. If a
+ * concurrent call already won, this returns THAT authoritative id instead
+ * of the candidate — the candidate's own (now-orphaned) provider order is
+ * simply never referenced again.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {unknown} orderId The order's document ID.
+ * @param {unknown} paymentId The payment's document ID.
+ * @param {string} candidateProviderOrderId The provider order ID this call
+ *   just created, to persist if no one beat it to it.
+ * @return {Promise<EnsureProviderOrderResult>} The authoritative result.
+ */
+async function claimProviderOrder(
+  db: Firestore,
+  orderId: unknown,
+  paymentId: unknown,
+  candidateProviderOrderId: string,
+): Promise<EnsureProviderOrderResult> {
+  return db.runTransaction(async (tx): Promise<EnsureProviderOrderResult> => {
+    const {payment, paymentRef} = await resolveOrderAndPayment(db, tx, orderId, paymentId);
+
+    if (payment.providerOrderId !== undefined) {
+      return {payment, providerOrderId: payment.providerOrderId, created: false};
+    }
+
+    const now = Timestamp.now();
+    const update: Partial<Payment> = {
+      provider: "razorpay",
+      providerOrderId: candidateProviderOrderId,
+      updatedAt: now,
+    };
+    tx.update(paymentRef, update);
+
+    return {payment: {...payment, ...update}, providerOrderId: candidateProviderOrderId, created: true};
   });
 }

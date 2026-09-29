@@ -9,27 +9,35 @@ import {createOrder, getOwnedOrder, type Order} from "./orders";
 import {createOrganization} from "./organizations";
 import {createOutlet} from "./outlets";
 import {
+  ensureProviderOrder,
   markPaymentFailed,
   markPaymentSucceeded,
   preparePayment,
   type Payment,
 } from "./payments";
 import {businessDateString} from "../time";
+import {PaymentProviderError, type CreateProviderOrderInput, type PaymentProviderGateway} from "../providers/razorpay";
 
 /**
- * These tests exercise `preparePayment`/`markPaymentSucceeded`/
- * `markPaymentFailed` directly against a REAL Firestore emulator — the same
- * reason `orders.emulator.test.ts` exists: to prove real transaction
- * semantics (the create-or-reuse payment record, and the atomic
- * payment+order transitions) and real concurrency. There is no HTTP route
- * for `markPaymentSucceeded`/`markPaymentFailed` in this checkpoint (see
- * root CLAUDE.md's core payment rule), so they are only reachable at this
- * domain layer, matching how a future trusted webhook adapter will call
- * them. `preparePayment` IS reachable via HTTP
- * (`POST /orders/{orderId}/payment`); its route-level behavior (auth,
- * envelope, status codes) is covered separately in
+ * These tests exercise `preparePayment`/`ensureProviderOrder`/
+ * `markPaymentSucceeded`/`markPaymentFailed` directly against a REAL
+ * Firestore emulator — the same reason `orders.emulator.test.ts` exists: to
+ * prove real transaction semantics (the create-or-reuse payment record, the
+ * guarded provider-order claim, and the atomic payment+order transitions)
+ * and real concurrency. There is no HTTP route for
+ * `markPaymentSucceeded`/`markPaymentFailed` in this checkpoint (see root
+ * CLAUDE.md's core payment rule), so they are only reachable at this domain
+ * layer, matching how a future trusted webhook adapter will call them.
+ * `preparePayment`/`ensureProviderOrder` ARE reachable via HTTP
+ * (`POST /orders/{orderId}/payment`); their route-level behavior (auth,
+ * envelope, status codes, response shape) is covered separately in
  * `routes/orders.emulator.test.ts`, so the tests here focus on the domain
  * invariants themselves.
+ *
+ * `ensureProviderOrder` always gets a FAKE `PaymentProviderGateway` (see
+ * `fakeGateway` below) — this suite never calls the real Razorpay API, per
+ * this checkpoint's "unit tests should mock the provider abstraction"
+ * requirement.
  *
  * Run via `npm run test:functions-emulator` (repo root).
  */
@@ -130,6 +138,34 @@ async function setupPendingOrder(
     idempotencyKey: `key-${randomUUID()}`,
   });
   return {organizationId, ownerId, outletId, menuId: menu.id, order, customerId};
+}
+
+/** A fake `PaymentProviderGateway` — never the real Razorpay SDK/API (see
+ * this file's own doc comment). Each `createOrder` call returns a fresh,
+ * distinct provider order ID unless `orderId` is fixed via `overrides`, so
+ * concurrency tests can tell which of several concurrent calls "won". */
+function fakeGateway(overrides: {
+  createOrder?: PaymentProviderGateway["createOrder"];
+  fetchOrder?: PaymentProviderGateway["fetchOrder"];
+} = {}): {gateway: PaymentProviderGateway; createOrder: ReturnType<typeof vi.fn>} {
+  let counter = 0;
+  const createOrder = vi.fn(
+    overrides.createOrder ??
+    (async (input: CreateProviderOrderInput) => ({
+      id: `order_fake_${randomUUID()}_${++counter}`,
+      amountInPaise: input.amountInPaise,
+      currency: input.currency,
+      receipt: input.receipt,
+      status: "created",
+    })),
+  );
+  const fetchOrder = vi.fn(
+    overrides.fetchOrder ??
+    (async (providerOrderId: string) => ({
+      id: providerOrderId, amountInPaise: 0, currency: "INR", status: "created",
+    })),
+  );
+  return {gateway: {createOrder, fetchOrder}, createOrder};
 }
 
 describe("preparePayment", () => {
@@ -401,5 +437,101 @@ describe("markPaymentFailed", () => {
     const {order} = await setupPendingOrder();
     await expect(markPaymentFailed(db, {orderId: order.id, paymentId: "no-such-payment"}))
       .rejects.toMatchObject({code: "not-found"});
+  });
+});
+
+describe("ensureProviderOrder", () => {
+  async function preparedPayment(priceInPaise = 12000): Promise<{order: Order; payment: Payment}> {
+    const {order, customerId} = await setupPendingOrder(priceInPaise);
+    const {payment} = await preparePayment(db, customerId, order.id);
+    return {order, payment};
+  }
+
+  it("creates exactly one provider order, with amount/currency/receipt from the payment", async () => {
+    const {order, payment} = await preparedPayment(7500);
+    const {gateway, createOrder} = fakeGateway();
+
+    const result = await ensureProviderOrder(db, order.id, payment.id, gateway);
+
+    expect(createOrder).toHaveBeenCalledTimes(1);
+    expect(createOrder).toHaveBeenCalledWith({
+      amountInPaise: payment.amountInPaise, currency: payment.currency, receipt: payment.id,
+    });
+    expect(result.created).toBe(true);
+    expect(result.payment.provider).toBe("razorpay");
+    expect(result.payment.providerOrderId).toBe(result.providerOrderId);
+  });
+
+  it("never marks anything paid/confirmed: payment stays pending, order stays pending_payment", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway} = fakeGateway();
+
+    const result = await ensureProviderOrder(db, order.id, payment.id, gateway);
+
+    expect(result.payment.status).toBe("pending");
+    const reread = await getOwnedOrder(db, order.userId, order.id);
+    expect(reread.status).toBe("pending_payment");
+    expect(reread.paymentStatus).toBe("pending");
+  });
+
+  it("is idempotent: a repeated call reuses the same providerOrderId without calling the gateway again", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway, createOrder} = fakeGateway();
+
+    const first = await ensureProviderOrder(db, order.id, payment.id, gateway);
+    const second = await ensureProviderOrder(db, order.id, payment.id, gateway);
+
+    expect(createOrder).toHaveBeenCalledTimes(1);
+    expect(second.created).toBe(false);
+    expect(second.providerOrderId).toBe(first.providerOrderId);
+  });
+
+  it("two concurrent calls settle on exactly one authoritative providerOrderId", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway} = fakeGateway();
+
+    const [a, b] = await Promise.all([
+      ensureProviderOrder(db, order.id, payment.id, gateway),
+      ensureProviderOrder(db, order.id, payment.id, gateway),
+    ]);
+
+    expect(a.providerOrderId).toBe(b.providerOrderId);
+    expect([a.created, b.created].filter(Boolean)).toHaveLength(1);
+
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.size).toBe(1);
+    expect(stored.docs[0].data().providerOrderId).toBe(a.providerOrderId);
+  });
+
+  it("a provider failure produces a safe unavailable error and leaves the payment retry-able", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway: failingGateway} = fakeGateway({
+      createOrder: async () => { throw new PaymentProviderError("Razorpay order creation failed.", {statusCode: 500}); },
+    });
+
+    await expect(ensureProviderOrder(db, order.id, payment.id, failingGateway))
+      .rejects.toMatchObject({code: "unavailable"});
+
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.docs[0].data()).toMatchObject({status: "pending", provider: "none"});
+    expect(stored.docs[0].data()).not.toHaveProperty("providerOrderId");
+
+    const {gateway: workingGateway} = fakeGateway();
+    const retried = await ensureProviderOrder(db, order.id, payment.id, workingGateway);
+    expect(retried.created).toBe(true);
+  });
+
+  it("rejects a nonexistent payment (not-found)", async () => {
+    const {order} = await setupPendingOrder();
+    const {gateway} = fakeGateway();
+    await expect(ensureProviderOrder(db, order.id, "no-such-payment", gateway))
+      .rejects.toMatchObject({code: "not-found"});
+  });
+
+  it("rejects a malformed order/payment ID (invalid-argument), never calling the gateway", async () => {
+    const {gateway, createOrder} = fakeGateway();
+    await expect(ensureProviderOrder(db, "..", "payment-1", gateway))
+      .rejects.toMatchObject({code: "invalid-argument"});
+    expect(createOrder).not.toHaveBeenCalled();
   });
 });

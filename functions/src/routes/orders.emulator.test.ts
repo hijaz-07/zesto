@@ -16,6 +16,7 @@ import {createOrganization} from "../domain/organizations";
 import {createOutlet, updateOutlet} from "../domain/outlets";
 import {handleRequest} from "../http/handleRequest";
 import type {ApiResult, NormalizedRequest} from "../http/types";
+import {PaymentProviderError, type PaymentProviderGateway} from "../providers/razorpay";
 import {businessDateString} from "../time";
 import {createOrderRoutes} from "./orders";
 
@@ -53,6 +54,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.stubEnv("DESCOPE_PROJECT_ID", "P-test");
+  vi.stubEnv("RAZORPAY_KEY_ID", "rzp_test_public_key");
 });
 
 afterEach(() => {
@@ -244,6 +246,9 @@ interface PaymentResponseShape {
   amountInPaise: number;
   currency: string;
   status: string;
+  provider: string;
+  providerOrderId?: string;
+  providerKeyId?: string;
 }
 
 function paymentOf(result: ApiResult): PaymentResponseShape {
@@ -251,8 +256,31 @@ function paymentOf(result: ApiResult): PaymentResponseShape {
   return (result.data as {payment: PaymentResponseShape}).payment;
 }
 
-async function callPreparePayment(validator: SessionValidator, orderId: string, body: unknown = undefined): Promise<ApiResult> {
-  const routes = createOrderRoutes({db, validator});
+/** A fake `PaymentProviderGateway` — this suite never calls the real
+ * Razorpay API (see this checkpoint's "unit tests should mock the provider
+ * abstraction" requirement; `payments.emulator.test.ts` covers the domain
+ * invariants directly, this file covers the route/response wiring). */
+function fakePaymentProvider(overrides: Partial<PaymentProviderGateway> = {}): PaymentProviderGateway {
+  let counter = 0;
+  return {
+    createOrder: vi.fn(async (input) => ({
+      id: `order_fake_${randomUUID()}_${++counter}`,
+      amountInPaise: input.amountInPaise, currency: input.currency, receipt: input.receipt, status: "created",
+    })),
+    fetchOrder: vi.fn(async (providerOrderId) => (
+      {id: providerOrderId, amountInPaise: 0, currency: "INR", status: "created"}
+    )),
+    ...overrides,
+  };
+}
+
+async function callPreparePayment(
+  validator: SessionValidator,
+  orderId: string,
+  body: unknown = undefined,
+  paymentProvider: PaymentProviderGateway = fakePaymentProvider(),
+): Promise<ApiResult> {
+  const routes = createOrderRoutes({db, validator, paymentProvider});
   return handleRequest(
     routes,
     request({method: "POST", path: `/orders/${orderId}/payment`, body}),
@@ -687,10 +715,36 @@ describe("POST /orders/:orderId/payment (Firestore emulator)", () => {
       amountInPaise: order.totalInPaise,
       currency: "INR",
       status: "pending",
+      provider: "razorpay",
+      providerOrderId: payment.providerOrderId,
+      providerKeyId: "rzp_test_public_key",
+    });
+    expect(payment.providerOrderId).toBeTruthy();
+
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.docs[0].data()).toMatchObject({
+      status: "pending", provider: "razorpay", providerOrderId: payment.providerOrderId,
     });
   });
 
-  it("never returns provider internals or Firestore paths", async () => {
+  it("sends the provider only amount/currency/receipt, never client-suppliable data", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem({priceInPaise: 8000});
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-fields",
+    });
+    const order = orderOf(created);
+    const provider = fakePaymentProvider();
+
+    await callPreparePayment(acceptingValidator(customerId), order.id, undefined, provider);
+
+    expect(provider.createOrder).toHaveBeenCalledTimes(1);
+    expect(provider.createOrder).toHaveBeenCalledWith({
+      amountInPaise: order.totalInPaise, currency: "INR", receipt: order.id,
+    });
+  });
+
+  it("never returns provider secrets, provider payment internals, or internal Firestore path context", async () => {
     const {outletId, menuId, item} = await setupPublishedMenuWithItem();
     const customerId = freshUserId();
     const created = await callCreate(acceptingValidator(customerId), {
@@ -702,29 +756,81 @@ describe("POST /orders/:orderId/payment (Firestore emulator)", () => {
 
     expect(result).toMatchObject({kind: "success"});
     const payment = paymentOf(result) as unknown as Record<string, unknown>;
-    expect(payment).not.toHaveProperty("provider");
     expect(payment).not.toHaveProperty("providerPaymentId");
     expect(payment).not.toHaveProperty("userId");
     expect(payment).not.toHaveProperty("organizationId");
+    expect(payment).not.toHaveProperty("outletId");
+    expect(payment).not.toHaveProperty("menuId");
+    const serialized = JSON.stringify(result).toLowerCase();
+    expect(serialized).not.toContain("secret");
+    expect(serialized).not.toContain("test_key_secret");
   });
 
-  it("is idempotent: a repeated call reuses the same payment (200, not 201)", async () => {
+  it("is idempotent: a repeated call reuses the same payment AND provider order (200, not 201)", async () => {
     const {outletId, menuId, item} = await setupPublishedMenuWithItem();
     const customerId = freshUserId();
     const created = await callCreate(acceptingValidator(customerId), {
       outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-3",
     });
     const order = orderOf(created);
+    const provider = fakePaymentProvider();
 
-    const first = await callPreparePayment(acceptingValidator(customerId), order.id);
-    const second = await callPreparePayment(acceptingValidator(customerId), order.id);
+    const first = await callPreparePayment(acceptingValidator(customerId), order.id, undefined, provider);
+    const second = await callPreparePayment(acceptingValidator(customerId), order.id, undefined, provider);
 
     expect(first).toMatchObject({kind: "success", status: 201});
     expect(second).toMatchObject({kind: "success", status: 200});
     expect(paymentOf(second)).toEqual(paymentOf(first));
+    expect(provider.createOrder).toHaveBeenCalledTimes(1);
 
     const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
     expect(stored.size).toBe(1);
+  });
+
+  it("a provider failure produces a safe 503, leaves the payment pending, and a retry can still succeed", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-fail",
+    });
+    const order = orderOf(created);
+    const failingProvider = fakePaymentProvider({
+      createOrder: async () => { throw new PaymentProviderError("Razorpay order creation failed.", {statusCode: 500}); },
+    });
+
+    const failed = await callPreparePayment(acceptingValidator(customerId), order.id, undefined, failingProvider);
+    expect(failed).toMatchObject({kind: "error", status: 503, code: "unavailable"});
+    const failedMessage = (failed as {message: string}).message.toLowerCase();
+    expect(failedMessage).not.toContain("secret");
+
+    const afterFailure = await callGet(acceptingValidator(customerId), order.id);
+    expect(orderOf(afterFailure)).toMatchObject({status: "pending_payment", paymentStatus: "pending"});
+
+    const retried = await callPreparePayment(acceptingValidator(customerId), order.id);
+    expect(retried).toMatchObject({kind: "success", status: 201});
+    expect(paymentOf(retried).status).toBe("pending");
+  });
+
+  it("two concurrent prepare-payment requests settle on exactly one authoritative provider order", async () => {
+    const {outletId, menuId, item} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    const created = await callCreate(acceptingValidator(customerId), {
+      outletId, menuId, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "pay-key-concurrent",
+    });
+    const order = orderOf(created);
+    const provider = fakePaymentProvider();
+
+    const [a, b] = await Promise.all([
+      callPreparePayment(acceptingValidator(customerId), order.id, undefined, provider),
+      callPreparePayment(acceptingValidator(customerId), order.id, undefined, provider),
+    ]);
+
+    expect([a.status, b.status].sort()).toEqual([200, 201]);
+    expect(paymentOf(a).providerOrderId).toBe(paymentOf(b).providerOrderId);
+
+    const stored = await db.collectionGroup("payments").where("orderId", "==", order.id).get();
+    expect(stored.size).toBe(1);
+    expect(stored.docs[0].data().providerOrderId).toBe(paymentOf(a).providerOrderId);
   });
 
   it("denies a different authenticated customer from preparing payment for someone else's order (404)", async () => {

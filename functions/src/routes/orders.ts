@@ -8,18 +8,21 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
-import {preparePayment, toPaymentResponse} from "../domain/payments";
+import {ensureProviderOrder, preparePayment, toPaymentResponse} from "../domain/payments";
 import type {
   ApiResult,
   NormalizedRequest,
   RouteContext,
   RouteDefinition,
 } from "../http/types";
+import {getRazorpayGateway, getRazorpayKeyId, type PaymentProviderGateway} from "../providers/razorpay";
 
 export interface OrdersRouteDeps {
   db: Firestore;
   /** Injectable for tests; defaults to the shared Descope client. */
   validator?: SessionValidator;
+  /** Injectable for tests; defaults to the shared real Razorpay gateway. */
+  paymentProvider?: PaymentProviderGateway;
 }
 
 /**
@@ -156,23 +159,27 @@ async function handleGetOrder(
 
 /**
  * `POST /orders/{orderId}/payment`: prepares a payment for the caller's own
- * `pending_payment` order (see `domain/payments.ts`'s `preparePayment` and
- * this checkpoint's "Payment creation"/"API endpoints" notes). Takes no
- * request body — `amountInPaise`/`currency` always come from the order,
- * never from the client, so there is nothing in the body to even read.
+ * `pending_payment` order, then ensures it has a Razorpay Test Mode order to
+ * collect payment against (see `domain/payments.ts`'s `preparePayment`/
+ * `ensureProviderOrder` and this checkpoint's "Server-side Razorpay order
+ * creation" notes). Takes no request body — `amountInPaise`/`currency` (both
+ * Zesto's and, in turn, Razorpay's) always come from the order, never from
+ * the client, so there is nothing in the body to even read.
  *
- * This is the ONLY payment-related endpoint this checkpoint adds. There is
- * deliberately no endpoint that can mark a payment/order succeeded — see
- * root CLAUDE.md's core payment rule: only a future trusted provider
- * webhook, calling `domain/payments.ts`'s `markPaymentSucceeded` directly,
- * may do that.
+ * This is the ONLY payment-related endpoint this checkpoint touches. There
+ * is deliberately no endpoint that can mark a payment/order succeeded, and
+ * creating a Razorpay order is NOT a payment — see root CLAUDE.md's core
+ * payment rule and `ensureProviderOrder`'s doc comment: only a future
+ * trusted provider webhook, calling `domain/payments.ts`'s
+ * `markPaymentSucceeded` directly, may confirm an order.
  *
  * @param {RouteContext} ctx The route context.
  * @param {OrdersRouteDeps} deps The route's dependencies.
- * @return {Promise<ApiResult>} The route's outcome. `201` for a newly
- *   created payment; `200` when the order already had one (see
- *   `preparePayment`'s idempotency design) — either way, the response body
- *   shape is identical.
+ * @return {Promise<ApiResult>} The route's outcome. `201` if this call
+ *   created the internal payment or its provider order (or both); `200` if
+ *   both already existed (a pure idempotent replay) — either way, the
+ *   response body shape is identical, and never exposes provider secrets
+ *   (see `toPaymentResponse`).
  */
 async function handlePostOrderPayment(
   ctx: RouteContext,
@@ -189,11 +196,16 @@ async function handlePostOrderPayment(
   }
 
   try {
-    const {payment, created} = await preparePayment(deps.db, session.userId, ctx.params?.orderId);
+    const providerKeyId = getRazorpayKeyId();
+    const {payment, created: paymentCreated} =
+      await preparePayment(deps.db, session.userId, ctx.params?.orderId);
+    const {payment: updatedPayment, created: providerOrderCreated} = await ensureProviderOrder(
+      deps.db, payment.orderId, payment.id, deps.paymentProvider ?? getRazorpayGateway(),
+    );
     return {
       kind: "success",
-      status: created ? 201 : 200,
-      data: {payment: toPaymentResponse(payment)},
+      status: paymentCreated || providerOrderCreated ? 201 : 200,
+      data: {payment: toPaymentResponse(updatedPayment, providerKeyId)},
       userId: session.userId,
     };
   } catch (error) {
