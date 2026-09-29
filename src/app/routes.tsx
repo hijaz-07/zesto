@@ -6,6 +6,9 @@ import { OrganizationGate } from '../layouts/OrganizationGate';
 import { PublicLayout } from '../layouts/PublicLayout';
 import { HomePage } from '../pages/HomePage';
 import { LoginPage } from '../pages/LoginPage';
+import { ExploreMenuDetailPage } from '../pages/customer/ExploreMenuDetailPage';
+import { ExploreOutletPage } from '../pages/customer/ExploreOutletPage';
+import { ExplorePage } from '../pages/customer/ExplorePage';
 
 export function AppRoutes() {
   return (
@@ -27,6 +30,9 @@ export function AppRoutes() {
             </PublicLayout>
           }
         />
+        <Route path="/explore" element={<ExplorePage />} />
+        <Route path="/explore/outlets/:outletId" element={<ExploreOutletPage />} />
+        <Route path="/explore/outlets/:outletId/menus/:menuId" element={<ExploreMenuDetailPage />} />
         <Route
           path="/app/*"
           element={
