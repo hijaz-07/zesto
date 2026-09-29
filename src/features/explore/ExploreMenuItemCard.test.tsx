@@ -34,9 +34,15 @@ describe('ExploreMenuItemCard', () => {
     expect(screen.queryByText(/basmati rice/)).not.toBeInTheDocument();
   });
 
-  it('has no quantity control or add-to-cart affordance', () => {
+  it('has no quantity control or add-to-cart affordance by default', () => {
     render(<ExploreMenuItemCard item={baseItem} />);
 
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it('renders the quantityControl slot when provided', () => {
+    render(<ExploreMenuItemCard item={baseItem} quantityControl={<button type="button">+</button>} />);
+
+    expect(screen.getByRole('button', { name: '+' })).toBeInTheDocument();
   });
 });

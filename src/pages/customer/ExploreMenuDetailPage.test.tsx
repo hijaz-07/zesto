@@ -1,6 +1,8 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createEmptyCart } from '../../features/cart/cart';
+import { setCart } from '../../features/cart/store';
 import type { ExploreMenuDetail } from '../../features/explore/types';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
 import { ApiError } from '../../lib/api/client';
@@ -40,15 +42,22 @@ const menuDetail: ExploreMenuDetail = {
       priceInPaise: 12000,
       displayOrder: 1,
     },
+    {
+      id: 'item-veg-meals',
+      name: 'Veg Meals',
+      priceInPaise: 8000,
+      displayOrder: 2,
+    },
   ],
 };
 
-function renderPage() {
+function renderPage(initialPath = '/explore/outlets/outlet-1/menus/menu-1') {
   return render(
-    <MemoryRouter initialEntries={['/explore/outlets/outlet-1/menus/menu-1']}>
+    <MemoryRouter initialEntries={[initialPath]}>
       <Routes>
         <Route path="/explore/outlets/:outletId" element={<div>Outlet detail page</div>} />
         <Route path="/explore/outlets/:outletId/menus/:menuId" element={<ExploreMenuDetailPage />} />
+        <Route path="/app/cart" element={<div>Cart page</div>} />
       </Routes>
     </MemoryRouter>,
   );
@@ -57,6 +66,8 @@ function renderPage() {
 describe('ExploreMenuDetailPage', () => {
   beforeEach(() => {
     mockedUseExploreMenu.mockReset();
+    window.localStorage.clear();
+    setCart(createEmptyCart());
   });
 
   it('shows a loading state while the menu is being fetched', () => {
@@ -108,13 +119,14 @@ describe('ExploreMenuDetailPage', () => {
     expect(screen.getByText('₹120')).toBeInTheDocument();
   });
 
-  it('never renders any ordering, cart, or checkout affordance', () => {
+  it('never renders checkout, payment, or place-order affordances', () => {
     mockMenu({ status: 'ready', menu: menuDetail });
 
     renderPage();
 
-    expect(screen.queryByText(/add to cart/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/checkout/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/place order/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/pay now/i)).not.toBeInTheDocument();
   });
 
   it('navigates back to the outlet page', () => {
@@ -125,5 +137,60 @@ describe('ExploreMenuDetailPage', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Back to Outlet' }));
 
     expect(screen.getByText('Outlet detail page')).toBeInTheDocument();
+  });
+
+  it('renders quantity controls for each item, starting at 0, with no cart entry point yet', () => {
+    mockMenu({ status: 'ready', menu: menuDetail });
+
+    renderPage();
+
+    expect(screen.getByTestId('cart-quantity-item-chicken-biriyani')).toHaveTextContent('0');
+    expect(screen.getByTestId('cart-quantity-item-veg-meals')).toHaveTextContent('0');
+    expect(screen.queryByRole('button', { name: 'View Cart' })).not.toBeInTheDocument();
+  });
+
+  it('adding an item shows the cart entry point with the running total, and takes the customer to /app/cart', () => {
+    mockMenu({ status: 'ready', menu: menuDetail });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Increase quantity for Chicken Biriyani' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Increase quantity for Chicken Biriyani' }));
+
+    expect(screen.getByTestId('cart-quantity-item-chicken-biriyani')).toHaveTextContent('2');
+    expect(screen.getByText('2 items · ₹240')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'View Cart' }));
+    expect(screen.getByText('Cart page')).toBeInTheDocument();
+  });
+
+  it('decreasing back to 0 removes the item and hides the cart entry point again', () => {
+    mockMenu({ status: 'ready', menu: menuDetail });
+
+    renderPage();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Increase quantity for Chicken Biriyani' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Decrease quantity for Chicken Biriyani' }));
+
+    expect(screen.getByTestId('cart-quantity-item-chicken-biriyani')).toHaveTextContent('0');
+    expect(screen.queryByRole('button', { name: 'View Cart' })).not.toBeInTheDocument();
+  });
+
+  it('shows a conflict banner and disables adding when the cart already holds a different menu, until cleared', () => {
+    setCart({
+      context: { outletId: 'outlet-other', menuId: 'menu-other' },
+      lines: [{ itemId: 'item-x', name: 'Item X', priceInPaise: 5000, quantity: 1 }],
+    });
+    mockMenu({ status: 'ready', menu: menuDetail });
+
+    renderPage();
+
+    expect(screen.getByText('Your cart has items from a different menu.')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Increase quantity for Chicken Biriyani' })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear cart to add items here' }));
+
+    expect(screen.queryByText('Your cart has items from a different menu.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Increase quantity for Chicken Biriyani' })).not.toBeDisabled();
   });
 });
