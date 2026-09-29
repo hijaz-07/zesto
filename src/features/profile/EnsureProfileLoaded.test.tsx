@@ -1,4 +1,4 @@
-import { render } from '@testing-library/react';
+import { render, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { EnsureProfileLoaded } from './EnsureProfileLoaded';
 
@@ -54,5 +54,17 @@ describe('EnsureProfileLoaded', () => {
     rerender(<EnsureProfileLoaded />);
 
     expect(getMeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not throw or retry when GET /api/me fails', async () => {
+    getMeMock.mockReset();
+    getMeMock.mockRejectedValue(new Error('Backend unavailable.'));
+    mockStatus('signedIn');
+
+    expect(() => render(<EnsureProfileLoaded />)).not.toThrow();
+    await waitFor(() => expect(getMeMock).toHaveBeenCalledTimes(1));
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(getMeMock).toHaveBeenCalledTimes(1);
   });
 });
