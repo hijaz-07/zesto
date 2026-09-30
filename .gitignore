@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Project-specific Functions deploy params (public IDs; not committed)
+functions/.env.*
+!functions/.env.example

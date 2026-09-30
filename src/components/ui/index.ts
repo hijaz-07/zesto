@@ -1,4 +1,5 @@
 export { Button } from './Button';
+export { buttonClassName } from './buttonClassName';
 export type { ButtonProps, ButtonVariant } from './Button';
 export { Card } from './Card';
 export { Badge } from './Badge';

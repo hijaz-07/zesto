@@ -9,19 +9,20 @@ import { LoginPage } from '../pages/LoginPage';
 import { ExploreMenuDetailPage } from '../pages/customer/ExploreMenuDetailPage';
 import { ExploreOutletPage } from '../pages/customer/ExploreOutletPage';
 import { ExplorePage } from '../pages/customer/ExplorePage';
+import { ContactPage } from '../pages/public/ContactPage';
+import { PrivacyPage } from '../pages/public/PrivacyPage';
+import { RefundCancellationPage } from '../pages/public/RefundCancellationPage';
+import { TermsPage } from '../pages/public/TermsPage';
 
 export function AppRoutes() {
   return (
     <IonRouterOutlet>
       <Routes>
-        <Route
-          path="/"
-          element={
-            <PublicLayout>
-              <HomePage />
-            </PublicLayout>
-          }
-        />
+        <Route path="/" element={<HomePage />} />
+        <Route path="/privacy" element={<PrivacyPage />} />
+        <Route path="/terms" element={<TermsPage />} />
+        <Route path="/refund-cancellation" element={<RefundCancellationPage />} />
+        <Route path="/contact" element={<ContactPage />} />
         <Route
           path="/login"
           element={

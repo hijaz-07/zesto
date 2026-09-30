@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Outlet } from '../../domain/types';
 import { ApiError } from '../../lib/api/client';
 import type { Menu } from '../../features/menu/types';
@@ -15,6 +15,9 @@ vi.mock('../../features/menu/api', () => ({
 }));
 
 const mockedUseOutlets = vi.mocked(useOutlets);
+
+// Fixed clock (business date 2026-09-28) so the schedule dates below stay valid.
+const NOW = '2026-09-28T12:00:00+05:30';
 
 const activeOutlet: Outlet = {
   id: 'outlet-1',
@@ -72,8 +75,15 @@ function renderPage(outletId = 'outlet-1') {
 
 describe('OrganizationCreateMenuPage', () => {
   beforeEach(() => {
+    // Date-only mock (no vi.useFakeTimers()): the tests below `await`, which relies on
+    // real timers for RTL's polling.
+    vi.setSystemTime(new Date(NOW));
     mockedUseOutlets.mockReset();
     createMenuMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('1. renders a loading state while the outlet is being resolved', () => {
