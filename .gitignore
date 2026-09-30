@@ -26,3 +26,6 @@ dist-ssr
 # Project-specific Functions deploy params (public IDs; not committed)
 functions/.env.*
 !functions/.env.example
+
+# Firebase CLI local state
+.firebase/
