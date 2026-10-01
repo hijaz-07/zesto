@@ -6,10 +6,15 @@ import { PageHeader } from '../../components/common/PageHeader';
 import { Badge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
 import { Card } from '../../components/ui/Card';
+import { useAuth } from '../../features/auth/useAuth';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
 import { getOrderErrorMessage } from '../../features/order/errors';
 import type { Order } from '../../features/order/types';
 import { useOrder } from '../../features/order/useOrder';
+import { paymentNoticeText } from '../../features/payment/errors';
+import { checkoutDescription } from '../../features/payment/razorpayCheckout';
+import type { PaymentNotice } from '../../features/payment/types';
+import { usePayOrder } from '../../features/payment/usePayOrder';
 import { formatPaiseAsRupees } from '../../utils/currency';
 
 const ORDER_STATUS_LABEL: Record<Order['status'], string> = {
@@ -20,7 +25,13 @@ const ORDER_STATUS_LABEL: Record<Order['status'], string> = {
 
 const PAYMENT_STATUS_LABEL: Record<Order['paymentStatus'], string> = {
   pending: 'Payment pending',
+  paid: 'Paid',
 };
+
+/** Whether a notice is something went wrong (announced assertively) rather than a neutral "not completed". */
+function isErrorNotice(notice: PaymentNotice): boolean {
+  return notice.kind !== 'dismissed';
+}
 
 /**
  * `/app/orders/:orderId` — the newly-created-order confirmation page, NOT
@@ -31,15 +42,28 @@ const PAYMENT_STATUS_LABEL: Record<Order['paymentStatus'], string> = {
  * totals, subtotal, total, status, paymentStatus — comes from that
  * authoritative response, never reconstructed from the cart.
  *
- * A newly created order is always `pending_payment` / `pending`: payment
- * doesn't exist yet (a later checkpoint), so this deliberately never shows
- * a payment button and never implies the order is paid or the food is
- * confirmed.
+ * A `pending_payment` order shows a "Pay ₹X" action that runs the whole
+ * payment flow (see `usePayOrder`): prepare/reuse the backend's Razorpay
+ * order, open Razorpay Test Checkout, then send Checkout's callback to the
+ * server for signature verification. The page only ever shows the order as
+ * confirmed/paid when it's loaded that way from the backend, or when the
+ * server's own verification response says so — never because Checkout's
+ * browser callback fired. A confirmed order has no Pay action.
  */
 export function CustomerOrderConfirmationPage() {
   const { orderId } = useParams<{ orderId: string }>();
   const navigate = useNavigate();
-  const { status, order, error, retry } = useOrder(orderId);
+  const { status, order: fetchedOrder, error, retry } = useOrder(orderId);
+  const { user } = useAuth();
+  const { phase, notice, confirmedOrder, busy, pay, retryVerification } = usePayOrder({
+    orderId,
+    description: fetchedOrder ? checkoutDescription(fetchedOrder) : '',
+    // Optional prefill only — payment never depends on any of these.
+    customer: { name: user?.name, email: user?.email, contact: user?.phone },
+  });
+  // After server verification the verify response IS the authoritative order;
+  // otherwise it's whatever the backend last returned for this order.
+  const order = confirmedOrder && confirmedOrder.id === fetchedOrder?.id ? confirmedOrder : fetchedOrder;
   // Best-effort display names only — the order itself never depends on this
   // still resolving (see staleness.ts's identical reasoning for the cart).
   const { menu: liveMenu, outlet: liveOutlet } = useExploreMenu(order?.outletId, order?.menuId);
@@ -56,16 +80,45 @@ export function CustomerOrderConfirmationPage() {
       />
     );
   } else if (order) {
+    const isConfirmed = order.status === 'confirmed' && order.paymentStatus === 'paid';
+    const needsPayment = order.status === 'pending_payment' && order.paymentStatus === 'pending';
+    const verifyFailed = notice?.kind === 'verify_failed';
+    const noticeText = notice ? paymentNoticeText(notice) : null;
+
+    let payLabel = `Pay ${formatPaiseAsRupees(order.totalInPaise)}`;
+    if (phase === 'preparing') {
+      payLabel = 'Preparing payment…';
+    } else if (phase === 'checkout') {
+      payLabel = 'Waiting for payment…';
+    } else if (phase === 'verifying') {
+      payLabel = 'Verifying payment…';
+    }
+
     content = (
       <>
-        <PageHeader title="Order placed" subtitle={`Order #${order.id}`} />
+        <PageHeader title={isConfirmed ? 'Order confirmed' : 'Your order'} subtitle={`Order #${order.id}`} />
 
-        <Card className="flex flex-col gap-2 border-warning/30 bg-warning/10">
-          <Badge tone="warning" className="self-start">
-            {ORDER_STATUS_LABEL[order.status]}
-          </Badge>
-          <p className="text-sm text-text">Order created — payment will be added next.</p>
-        </Card>
+        {isConfirmed ? (
+          <Card className="flex flex-col gap-2 border-success/30 bg-success/10">
+            <Badge tone="success" className="self-start">
+              {ORDER_STATUS_LABEL[order.status]}
+            </Badge>
+            <p className="text-sm text-text">Payment successful. Your order is confirmed.</p>
+          </Card>
+        ) : (
+          <Card
+            className={
+              order.status === 'cancelled'
+                ? 'flex flex-col gap-2 border-danger/30 bg-danger/10'
+                : 'flex flex-col gap-2 border-warning/30 bg-warning/10'
+            }
+          >
+            <Badge tone={order.status === 'cancelled' ? 'danger' : 'warning'} className="self-start">
+              {ORDER_STATUS_LABEL[order.status]}
+            </Badge>
+            {needsPayment && <p className="text-sm text-text">Pay to confirm your order.</p>}
+          </Card>
+        )}
 
         {(liveOutlet || liveMenu) && (
           <div>
@@ -103,8 +156,31 @@ export function CustomerOrderConfirmationPage() {
 
         <Card className="flex items-center justify-between gap-3">
           <p className="text-sm text-muted">Payment status</p>
-          <Badge tone="warning">{PAYMENT_STATUS_LABEL[order.paymentStatus]}</Badge>
+          <Badge tone={order.paymentStatus === 'paid' ? 'success' : 'warning'}>
+            {PAYMENT_STATUS_LABEL[order.paymentStatus]}
+          </Badge>
         </Card>
+
+        {needsPayment && noticeText && (
+          <Card
+            role={notice && isErrorNotice(notice) ? 'alert' : 'status'}
+            className="flex flex-col gap-1 border-warning/30 bg-warning/10"
+          >
+            <p className="text-sm font-medium text-text">{noticeText.title}</p>
+            <p className="text-sm text-muted">{noticeText.detail}</p>
+          </Card>
+        )}
+
+        {needsPayment &&
+          (verifyFailed ? (
+            <Button onClick={() => void retryVerification()} disabled={busy}>
+              Retry verification
+            </Button>
+          ) : (
+            <Button onClick={() => void pay()} disabled={busy} aria-busy={busy}>
+              {payLabel}
+            </Button>
+          ))}
 
         <Button variant="secondary" onClick={() => navigate('/explore')}>
           Continue browsing

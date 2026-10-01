@@ -13,8 +13,8 @@ export type OrderId = string;
 
 export type OrderStatus = 'pending_payment' | 'confirmed' | 'cancelled';
 
-/** v1 only ever has `'pending'` — payment integration (a later checkpoint) will extend this. */
-export type OrderPaymentStatus = 'pending';
+/** `'paid'` is only ever set by the backend, after server-side verification of a Razorpay payment (see ../payment). */
+export type OrderPaymentStatus = 'pending' | 'paid';
 
 export type OrderCurrency = 'INR';
 
