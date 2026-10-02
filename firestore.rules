@@ -248,6 +248,34 @@ rules_version = '2';
 // transition (pending -> succeeded) happens atomically, in the same
 // transaction, with the parent order's status becoming 'confirmed' and its
 // paymentStatus becoming 'paid'.
+//   - providerOrderId is looked up by a COLLECTION-GROUP query on this
+//     subcollection's `payments` group when a Razorpay webhook arrives (see
+//     firestore.indexes.json's fieldOverrides). Backend-only like everything
+//     else here — the query runs through the Admin SDK, never a client.
+//
+// Collection: razorpayWebhookEvents
+// Document ID: {eventKey} — `evt_<x-razorpay-event-id>` when Razorpay's
+// documented per-event header is present, else `body_<sha256 of the raw
+// body>`. Fields (operational bookkeeping only — never the webhook body, a
+// secret, or any customer/card data):
+//   - id: string — equals the document id.
+//   - eventType: string — e.g. payment.captured | payment.failed.
+//   - keySource: string — event_id_header | body_fingerprint.
+//   - bodyFingerprint: string — SHA-256 (hex) of the raw body, so an event ID
+//     re-used with a different body is detected rather than mistaken for a
+//     duplicate.
+//   - status: string — processing | processed. Set to processed only
+//     AFTER the payment transition completed.
+//   - attempts: number; receivedAt, claimedAt, leaseExpiresAt: timestamp —
+//     the claim lease that lets exactly one delivery do the work while a
+//     crashed attempt is still retried.
+//   - processedAt: timestamp, outcome: string — set when processed.
+//   - providerOrderId, providerPaymentId: string (optional) — Razorpay's
+//     own public identifiers, for tracing.
+// A root collection, deliberately outside every customer/organization path:
+// a Razorpay webhook has no authenticated customer. Written ONLY by
+// functions/src/domain/razorpayWebhooks.ts, after the request's HMAC
+// signature was verified. Never read or written directly by clients.
 //
 // ===============================================================
 
@@ -307,6 +335,15 @@ service cloud.firestore {
       match /outletSlugs/{slug} {
         allow read, write: if false;
       }
+    }
+
+    // Razorpay webhook event bookkeeping (deduplication + audit). Backend-only,
+    // always — a client must never be able to read which provider events
+    // Zesto has seen, forge a "processed" record to make a real event look
+    // like a duplicate, or delete one to force a replay. Written only by
+    // functions/src/domain/razorpayWebhooks.ts after signature verification.
+    match /razorpayWebhookEvents/{eventKey} {
+      allow read, write: if false;
     }
 
     // Slug uniqueness reservation for organization creation. Backend-only,

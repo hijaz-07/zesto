@@ -2,6 +2,7 @@
 import {randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
+import {HttpsError} from "firebase-functions/v2/https";
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import type {SessionValidator} from "../auth/session";
 import {archiveMenu, createMenu, publishMenu} from "../domain/menus";
@@ -49,9 +50,42 @@ beforeEach(() => {
   vi.stubEnv("DESCOPE_PROJECT_ID", "P-test");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
+  await archiveFixtureMenus();
 });
+
+// Every menu this file publishes (see `setupItemThenTransitionMenu`). Left
+// alone, each stays published in the shared emulator for good, and the global
+// Explore feed (`explore.emulator.test.ts`, capped at 50 outlets) ends up
+// crowded out by leftovers from other files.
+const publishedFixtureMenus: Array<{organizationId: string; outletId: string; menuId: string}> = [];
+
+/**
+ * Archives, through the normal `archiveMenu` lifecycle, every menu this file
+ * has published since the last call. Runs from `afterEach`, so it also runs
+ * when a test's assertions fail. Only "already archived / not there" is
+ * tolerated (a test may have archived its own menu); any other error is
+ * rethrown after every menu was attempted, so a cleanup that fails cannot
+ * silently reintroduce the leak.
+ */
+async function archiveFixtureMenus(): Promise<void> {
+  let firstError: unknown;
+  for (const {organizationId, outletId, menuId} of publishedFixtureMenus.splice(0)) {
+    try {
+      await archiveMenu(db, organizationId, outletId, menuId);
+    } catch (error) {
+      const alreadyGone = error instanceof HttpsError &&
+        (error.code === "failed-precondition" || error.code === "not-found");
+      if (!alreadyGone && firstError === undefined) {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
 
 function freshUserId(): string {
   return `U-${randomUUID()}`;
@@ -259,6 +293,7 @@ async function setupItemThenTransitionMenu(
   const itemId = (created.data as {item: {id: string}}).item.id;
 
   await publishMenu(db, organizationId, outletId, menuId);
+  publishedFixtureMenus.push({organizationId, outletId, menuId});
   if (finalStatus === "archived") {
     await archiveMenu(db, organizationId, outletId, menuId);
   }

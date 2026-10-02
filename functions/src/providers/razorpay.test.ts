@@ -6,6 +6,7 @@ import {
   getRazorpayKeyId,
   getRazorpayKeySecret,
   verifyCheckoutSignature,
+  verifyWebhookSignature,
   PaymentProviderError,
 } from "./razorpay";
 
@@ -293,5 +294,183 @@ describe("verifyCheckoutSignature", () => {
       caught = error;
     }
     expect(String(caught)).not.toContain("test_key_secret");
+  });
+});
+
+/**
+ * @param {Buffer | string} rawBody The exact webhook body bytes.
+ * @param {string} [secret] The webhook secret to sign with (defaults to the
+ *   stubbed `RAZORPAY_WEBHOOK_SECRET` of the `verifyWebhookSignature` suite).
+ * @return {string} A signature computed with the algorithm Razorpay's webhook
+ *   documentation prescribes (hex HMAC-SHA256 of the raw body, keyed with the
+ *   webhook secret) — independent of `verifyWebhookSignature`'s own
+ *   implementation, so these tests prove the real algorithm.
+ */
+function computeWebhookSignature(rawBody: Buffer | string, secret = "test_webhook_secret"): string {
+  return createHmac("sha256", secret).update(rawBody).digest("hex");
+}
+
+describe("verifyWebhookSignature", () => {
+  beforeEach(() => {
+    vi.stubEnv("RAZORPAY_WEBHOOK_SECRET", "test_webhook_secret");
+  });
+
+  // Deliberately NOT what JSON.stringify would produce: indentation, a
+  // different key order than alphabetical, an escaped non-ASCII character,
+  // a number written as 100.0, and a trailing newline — all things a
+  // parse-then-reserialize round trip would silently "fix".
+  const prettyRawBody =
+    "{\n" +
+    "  \"event\": \"payment.captured\",\n" +
+    "  \"created_at\": 1567674606,\n" +
+    "  \"payload\": {\"payment\": {\"entity\": {\"id\": \"pay_X\", \"amount\": 100.0, \"note\": \"caf\\u00e9\"}}}\n" +
+    "}\n";
+
+  it("accepts a signature computed with the documented algorithm over the raw body", () => {
+    expect(verifyWebhookSignature({
+      rawBody: prettyRawBody,
+      signature: computeWebhookSignature(prettyRawBody),
+    })).toBe(true);
+  });
+
+  it("gives the same answer for the raw body as a Buffer or as a string", () => {
+    const signature = computeWebhookSignature(prettyRawBody);
+
+    expect(verifyWebhookSignature({rawBody: Buffer.from(prettyRawBody, "utf8"), signature})).toBe(true);
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature})).toBe(true);
+  });
+
+  it("verifies the EXACT bytes: a re-serialized (JSON.parse -> JSON.stringify) body does NOT verify", () => {
+    const signature = computeWebhookSignature(prettyRawBody);
+    const reserialized = JSON.stringify(JSON.parse(prettyRawBody));
+
+    // The semantic content is identical, the bytes are not.
+    expect(JSON.parse(reserialized)).toEqual(JSON.parse(prettyRawBody));
+    expect(reserialized).not.toBe(prettyRawBody);
+    expect(verifyWebhookSignature({rawBody: reserialized, signature})).toBe(false);
+  });
+
+  it("verifies bytes, not decoded text: a body that is not valid UTF-8 verifies only as a Buffer", () => {
+    const rawBody = Buffer.from([0x7b, 0xff, 0xfe, 0x7d]);
+    const signature = computeWebhookSignature(rawBody);
+
+    expect(verifyWebhookSignature({rawBody, signature})).toBe(true);
+    // Decoding to a string replaces the invalid bytes, so the bytes differ.
+    expect(verifyWebhookSignature({rawBody: rawBody.toString("utf8"), signature})).toBe(false);
+  });
+
+  it.each([
+    ["a single changed character", (body: string) => body.replace("pay_X", "pay_Y")],
+    ["an appended space", (body: string) => `${body} `],
+    ["a removed trailing newline", (body: string) => body.trimEnd()],
+    ["a changed amount", (body: string) => body.replace("100.0", "1.0")],
+  ])("rejects a modified raw body (%s)", (_label, mutate) => {
+    const signature = computeWebhookSignature(prettyRawBody);
+
+    expect(verifyWebhookSignature({rawBody: mutate(prettyRawBody), signature})).toBe(false);
+  });
+
+  it("rejects a modified signature", () => {
+    const signature = computeWebhookSignature(prettyRawBody);
+    const flipped = `${signature.slice(0, -1)}${signature.endsWith("0") ? "1" : "0"}`;
+
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature: flipped})).toBe(false);
+  });
+
+  it("rejects a signature computed with the wrong secret", () => {
+    const signature = computeWebhookSignature(prettyRawBody, "some_other_secret");
+
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature})).toBe(false);
+  });
+
+  it("rejects an empty signature and a garbage signature of the wrong length, without throwing", () => {
+    expect(() => verifyWebhookSignature({rawBody: prettyRawBody, signature: ""})).not.toThrow();
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature: ""})).toBe(false);
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature: "short"})).toBe(false);
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature: "z".repeat(500)})).toBe(false);
+  });
+
+  it("fails safely on an empty or malformed body with a non-matching signature (false, no throw)", () => {
+    const signature = computeWebhookSignature(prettyRawBody);
+
+    for (const rawBody of ["", "{", "not json at all", Buffer.alloc(0)]) {
+      expect(() => verifyWebhookSignature({rawBody, signature})).not.toThrow();
+      expect(verifyWebhookSignature({rawBody, signature})).toBe(false);
+    }
+  });
+
+  it("fails safely (throws, never returns true/false) when RAZORPAY_WEBHOOK_SECRET is not configured", () => {
+    vi.stubEnv("RAZORPAY_WEBHOOK_SECRET", "");
+
+    expect(() => verifyWebhookSignature({rawBody: prettyRawBody, signature: "irrelevant"}))
+      .toThrow("RAZORPAY_WEBHOOK_SECRET is not configured.");
+  });
+
+  it("never falls back to the API key secret when the webhook secret is missing", () => {
+    vi.stubEnv("RAZORPAY_WEBHOOK_SECRET", "");
+    // A signature computed with the API key secret must not become acceptable.
+    const signatureWithKeySecret = computeWebhookSignature(prettyRawBody, "test_key_secret");
+
+    expect(() => verifyWebhookSignature({rawBody: prettyRawBody, signature: signatureWithKeySecret}))
+      .toThrow("RAZORPAY_WEBHOOK_SECRET is not configured.");
+  });
+
+  it("is independent of the API key secret: a body signed with RAZORPAY_KEY_SECRET is rejected", () => {
+    const signature = computeWebhookSignature(prettyRawBody, "test_key_secret");
+
+    expect(verifyWebhookSignature({rawBody: prettyRawBody, signature})).toBe(false);
+  });
+
+  it("never leaks the webhook secret through its return value or a thrown error", () => {
+    const result = verifyWebhookSignature({
+      rawBody: prettyRawBody,
+      signature: computeWebhookSignature(prettyRawBody),
+    });
+    expect(String(result)).not.toContain("test_webhook_secret");
+
+    vi.stubEnv("RAZORPAY_WEBHOOK_SECRET", "");
+    let caught: unknown;
+    try {
+      verifyWebhookSignature({rawBody: "x", signature: "s"});
+      throw new Error("expected verifyWebhookSignature to throw here");
+    } catch (error) {
+      caught = error;
+    }
+    expect(String(caught)).not.toContain("test_webhook_secret");
+  });
+});
+
+describe("Checkout verification and webhook verification are separate operations", () => {
+  beforeEach(() => {
+    vi.stubEnv("RAZORPAY_WEBHOOK_SECRET", "test_webhook_secret");
+  });
+
+  it("a valid Checkout signature is not a valid webhook signature, whatever it is computed over", () => {
+    const checkoutSignature = computeTestSignature("order_RazorpayTest1", "pay_RazorpayTest1");
+
+    expect(verifyWebhookSignature({rawBody: "order_RazorpayTest1|pay_RazorpayTest1", signature: checkoutSignature}))
+      .toBe(false);
+    expect(verifyWebhookSignature({rawBody: "{\"event\":\"payment.captured\"}", signature: checkoutSignature}))
+      .toBe(false);
+  });
+
+  it("a valid webhook signature is not a valid Checkout signature", () => {
+    const body = "order_RazorpayTest1|pay_RazorpayTest1";
+    const webhookSignature = computeWebhookSignature(body);
+
+    expect(verifyWebhookSignature({rawBody: body, signature: webhookSignature})).toBe(true);
+    expect(verifyCheckoutSignature({
+      providerOrderId: "order_RazorpayTest1",
+      razorpayPaymentId: "pay_RazorpayTest1",
+      razorpaySignature: webhookSignature,
+    })).toBe(false);
+  });
+
+  it("uses a different secret for each: configuring only one never satisfies the other", () => {
+    vi.stubEnv("RAZORPAY_KEY_SECRET", "");
+    expect(() => verifyCheckoutSignature({
+      providerOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s",
+    })).toThrow("RAZORPAY_KEY_SECRET is not configured.");
+    expect(verifyWebhookSignature({rawBody: "x", signature: computeWebhookSignature("x")})).toBe(true);
   });
 });

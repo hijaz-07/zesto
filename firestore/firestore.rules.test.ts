@@ -5,8 +5,8 @@ import {
   initializeTestEnvironment,
   type RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { Timestamp, deleteDoc, doc, getDoc, setDoc, updateDoc } from 'firebase/firestore';
-import { afterAll, afterEach, beforeAll, describe, it } from 'vitest';
+import { Timestamp, collection, deleteDoc, doc, getDoc, getDocs, setDoc, updateDoc } from 'firebase/firestore';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 /**
  * Descope is Zesto's identity provider, so no legitimate client carries a
@@ -717,6 +717,73 @@ describe('firestore.rules: organizationSlugs/{slug}', () => {
     for (const db of Object.values(clients())) {
       await assertFails(updateDoc(doc(db, 'organizationSlugs', SLUG), { organizationId: 'org-attacker' }));
       await assertFails(deleteDoc(doc(db, 'organizationSlugs', SLUG)));
+    }
+  });
+});
+
+describe('firestore.rules: razorpayWebhookEvents/{eventKey}', () => {
+  const EVENT_KEY = 'evt_Abc123';
+
+  function eventRecord(status: 'processing' | 'processed' = 'processed') {
+    return {
+      id: EVENT_KEY,
+      eventType: 'payment.captured',
+      keySource: 'event_id_header',
+      bodyFingerprint: 'a'.repeat(64),
+      status,
+      attempts: 1,
+      receivedAt: Timestamp.now(),
+      claimedAt: Timestamp.now(),
+      leaseExpiresAt: Timestamp.now(),
+      processedAt: Timestamp.now(),
+      outcome: 'payment_succeeded',
+      providerOrderId: 'order_Test1',
+      providerPaymentId: 'pay_Test1',
+    };
+  }
+
+  async function seedEvent() {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), 'razorpayWebhookEvents', EVENT_KEY), eventRecord());
+    });
+  }
+
+  it('has an explicit backend-only rule, rather than relying on the catch-all alone', () => {
+    const rules = readFileSync('firestore.rules', 'utf8');
+
+    expect(rules).toMatch(/match \/razorpayWebhookEvents\/\{eventKey\}\s*\{\s*allow read, write: if false;/);
+  });
+
+  it('denies all client reads of a webhook event record', async () => {
+    await seedEvent();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'razorpayWebhookEvents', EVENT_KEY)));
+    }
+  });
+
+  it('denies listing or querying webhook events', async () => {
+    await seedEvent();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDocs(collection(db, 'razorpayWebhookEvents')));
+    }
+  });
+
+  it('denies a client forging a "processed" record, which would make a real event look like a duplicate', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(setDoc(doc(db, 'razorpayWebhookEvents', EVENT_KEY), eventRecord('processed')));
+      await assertFails(setDoc(doc(db, 'razorpayWebhookEvents', 'evt_Another'), eventRecord('processing')));
+    }
+  });
+
+  it('denies a client updating or deleting an event record (e.g. to force a replay or hide an outcome)', async () => {
+    await seedEvent();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'razorpayWebhookEvents', EVENT_KEY), { outcome: 'tampered' }));
+      await assertFails(updateDoc(doc(db, 'razorpayWebhookEvents', EVENT_KEY), { status: 'processing' }));
+      await assertFails(deleteDoc(doc(db, 'razorpayWebhookEvents', EVENT_KEY)));
     }
   });
 });

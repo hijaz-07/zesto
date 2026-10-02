@@ -2,9 +2,11 @@
 import {randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {getFirestore, type Firestore} from "firebase-admin/firestore";
+import {HttpsError} from "firebase-functions/v2/https";
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import type {SessionValidator} from "../auth/session";
 import {createMenuItem, deleteMenuItem, updateMenuItem} from "../domain/menuItems";
+import {archiveMenu} from "../domain/menus";
 import {createOrganization} from "../domain/organizations";
 import {createOutlet, updateOutlet} from "../domain/outlets";
 import {handleRequest} from "../http/handleRequest";
@@ -47,9 +49,42 @@ beforeEach(() => {
   vi.stubEnv("DESCOPE_PROJECT_ID", "P-test");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
+  await archiveFixtureMenus();
 });
+
+// Every menu this file successfully publishes (see `callPublish`). Left alone,
+// each stays published in the shared emulator for good, and the global Explore
+// feed (`explore.emulator.test.ts`, capped at 50 outlets) ends up crowded out
+// by leftovers from other files.
+const publishedFixtureMenus: Array<{organizationId: string; outletId: string; menuId: string}> = [];
+
+/**
+ * Archives, through the normal `archiveMenu` lifecycle, every menu this file
+ * has published since the last call. Runs from `afterEach`, so it also runs
+ * when a test's assertions fail. Only "already archived / not there" is
+ * tolerated (a test may have archived its own menu); any other error is
+ * rethrown after every menu was attempted, so a cleanup that fails cannot
+ * silently reintroduce the leak.
+ */
+async function archiveFixtureMenus(): Promise<void> {
+  let firstError: unknown;
+  for (const {organizationId, outletId, menuId} of publishedFixtureMenus.splice(0)) {
+    try {
+      await archiveMenu(db, organizationId, outletId, menuId);
+    } catch (error) {
+      const alreadyGone = error instanceof HttpsError &&
+        (error.code === "failed-precondition" || error.code === "not-found");
+      if (!alreadyGone && firstError === undefined) {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
 
 function freshUserId(): string {
   return `U-${randomUUID()}`;
@@ -187,11 +222,16 @@ async function callPublish(
   organizationId: string, outletId: string, menuId: string, validator: SessionValidator,
 ) {
   const routes = createMenuRoutes({db, validator});
-  return handleRequest(
+  const result = await handleRequest(
     routes,
     request({method: "POST", path: `${menuBasePath(organizationId, outletId)}/${menuId}/publish`}),
     () => {},
   );
+  // Only a publish that actually succeeded leaves a published menu behind.
+  if (result.kind === "success") {
+    publishedFixtureMenus.push({organizationId, outletId, menuId});
+  }
+  return result;
 }
 
 async function callArchive(

@@ -2,7 +2,8 @@
 import {randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
-import {beforeAll, describe, expect, it} from "vitest";
+import {HttpsError} from "firebase-functions/v2/https";
+import {afterEach, beforeAll, describe, expect, it} from "vitest";
 import {
   listExploreOutlets,
   listUpcomingPublishedMenusForOutlet,
@@ -46,6 +47,49 @@ beforeAll(() => {
     getApps()[0] :
     initializeApp({projectId: PROJECT_ID});
   db = getFirestore(app);
+});
+
+// Every menu this file publishes (see `publishTracked`). The global Explore
+// feed these tests assert on is capped at 50 outlets, so published menus left
+// behind by earlier tests — in this file or any other — would crowd out the
+// data a later test is looking for, making the result depend on which file
+// happened to run first. Archiving each test's menus keeps the feed clean.
+const publishedFixtureMenus: Array<{organizationId: string; outletId: string; menuId: string}> = [];
+
+/** `publishMenu`, remembering the menu so `afterEach` can archive it. */
+async function publishTracked(organizationId: string, outletId: string, menuId: string): Promise<void> {
+  await publishMenu(db, organizationId, outletId, menuId);
+  publishedFixtureMenus.push({organizationId, outletId, menuId});
+}
+
+/**
+ * Archives, through the normal `archiveMenu` lifecycle, every menu this file
+ * has published since the last call. Runs from `afterEach`, so it also runs
+ * when a test's assertions fail. Only "already archived / not there" is
+ * tolerated (a test may have archived its own menu); any other error is
+ * rethrown after every menu was attempted, so a cleanup that fails cannot
+ * silently reintroduce the leak.
+ */
+async function archiveFixtureMenus(): Promise<void> {
+  let firstError: unknown;
+  for (const {organizationId, outletId, menuId} of publishedFixtureMenus.splice(0)) {
+    try {
+      await archiveMenu(db, organizationId, outletId, menuId);
+    } catch (error) {
+      const alreadyGone = error instanceof HttpsError &&
+        (error.code === "failed-precondition" || error.code === "not-found");
+      if (!alreadyGone && firstError === undefined) {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
+
+afterEach(async () => {
+  await archiveFixtureMenus();
 });
 
 function freshOrgInput() {
@@ -127,7 +171,7 @@ async function setupPublishedMenu(
   const item = await createMenuItem(db, organizationId, outletId, menu.id, ownerId, {
     name: "Chicken Biriyani", priceInPaise: 12000, displayOrder: 1,
   });
-  await publishMenu(db, organizationId, outletId, menu.id);
+  await publishTracked(organizationId, outletId, menu.id);
   return {menuId: menu.id, itemId: item.id};
 }
 
@@ -676,7 +720,7 @@ describe("Domain-level Asia/Kolkata boundary behavior (Firestore emulator)", () 
     }).then((menu) =>
       createMenuItem(db, organizationId, outletId, menu.id, ownerId, {
         name: "Test Item", priceInPaise: 5000, displayOrder: 1,
-      }).then(() => publishMenu(db, organizationId, outletId, menu.id)));
+      }).then(() => publishTracked(organizationId, outletId, menu.id)));
 
     const feedEntries = await listExploreOutlets(db, now);
     expect(feedEntries.map((e) => e.outlet.id)).not.toContain(outletId);
@@ -701,7 +745,7 @@ describe("Domain-level Asia/Kolkata boundary behavior (Firestore emulator)", () 
     await createMenuItem(db, organizationId, outletId, menu.id, ownerId, {
       name: "Test Item", priceInPaise: 5000, displayOrder: 1,
     });
-    await publishMenu(db, organizationId, outletId, menu.id);
+    await publishTracked(organizationId, outletId, menu.id);
 
     const feedEntries = await listExploreOutlets(db, now);
     expect(feedEntries.map((e) => e.outlet.id)).toContain(outletId);

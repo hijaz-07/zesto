@@ -1,4 +1,5 @@
 import * as logger from "firebase-functions/logger";
+import type {LogContext} from "./types";
 
 /**
  * Fields logged for every `api` request. Deliberately a closed set: there is
@@ -15,6 +16,8 @@ export interface RequestLogFields {
   duration: number;
   /** The authenticated caller's Descope user ID, if any. */
   userId?: string;
+  /** Route-curated safe operational fields (see `LogContext`), e.g. a webhook's event type and outcome. */
+  context?: LogContext;
 }
 
 /**

@@ -43,6 +43,23 @@ export const razorpayKeySecret = defineSecret("RAZORPAY_KEY_SECRET", {
 });
 
 /**
+ * The secret Razorpay signs WEBHOOK deliveries with. Configured independently
+ * in the Razorpay Dashboard (Accounts & Settings → Webhooks) and DELIBERATELY
+ * a different secret from `RAZORPAY_KEY_SECRET` above: the API key secret
+ * authenticates Zesto to Razorpay (and signs Checkout results), this one
+ * authenticates Razorpay to Zesto. Never reuse one for the other, so that a
+ * leak of either does not compromise both directions.
+ *
+ * A REAL secret, handled exactly like `razorpayKeySecret`: Cloud Secret
+ * Manager in production (declared on the `api` function's `secrets` array in
+ * `index.ts`), `functions/.secret.local` for the local emulator. Never in
+ * source control, Firestore, an API response, or a log line.
+ */
+export const razorpayWebhookSecret = defineSecret("RAZORPAY_WEBHOOK_SECRET", {
+  description: "Razorpay webhook signing secret (Test Mode for now). Server-only — never log or return this value.",
+});
+
+/**
  * @return {string} The configured Razorpay `key_id`, trimmed.
  * @throws {Error} If `RAZORPAY_KEY_ID` is missing or blank.
  */
@@ -62,6 +79,20 @@ export function getRazorpayKeySecret(): string {
   const value = razorpayKeySecret.value().trim();
   if (!value) {
     throw new Error("RAZORPAY_KEY_SECRET is not configured.");
+  }
+  return value;
+}
+
+/**
+ * @return {string} The configured Razorpay webhook signing secret, trimmed.
+ * @throws {Error} If `RAZORPAY_WEBHOOK_SECRET` is missing or blank — a
+ *   server misconfiguration, deliberately never reported to the caller as
+ *   "signature invalid", and never containing the secret itself.
+ */
+export function getRazorpayWebhookSecret(): string {
+  const value = razorpayWebhookSecret.value().trim();
+  if (!value) {
+    throw new Error("RAZORPAY_WEBHOOK_SECRET is not configured.");
   }
   return value;
 }
@@ -131,6 +162,55 @@ export function verifyCheckoutSignature(input: VerifyCheckoutSignatureInput): bo
     .update(`${input.providerOrderId}|${input.razorpayPaymentId}`)
     .digest("hex");
   return timingSafeEqualHex(expectedSignature, input.razorpaySignature);
+}
+
+/**
+ * Input to `verifyWebhookSignature`: the EXACT bytes of the webhook request
+ * body as Razorpay sent them, and the value of its `X-Razorpay-Signature`
+ * header.
+ */
+export interface VerifyWebhookSignatureInput {
+  /** The raw request body, untouched — see `verifyWebhookSignature`. */
+  rawBody: Buffer | string;
+  signature: string;
+}
+
+/**
+ * Verifies a Razorpay WEBHOOK signature, per Razorpay's current webhook
+ * validation guidance: the `X-Razorpay-Signature` header must equal the
+ * hex-encoded HMAC-SHA256 of the webhook request body, keyed with the
+ * webhook secret configured for that webhook in the Razorpay Dashboard.
+ *
+ * `input.rawBody` MUST be the raw request body exactly as received — never
+ * the result of `JSON.parse`/`JSON.stringify`. Razorpay signs the bytes it
+ * sent; any whitespace, key-order, escaping, or number-formatting change
+ * introduced by parsing and re-serializing makes a genuine delivery fail
+ * verification (and, conversely, would let a differently-formatted body be
+ * compared against a signature that was never computed over it). Callers
+ * must therefore read the body from the runtime's raw-body facility
+ * (`request.rawBody` — see `http/request.ts`), and only parse JSON AFTER
+ * this returns true.
+ *
+ * This is a DIFFERENT operation from `verifyCheckoutSignature`: that one
+ * proves a browser's Checkout result (HMAC over `orderId|paymentId`, keyed
+ * with the API key secret); this one proves a request really came from
+ * Razorpay (HMAC over the whole raw body, keyed with the separate webhook
+ * secret). Neither secret, input, nor result is interchangeable with the
+ * other's, and they are tested separately.
+ *
+ * A pure, synchronous, local computation — no network call.
+ *
+ * @param {VerifyWebhookSignatureInput} input The raw body and the
+ *   submitted signature.
+ * @return {boolean} Whether the signature is valid for exactly this body.
+ * @throws {Error} If `RAZORPAY_WEBHOOK_SECRET` is not configured (see
+ *   `getRazorpayWebhookSecret`).
+ */
+export function verifyWebhookSignature(input: VerifyWebhookSignatureInput): boolean {
+  const expectedSignature = createHmac("sha256", getRazorpayWebhookSecret())
+    .update(input.rawBody)
+    .digest("hex");
+  return timingSafeEqualHex(expectedSignature, input.signature);
 }
 
 /**

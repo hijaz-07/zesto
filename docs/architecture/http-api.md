@@ -945,6 +945,192 @@ No Firestore rules changed: these endpoints read exclusively through the
 Admin SDK, which bypasses `firestore.rules` entirely, exactly like every
 other route in this codebase (see `firestore.rules`'s own header comment).
 
+## Razorpay webhook
+
+`POST /api/webhooks/razorpay` receives Razorpay's asynchronous payment
+notifications and reconciles them with Zesto's own payment records. It is the
+provider-driven counterpart of the customer's `POST /orders/{orderId}/payment/verify`:
+Checkout verification gives the customer immediate confirmation, the webhook
+makes sure a payment is still reconciled when the browser never gets to call
+verify (closed tab, lost network). Both end in the **same** trusted domain
+transitions (`markPaymentSucceeded` / `markPaymentFailed`), so the webhook can
+never do anything the verified-Checkout path could not.
+
+It lives on the existing `api` Cloud Function and router — there is no second
+function — and is public at `https://zesto-dev-2026.web.app/api/webhooks/razorpay`
+(HTTPS only, through the Hosting rewrite).
+
+### Authentication: the signature, not a session
+
+This is the only route that does **not** require a Descope session: Razorpay has
+no Zesto user. It is authenticated by Razorpay's own signature instead, and it
+ignores any `Authorization` header it is sent.
+
+- Header: `X-Razorpay-Signature`.
+- Algorithm (per Razorpay's webhook validation guidance): the hex HMAC-SHA256 of
+  the **raw request body**, keyed with the **webhook secret**
+  (`providers/razorpay.ts`'s `verifyWebhookSignature`), compared in constant time.
+- This is a *different* operation from Checkout verification
+  (`verifyCheckoutSignature`: HMAC over `orderId|paymentId`, keyed with the **API
+  key secret**). Different input, different secret; neither can stand in for the
+  other, and they are tested separately.
+
+### Raw body handling
+
+Razorpay signs the exact bytes it sends, so the HMAC must be computed over those
+bytes — never over `JSON.stringify(JSON.parse(body))`, whose whitespace, key
+order, escaping, and number formatting can differ.
+
+The Firebase Functions runtime (both the deployed Functions Framework and the
+local emulator) captures the original body through body-parser's `verify` hook
+before parsing and exposes it as `request.rawBody` (a `Buffer`). The `api`
+function copies it onto the normalized request (`http/request.ts` →
+`NormalizedRequest.rawBody`) next to the parsed `body`; nothing re-parses or
+re-serializes it. The webhook route HMACs that `Buffer` directly (bytes, not a
+decoded string, so even non-UTF-8 input is verified exactly), and JSON is parsed
+**only after** the signature verifies. The regression tests prove this over a real
+HTTP socket with a body whose re-serialization differs byte-for-byte from what
+was signed (`http/request.test.ts`).
+
+### Webhook secret
+
+`RAZORPAY_WEBHOOK_SECRET` is a **separate** secret from `RAZORPAY_KEY_SECRET`. It is
+the signing secret chosen when the webhook is added in the Razorpay Dashboard
+(Accounts & Settings → Webhooks).
+
+| Where | Storage |
+|---|---|
+| Production | Firebase Secret Manager (`firebase functions:secrets:set RAZORPAY_WEBHOOK_SECRET`), bound to the `api` function's `secrets` array |
+| Local emulator | one more line in `functions/.secret.local` |
+
+It is never in source control, the frontend, Firestore, an API response, or a log
+line. A missing secret is a server misconfiguration and surfaces as the generic
+`500` — never as "invalid signature".
+
+### Supported events
+
+Subscribe to **only**:
+
+- `payment.captured`
+- `payment.failed`
+
+Not `order.paid`: subscribing to both `payment.captured` and `order.paid` would
+deliver two success events for one payment. Any other (valid, signed) event type
+is acknowledged with `200` and never mutates anything. Events are handled by the
+payment entity's own status in the payload, never by assumed delivery order.
+
+### Pipeline
+
+1. **Signature** over the raw bytes. Invalid → `401`; nothing is recorded.
+2. **Parse** (zod): only `payment.id`, `payment.order_id`, `payment.amount`,
+   `payment.currency`, and `payment.status` are read. Card, customer, bank, UPI,
+   fee, and notes data in the payload are never read, stored, or logged.
+3. **Deduplicate**: claim the event (below).
+4. **Resolve** the Zesto payment by Razorpay's order ID (below) and **validate**
+   it: provider, `providerOrderId`, currency, amount, and that the event's own
+   payment status matches its type.
+5. **Transition** through the existing trusted functions.
+6. **Record** the event as processed — only now, after the transition.
+
+### Deduplication
+
+Razorpay retries deliveries, so processing is at-least-once and every effect is
+idempotent.
+
+- **Key**: Razorpay's documented per-event header `x-razorpay-event-id` →
+  `razorpayWebhookEvents/evt_<id>`. If absent (or not a safe identifier), fall
+  back to the SHA-256 fingerprint of the raw body → `body_<fingerprint>`. The
+  fallback is deterministic for retries of the same payload, at the cost that two
+  distinct events with byte-identical bodies would collapse into one (not expected:
+  payloads carry `created_at` and distinct entities).
+- The key is derived **after** the signature check and is never used to
+  authenticate. Because the header is not covered by the HMAC, the body
+  fingerprint is stored beside it: re-using a known event ID with a *different*
+  body is `409 event_id_conflict`, never mistaken for a duplicate.
+- **Claim** (one Firestore transaction): create the record as `processing` with a
+  60-second lease. A second delivery while the lease is live gets a retryable
+  `409 event_in_progress` (so a crash of the first can never lose the event); a
+  `processed` record is a safe duplicate (`200`); an *expired* lease is re-claimed.
+- The record becomes `processed` only after the payment transition completed. If
+  processing throws, the claim is released and the delivery fails with `500` so
+  Razorpay redelivers; the transition is idempotent, so redelivery is safe.
+- Malformed or unsupported events are not recorded at all.
+
+Event record (`razorpayWebhookEvents/{eventKey}`, a root collection — a webhook has
+no authenticated customer): `id`, `eventType`, `keySource`, `bodyFingerprint`,
+`status`, `attempts`, `receivedAt`, `claimedAt`, `leaseExpiresAt`, `processedAt`,
+`outcome`, and Razorpay's own `providerOrderId` / `providerPaymentId`. Backend-only
+(`allow read, write: if false`).
+
+### Resolving the Zesto payment
+
+A collection-group query on `payments.providerOrderId == payment.order_id`
+(`firestore.indexes.json` field override; the ID is Razorpay's, set by
+`ensureProviderOrder` before the customer could ever pay). Exactly one match is
+required; the stored payment/order — never the webhook — decides the owner, the
+amount, and the currency. No match → the event is not about Zesto: acknowledged,
+nothing created.
+
+### State behaviour
+
+| Event | Payment now | Result |
+|---|---|---|
+| `payment.captured` | `pending` / `failed` | `markPaymentSucceeded`: payment `succeeded` + `providerPaymentId`, order `confirmed`/`paid`, atomically |
+| `payment.captured` | `succeeded` | idempotent no-op (e.g. browser verification got there first); a *different* Razorpay payment ID is reported, never overwritten |
+| `payment.failed` | `pending` | `markPaymentFailed`: payment `failed` + `providerPaymentId`; the **order stays `pending_payment`** and payable |
+| `payment.failed` | `failed` | idempotent no-op |
+| `payment.failed` | `succeeded` | ignored — a late failure never moves a success backward |
+
+A webhook can never change an order's total, items, customer, menu, or outlet, and
+never confirms a payment whose amount, currency, or provider order ID differs.
+
+### Responses
+
+| Status | Meaning |
+|---|---|
+| `200` `{"data":{"received":true,"outcome":"…"}}` | processed, safe duplicate, or a valid event Zesto intentionally ignores (unknown type, not a Zesto payment, or a reported inconsistency such as an amount mismatch that no retry can fix) |
+| `400` | signed but malformed payload, or no body |
+| `401` | missing/invalid signature |
+| `409` | the event is being processed right now (retryable), or its ID was re-used with a different body |
+| `500` | transient/unexpected failure (e.g. Firestore): Razorpay retries; reconciliation is idempotent |
+
+Inconsistencies (`rejected_*`, `success_conflicting_payment_id`, `event_id_conflict`)
+are acknowledged (retrying cannot change them) but logged at error severity for
+follow-up.
+
+### Logging
+
+The normal `api request` line (with `requestId`, route, status, duration) gains a
+`context` of curated safe fields: `eventType`, `eventKey`, `outcome`,
+`providerOrderId`, `providerPaymentId`. The webhook secret, API key secret,
+`Authorization` header, signature, and webhook body are never logged.
+
+### Razorpay Dashboard configuration (Test Mode)
+
+After this is deployed: Accounts & Settings → Webhooks → add
+
+- URL: `https://zesto-dev-2026.web.app/api/webhooks/razorpay`
+- Secret: a **new** value, entered directly into Secret Manager (never pasted into chat or source), different from the API key secret
+- Active events: **`payment.captured`** and **`payment.failed`** only
+
+Create `RAZORPAY_WEBHOOK_SECRET` in Secret Manager **before** deploying the `api`
+function: the function now declares the secret binding, so a deploy without it
+fails. Also deploy the new Firestore index (`firebase deploy --only firestore:indexes`)
+before the first event arrives.
+
+### Local testing
+
+Add `RAZORPAY_WEBHOOK_SECRET=<any local value>` to `functions/.secret.local`, start
+the emulators, and POST a body you signed yourself — the signature must be computed
+over the exact string you send:
+
+```
+sig=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | sed 's/^.* //')
+curl -X POST http://127.0.0.1:5001/zesto-dev-2026/asia-south1/api/webhooks/razorpay \
+  -H "Content-Type: application/json" -H "X-Razorpay-Signature: $sig" \
+  -H "x-razorpay-event-id: evt_local_1" --data-binary "$BODY"
+```
+
 ## Local emulator setup
 
 `functions/package.json`'s `serve` script starts **both** the Functions and

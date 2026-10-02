@@ -1,13 +1,13 @@
 import {randomUUID} from "node:crypto";
 import {setGlobalOptions} from "firebase-functions";
-import {onRequest, type Request} from "firebase-functions/v2/https";
+import {onRequest} from "firebase-functions/v2/https";
 import type {Response} from "express";
 import {getAdminFirestore} from "./firebaseAdmin";
 import {toResponseBody} from "./http/envelope";
 import {handleRequest} from "./http/handleRequest";
 import {logRequest, logUnhandledError} from "./http/logger";
-import {normalizePath} from "./http/router";
-import type {ApiResult, NormalizedRequest} from "./http/types";
+import {toNormalizedRequest} from "./http/request";
+import type {ApiResult} from "./http/types";
 import {createExploreRoutes} from "./routes/explore";
 import {createMeRoutes} from "./routes/me";
 import {createMenuItemRoutes} from "./routes/menuItems";
@@ -15,7 +15,8 @@ import {createMenuRoutes} from "./routes/menus";
 import {createOrderRoutes} from "./routes/orders";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
-import {razorpayKeySecret} from "./providers/razorpay";
+import {createWebhookRoutes} from "./routes/webhooks";
+import {razorpayKeySecret, razorpayWebhookSecret} from "./providers/razorpay";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
@@ -31,21 +32,8 @@ const ROUTES = [
   ...createMenuItemRoutes({db: getAdminFirestore()}),
   ...createOrderRoutes({db: getAdminFirestore()}),
   ...createExploreRoutes({db: getAdminFirestore()}),
+  ...createWebhookRoutes({db: getAdminFirestore()}),
 ];
-
-/**
- * @param {Request} request The incoming Express-compatible request.
- * @return {NormalizedRequest} The request reduced to the router's contract.
- */
-function toNormalizedRequest(request: Request): NormalizedRequest {
-  return {
-    method: request.method,
-    path: normalizePath(request.path),
-    headers: request.headers,
-    query: request.query,
-    body: request.body,
-  };
-}
 
 /**
  * Applies the headers common to every response (always `X-Request-Id` and
@@ -75,15 +63,20 @@ function sendResult(
  * docs/architecture/http-api.md for the full request/response contract.
  */
 export const api = onRequest(
-  // `secrets` makes RAZORPAY_KEY_SECRET available via `process.env` when
-  // deployed (backed by Cloud Secret Manager) — required for any deployed
-  // invocation that ends up calling `providers/razorpay.ts`'s
-  // `getRazorpayGateway()`. RAZORPAY_KEY_ID is a plain `defineString` param
-  // (like DESCOPE_PROJECT_ID) and needs no such declaration.
-  {region: "asia-south1", secrets: [razorpayKeySecret]},
+  // `secrets` makes RAZORPAY_KEY_SECRET (API key secret: creating orders,
+  // Checkout verification) and RAZORPAY_WEBHOOK_SECRET (the SEPARATE secret
+  // Razorpay signs webhook deliveries with) available via `process.env` when
+  // deployed (backed by Cloud Secret Manager). RAZORPAY_KEY_ID is a plain
+  // `defineString` param (like DESCOPE_PROJECT_ID) and needs no such
+  // declaration. The webhook route lives on this same function — there is
+  // deliberately no second Cloud Function.
+  {region: "asia-south1", secrets: [razorpayKeySecret, razorpayWebhookSecret]},
   async (request, response) => {
     const requestId = randomUUID();
     const startedAt = Date.now();
+    // `request.rawBody` is the original, unparsed body bytes (see
+    // `http/request.ts`) — carried alongside the parsed `body` for the
+    // webhook route's signature check.
     const normalized = toNormalizedRequest(request);
 
     const result: ApiResult = await handleRequest(
@@ -101,6 +94,7 @@ export const api = onRequest(
       status: result.status,
       duration: Date.now() - startedAt,
       userId: result.userId,
+      context: result.logContext,
     });
   },
 );

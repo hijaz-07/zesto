@@ -59,9 +59,48 @@ beforeEach(() => {
   vi.stubEnv("RAZORPAY_KEY_SECRET", "test_key_secret_for_verify");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
+  await archiveFixtureMenus();
 });
+
+// Every menu this file publishes (see `publishTracked`). Left alone, each
+// stays published in the shared emulator for good, and the global Explore feed
+// (`explore.emulator.test.ts`, capped at 50 outlets) ends up crowded out by
+// leftovers from other files.
+const publishedFixtureMenus: Array<{organizationId: string; outletId: string; menuId: string}> = [];
+
+/** `publishMenu`, remembering the menu so `afterEach` can archive it. */
+async function publishTracked(organizationId: string, outletId: string, menuId: string): Promise<void> {
+  await publishMenu(db, organizationId, outletId, menuId);
+  publishedFixtureMenus.push({organizationId, outletId, menuId});
+}
+
+/**
+ * Archives, through the normal `archiveMenu` lifecycle, every menu this file
+ * has published since the last call. Runs from `afterEach`, so it also runs
+ * when a test's assertions fail. Only "already archived / not there" is
+ * tolerated (a test may have archived its own menu); any other error is
+ * rethrown after every menu was attempted, so a cleanup that fails cannot
+ * silently reintroduce the leak.
+ */
+async function archiveFixtureMenus(): Promise<void> {
+  let firstError: unknown;
+  for (const {organizationId, outletId, menuId} of publishedFixtureMenus.splice(0)) {
+    try {
+      await archiveMenu(db, organizationId, outletId, menuId);
+    } catch (error) {
+      const alreadyGone = error instanceof HttpsError &&
+        (error.code === "failed-precondition" || error.code === "not-found");
+      if (!alreadyGone && firstError === undefined) {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
 
 function freshUserId(): string {
   return `U-${randomUUID()}`;
@@ -160,7 +199,7 @@ async function setupPublishedMenuWithItem(itemOverrides: Partial<CreateMenuItemI
   const {outletId} = await setupOutlet(organizationId, ownerId);
   const menu = await createDraftMenu(organizationId, outletId, ownerId);
   const item = await addItem(organizationId, outletId, menu.id, ownerId, itemOverrides);
-  await publishMenu(db, organizationId, outletId, menu.id);
+  await publishTracked(organizationId, outletId, menu.id);
   return {organizationId, ownerId, outletId, menuId: menu.id, item};
 }
 
@@ -415,7 +454,7 @@ describe("POST /orders — rejections (Firestore emulator)", () => {
     const {outletId} = await setupInactiveOutlet(organizationId, ownerId);
     const menu = await createDraftMenu(organizationId, outletId, ownerId);
     const item = await addItem(organizationId, outletId, menu.id, ownerId);
-    await publishMenu(db, organizationId, outletId, menu.id);
+    await publishTracked(organizationId, outletId, menu.id);
 
     const result = await callCreate(acceptingValidator(freshUserId()), {
       outletId, menuId: menu.id, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "k",
@@ -441,7 +480,7 @@ describe("POST /orders — rejections (Firestore emulator)", () => {
     const {outletId: outletB} = await setupOutlet(organizationId, ownerId);
     const menuA = await createDraftMenu(organizationId, outletA, ownerId);
     const item = await addItem(organizationId, outletA, menuA.id, ownerId);
-    await publishMenu(db, organizationId, outletA, menuA.id);
+    await publishTracked(organizationId, outletA, menuA.id);
 
     const result = await callCreate(acceptingValidator(freshUserId()), {
       outletId: outletB, menuId: menuA.id, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "k",
@@ -483,7 +522,7 @@ describe("POST /orders — rejections (Firestore emulator)", () => {
       orderingClosesAt: new Date(now + 3 * 60 * 60 * 1000),
     });
     const item = await addItem(organizationId, outletId, menu.id, ownerId);
-    await publishMenu(db, organizationId, outletId, menu.id);
+    await publishTracked(organizationId, outletId, menu.id);
 
     const result = await callCreate(acceptingValidator(freshUserId()), {
       outletId, menuId: menu.id, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "k",
@@ -501,7 +540,7 @@ describe("POST /orders — rejections (Firestore emulator)", () => {
       orderingClosesAt: new Date(now - 60 * 60 * 1000),
     });
     const item = await addItem(organizationId, outletId, menu.id, ownerId);
-    await publishMenu(db, organizationId, outletId, menu.id);
+    await publishTracked(organizationId, outletId, menu.id);
 
     const result = await callCreate(acceptingValidator(freshUserId()), {
       outletId, menuId: menu.id, items: [{itemId: item.id, quantity: 1}], idempotencyKey: "k",

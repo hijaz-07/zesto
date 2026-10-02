@@ -2,9 +2,10 @@
 import {createHmac, randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
 import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
+import {HttpsError} from "firebase-functions/v2/https";
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import {createMenuItem, type CreateMenuItemInput} from "./menuItems";
-import {createMenu, publishMenu, type Menu} from "./menus";
+import {archiveMenu, createMenu, publishMenu, type Menu} from "./menus";
 import {createOrder, getOwnedOrder, type Order} from "./orders";
 import {createOrganization} from "./organizations";
 import {createOutlet} from "./outlets";
@@ -63,9 +64,42 @@ beforeEach(() => {
   vi.stubEnv("RAZORPAY_KEY_SECRET", "test_key_secret_for_verify");
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.unstubAllEnvs();
+  await archiveFixtureMenus();
 });
+
+// Every menu this file publishes (see `setupPendingOrder`). Left alone, each
+// test's menu stays published and open in the shared emulator for good, and
+// the global Explore feed (`explore.emulator.test.ts`, capped at 50 outlets)
+// ends up crowded out by leftovers from other files.
+const publishedFixtureMenus: Array<{organizationId: string; outletId: string; menuId: string}> = [];
+
+/**
+ * Archives, through the normal `archiveMenu` lifecycle, every menu this file
+ * has published since the last call. Runs from `afterEach`, so it also runs
+ * when a test's assertions fail. Only "already archived / not there" is
+ * tolerated (a test may have archived its own menu); any other error is
+ * rethrown after every menu was attempted, so a cleanup that fails cannot
+ * silently reintroduce the leak.
+ */
+async function archiveFixtureMenus(): Promise<void> {
+  let firstError: unknown;
+  for (const {organizationId, outletId, menuId} of publishedFixtureMenus.splice(0)) {
+    try {
+      await archiveMenu(db, organizationId, outletId, menuId);
+    } catch (error) {
+      const alreadyGone = error instanceof HttpsError &&
+        (error.code === "failed-precondition" || error.code === "not-found");
+      if (!alreadyGone && firstError === undefined) {
+        firstError = error;
+      }
+    }
+  }
+  if (firstError !== undefined) {
+    throw firstError;
+  }
+}
 
 beforeAll(() => {
   if (!process.env.FIRESTORE_EMULATOR_HOST) {
@@ -142,6 +176,7 @@ async function setupPendingOrder(
     db, organizationId, outletId, menu.id, ownerId, freshItemInput({priceInPaise}),
   );
   await publishMenu(db, organizationId, outletId, menu.id);
+  publishedFixtureMenus.push({organizationId, outletId, menuId: menu.id});
   const customerId = freshUserId();
   const {order} = await createOrder(db, customerId, {
     outletId, menuId: menu.id,
