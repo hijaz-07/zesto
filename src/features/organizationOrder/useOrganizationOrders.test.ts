@@ -186,6 +186,134 @@ describe('useOrganizationOrders', () => {
       expect(result.current.loadMoreError).toBeNull();
     });
 
+    describe('when a "load more" is refused with a 403 (access lost while the page was open)', () => {
+      const forbidden = new ApiError(403, 'permission_denied', 'You do not have access to this organization.');
+
+      it('clears the loaded rows, the cursor and the load-more state, and reports the 403 as the error', async () => {
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(3, 'a'), 'cursor-1'));
+        listMock.mockRejectedValueOnce(forbidden);
+
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        expect(result.current.orders).toHaveLength(3);
+
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.status).toBe('error'));
+
+        expect(result.current.error).toBe(forbidden);
+        expect(result.current.orders).toEqual([]);
+        expect(result.current.hasMore).toBe(false);
+        expect(result.current.loadingMore).toBe(false);
+        expect(result.current.loadMoreError).toBeNull();
+        expect(result.current.refreshing).toBe(false);
+        expect(result.current.refreshError).toBeNull();
+      });
+
+      it('leaves no cursor behind: a further "load more" does nothing', async () => {
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(3, 'a'), 'cursor-1'));
+        listMock.mockRejectedValueOnce(forbidden);
+
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.status).toBe('error'));
+        act(() => result.current.loadMore());
+
+        expect(listMock).toHaveBeenCalledTimes(2);
+      });
+
+      it('clears the rows loaded across several pages, not just the last one', async () => {
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-1'));
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'b'), 'cursor-2'));
+        listMock.mockRejectedValueOnce(forbidden);
+
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.orders).toHaveLength(4));
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.status).toBe('error'));
+
+        expect(result.current.orders).toEqual([]);
+        expect(listMock).toHaveBeenLastCalledWith('org-1', { outletId: undefined, limit: 20, cursor: 'cursor-2' });
+      });
+
+      it('applies to a filtered list too, and carries the filter in the request that was refused', async () => {
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-1'));
+        listMock.mockRejectedValueOnce(forbidden);
+
+        const { result } = renderOrders('org-1', 'outlet-2');
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.status).toBe('error'));
+
+        expect(listMock).toHaveBeenLastCalledWith('org-1', { outletId: 'outlet-2', limit: 20, cursor: 'cursor-1' });
+        expect(result.current.orders).toEqual([]);
+      });
+
+      it('lets Refresh ask again afterwards, and shows the orders if access was restored', async () => {
+        listMock.mockResolvedValueOnce(page([confirmedOrgOrder], 'cursor-1'));
+        listMock.mockRejectedValueOnce(forbidden);
+        listMock.mockResolvedValueOnce(page([pendingOrgOrder], null));
+
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        act(() => result.current.loadMore());
+        await waitFor(() => expect(result.current.status).toBe('error'));
+
+        act(() => result.current.refresh());
+        expect(result.current.status).toBe('loading');
+        await waitFor(() => expect(result.current.status).toBe('ready'));
+        expect(result.current.orders.map((order) => order.id)).toEqual(['order-pending-2']);
+        expect(result.current.hasMore).toBe(false);
+      });
+
+      it('still ignores a refused page that no longer belongs to the list on screen (a refresh replaced it)', async () => {
+        const staleMore = deferred<OrganizationOrdersPage>();
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(1, 'a'), 'cursor-1'));
+        listMock.mockReturnValueOnce(staleMore.promise);
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(1, 'fresh'), 'cursor-fresh'));
+
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.hasMore).toBe(true));
+        act(() => result.current.loadMore());
+        act(() => result.current.refresh());
+        await waitFor(() => expect(result.current.orders[0].id).toBe('fresh-1'));
+        await act(async () => staleMore.reject(forbidden));
+
+        expect(result.current.status).toBe('ready');
+        expect(result.current.orders.map((order) => order.id)).toEqual(['fresh-1']);
+        expect(result.current.hasMore).toBe(true);
+      });
+    });
+
+    it.each([
+      ['a 500', new ApiError(500, 'internal', 'boom')],
+      ['a 503', new ApiError(503, 'unavailable', 'down')],
+      ['a 401', new ApiError(401, 'unauthenticated', 'expired')],
+      ['a 404', new ApiError(404, 'not_found', 'Outlet not found.')],
+      ['a network failure', new TypeError('Failed to fetch')],
+    ])('still keeps the loaded pages, with the error and the cursor, when a "load more" fails with %s', async (_label, failure) => {
+      listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-1'));
+      listMock.mockRejectedValueOnce(failure);
+      listMock.mockResolvedValueOnce(page(manyOrgOrders(1, 'b'), null));
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.hasMore).toBe(true));
+      act(() => result.current.loadMore());
+      await waitFor(() => expect(result.current.loadMoreError).toBe(failure));
+
+      expect(result.current.status).toBe('ready');
+      expect(result.current.orders.map((order) => order.id)).toEqual(['a-1', 'a-2']);
+      expect(result.current.hasMore).toBe(true);
+      expect(result.current.loadingMore).toBe(false);
+
+      act(() => result.current.loadMore());
+      await waitFor(() => expect(result.current.orders).toHaveLength(3));
+      expect(listMock).toHaveBeenLastCalledWith('org-1', { outletId: undefined, limit: 20, cursor: 'cursor-1' });
+      expect(result.current.loadMoreError).toBeNull();
+    });
+
     it('never renders an order twice, even if a page repeats one', async () => {
       listMock.mockResolvedValueOnce(page([confirmedOrgOrder], 'cursor-1'));
       listMock.mockResolvedValueOnce(page([confirmedOrgOrder, pendingOrgOrder], null));

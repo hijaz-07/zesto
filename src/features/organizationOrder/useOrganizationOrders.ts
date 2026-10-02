@@ -35,7 +35,7 @@ export interface UseOrganizationOrdersResult {
   /** Whether the backend reported another page after the ones loaded so far. */
   hasMore: boolean;
   loadingMore: boolean;
-  /** The failure of the last "load more", if any; the pages already loaded stay. */
+  /** The failure of the last "load more", if any; the pages already loaded stay (a 403 aside: access lost clears them, see `loadMore`). */
   loadMoreError: unknown;
   /** Whether a `refresh` is in flight (the list on screen stays until it lands). */
   refreshing: boolean;
@@ -43,7 +43,13 @@ export interface UseOrganizationOrdersResult {
   refreshError: unknown;
   /** Re-fetches from the first page, showing the loading state (used after a failed load). */
   retry: () => void;
-  /** Fetches the next page and appends it; a no-op if there isn't one or one is in flight. */
+  /**
+   * Fetches the next page and appends it; a no-op if there isn't one or one is in
+   * flight. If it is refused with a 403 (access lost while the page was open), the
+   * loaded list and the cursor are cleared and the access error is shown instead,
+   * exactly as for a refused `refresh`. Any other failure keeps the pages already
+   * loaded and leaves the page to be tried again.
+   */
   loadMore: () => void;
   /**
    * Re-fetches the first page without blanking the list — for the Refresh
@@ -212,11 +218,21 @@ export function useOrganizationOrders(
         if (generation.current !== mine) {
           return;
         }
-        setState((previous) =>
-          previous.scope === scope && previous.status === 'ready' && previous.nextCursor === cursor
-            ? { ...previous, loadMore: 'error', loadMoreError: error }
-            : previous,
-        );
+        setState((previous) => {
+          // Only a failure of the page the list on screen is waiting for counts.
+          if (previous.scope !== scope || previous.status !== 'ready' || previous.nextCursor !== cursor) {
+            return previous;
+          }
+          // A 403 means access to this organization's orders has been lost, exactly as
+          // for a refresh: nothing already loaded may stay on screen, so the whole state —
+          // rows, cursor, the in-flight "load more" — is replaced by the same error state an
+          // initial 403 produces. Every other failure keeps the pages already loaded and
+          // offers to try that page again.
+          if (isOrganizationOrdersForbidden(error)) {
+            return { scope, status: 'error', error };
+          }
+          return { ...previous, loadMore: 'error', loadMoreError: error };
+        });
       },
     );
   }, [organizationId, outletId, scope]);

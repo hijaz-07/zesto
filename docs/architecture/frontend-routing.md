@@ -40,8 +40,9 @@ mounted or not, based on the table above. (The layout hands `orders` the same
 `GET /organizations/{organizationId}/orders`, where the backend — not this
 route — decides whether the signed-in member may read it. A `403` is shown as an
 access problem, not a retryable error — including a `403` that arrives on a
-Refresh after access was revoked while the page was open: the rows already
-loaded are cleared, not left on screen. Any other failed refresh keeps them.)
+Refresh or on Load more after access was revoked while the page was open: the
+rows already loaded (and the paging cursor) are cleared, not left on screen. Any
+other failed refresh or Load more keeps them.)
 
 After `POST /organizations` succeeds, the client uses the organization and
 membership objects the response already contains to update

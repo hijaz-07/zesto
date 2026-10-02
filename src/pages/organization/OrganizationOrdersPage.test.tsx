@@ -399,6 +399,106 @@ describe('OrganizationOrdersPage', () => {
       await waitFor(() => expect(bodyRows()).toHaveLength(3));
       expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     });
+
+    describe('when access is lost while the page is open (Load more is refused with a 403)', () => {
+      const forbidden = new ApiError(403, 'permission_denied', 'You do not have access to this organization.');
+
+      it('replaces the visible orders with the access-denied state: no stale rows, cursor or Load more remain', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder, pendingOrgOrder], 'cursor-1'));
+        mockedList.mockRejectedValueOnce(forbidden);
+
+        renderPage();
+
+        // 1. Orders are initially visible, with another page on offer.
+        await screen.findByRole('table');
+        expect(bodyRows()).toHaveLength(2);
+        expect(screen.getByText('#order-confirmed-1')).toBeInTheDocument();
+        expect(screen.getByText('#order-pending-2')).toBeInTheDocument();
+
+        // 2. Load more returns 403.
+        fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+
+        // 4. The access-denied state appears — the same one an initial 403 shows.
+        const alert = await screen.findByRole('alert');
+        expect(alert).toHaveTextContent("You don't have access to these orders");
+        expect(alert).toHaveTextContent("You don't have access to this organization's orders.");
+        // 3 + 6. The existing rows are gone and no order cell remains.
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+        expect(screen.queryAllByRole('row')).toHaveLength(0);
+        expect(screen.queryAllByRole('cell')).toHaveLength(0);
+        expect(screen.queryAllByRole('columnheader')).toHaveLength(0);
+        expect(screen.queryByText('#order-confirmed-1')).not.toBeInTheDocument();
+        expect(screen.queryByText('#order-pending-2')).not.toBeInTheDocument();
+        expect(screen.queryByText('Chicken Biriyani × 2')).not.toBeInTheDocument();
+        // 5. The Load more state is reset: no button (spinner or retry), and no inline error under a list.
+        expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'Loading…' })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+        expect(screen.getAllByRole('alert')).toHaveLength(1);
+        // Nothing was asked for beyond the one page and the refused one.
+        expect(mockedList).toHaveBeenCalledTimes(2);
+        expect(mockedList).toHaveBeenLastCalledWith('org-1', { outletId: undefined, limit: 20, cursor: 'cursor-1' });
+      });
+
+      it('clears every page loaded so far when a later Load more is the refused one', async () => {
+        mockedList.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-1'));
+        mockedList.mockResolvedValueOnce(page(manyOrgOrders(2, 'b'), 'cursor-2'));
+        mockedList.mockRejectedValueOnce(forbidden);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+        await waitFor(() => expect(bodyRows()).toHaveLength(4));
+        fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent("You don't have access to these orders");
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+        expect(screen.queryByText('#a-1')).not.toBeInTheDocument();
+        expect(screen.queryByText('#b-2')).not.toBeInTheDocument();
+      });
+
+      it('still lets Refresh ask again, and shows the orders once access is back', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder], 'cursor-1'));
+        mockedList.mockRejectedValueOnce(forbidden);
+        mockedList.mockResolvedValueOnce(page([pendingOrgOrder], null));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+        // First the denied state, with the old rows gone...
+        expect(await screen.findByRole('alert')).toHaveTextContent("You don't have access to these orders");
+        expect(screen.queryByText('#order-confirmed-1')).not.toBeInTheDocument();
+
+        // ...then Refresh asks again and recovers.
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+        expect(await screen.findByText('#order-pending-2')).toBeInTheDocument();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'Load more' })).not.toBeInTheDocument();
+      });
+    });
+
+    it.each([
+      ['a 500', new ApiError(500, 'internal', 'Something broke on our side.'), 'Something broke on our side.'],
+      ['a 401', new ApiError(401, 'unauthenticated', 'x'), 'Your session has expired. Please sign in again.'],
+      ['a 404', new ApiError(404, 'not_found', 'x'), "That outlet couldn't be found."],
+      ['a network failure', new TypeError('Failed to fetch'), 'Something went wrong. Please check your connection and try again.'],
+    ])('leaves %s on Load more as it was: the rows stay, with the error and Try again', async (_label, failure, message) => {
+      mockedList.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-1'));
+      mockedList.mockRejectedValueOnce(failure);
+      mockedList.mockResolvedValueOnce(page(manyOrgOrders(1, 'b'), null));
+
+      renderPage();
+      fireEvent.click(await screen.findByRole('button', { name: 'Load more' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(message);
+      expect(screen.getByRole('table')).toBeInTheDocument();
+      expect(bodyRows()).toHaveLength(2);
+      expect(screen.queryByText("You don't have access to these orders")).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+
+      await waitFor(() => expect(bodyRows()).toHaveLength(3));
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
   });
 
   describe('refresh', () => {
