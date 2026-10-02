@@ -35,7 +35,13 @@ and branches on the result:
 
 `OrganizationAppLayout` and its child pages (`dashboard`, `menus`, `orders`,
 `analytics`, `settings`) are unmodified by this gate — they are simply
-mounted or not, based on the table above.
+mounted or not, based on the table above. (The layout hands `orders` the same
+`organizationId` it gives `menus`/`outlets`; `/org/orders` loads
+`GET /organizations/{organizationId}/orders`, where the backend — not this
+route — decides whether the signed-in member may read it. A `403` is shown as an
+access problem, not a retryable error — including a `403` that arrives on a
+Refresh after access was revoked while the page was open: the rows already
+loaded are cleared, not left on screen. Any other failed refresh keeps them.)
 
 After `POST /organizations` succeeds, the client uses the organization and
 membership objects the response already contains to update

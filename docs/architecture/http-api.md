@@ -814,6 +814,102 @@ Errors: `400 invalid_argument` (bad `limit`/`cursor`), `401 unauthenticated`,
 document-path tie-break is implicit in that index, in the same direction as
 its last field.
 
+## Organization orders
+
+### `GET /organizations/{organizationId}/orders`
+
+The organization-side, **read-only** counterpart of customer order history:
+the orders placed with an organization's outlets, newest first, one page at a
+time (`functions/src/routes/organizationOrders.ts` +
+`functions/src/domain/organizationOrders.ts`). It is tenant-scoped like the
+outlet/menu routes, not identity-scoped like `GET /orders`. There is no
+endpoint that changes an order here; preparation/pickup/cancellation states
+are a later checkpoint and are not part of this one.
+
+**Authorization.** In this order, each step stopping the request if it fails:
+
+1. `authenticateRequest` — a missing/invalid Descope session is `401`.
+2. `requireOrganizationRole` with `VIEW_ROLES` (`owner`, `manager`, `staff` —
+   the same set that may read outlets and menus; there is no per-outlet
+   permission, and no new role model): an **active** membership at
+   `organizations/{organizationId}/members/{session user}`. A non-member
+   (including a customer who has only ever placed orders), an `invited` or
+   `revoked` member, a nonexistent organization, and an unknown role/status are
+   all the same `403` — a nonexistent organization is not distinguishable from
+   a forbidden one.
+3. Only then is the query string validated.
+
+`organizationId` in the path is a claim about *which membership to look up*,
+never authority by itself: the member document read is keyed by the **verified**
+session user. The scope used for the query is the organization of that verified
+membership. An `organizationId`/`userId` in the query string is ignored.
+
+**Query parameters** (all optional; anything else is ignored):
+
+- `outletId` — narrows the list to one outlet. A requested filter only: the
+  outlet is read under *this* organization's path, so another organization's
+  outlet is simply "not found" (`404`, identical to a nonexistent one — nothing
+  about it leaks). A deactivated outlet is accepted: its history stays
+  readable. A malformed or blank value is `400`, never "no filter".
+- `limit` — as for customer history: default `20`, hard maximum `50`, a
+  non-positive-integer is `400`.
+- `cursor` — the `nextCursor` of the previous page. One this endpoint did not
+  issue, **or one that points outside the current organization (or, with an
+  `outletId` filter, outside that outlet), is `400`** — it is never quietly
+  accepted and never widens the query.
+
+**Query.** `collectionGroup("orders").where("organizationId", "==", <verified
+organization>)`, plus `.where("outletId", "==", <verified outlet>)` when
+filtering, ordered `createdAt` descending then document path descending (so
+orders sharing a timestamp are never skipped or repeated between pages), fetched
+as `limit + 1` to learn whether another page exists. Before anything is
+returned, every document's path and `organizationId` (and `outletId`, when
+filtering) are checked against the verified scope once more, and a mismatch
+fails the request rather than returning the order.
+
+Response (`200`): `{ "orders": [...], "nextCursor": string | null }`; an
+organization with no orders gets `{ "orders": [], "nextCursor": null }`. Every
+status is listed (`pending_payment`, `confirmed`, `cancelled`) — there is no
+status filter yet, and no new states. Orders from inactive outlets are listed
+like any other. Each row:
+
+```json
+{
+  "id": "…", "outletId": "…", "menuId": "…",
+  "outlet": { "name": "Main Canteen" },
+  "menu": { "title": "Tuesday Menu", "menuDate": "2026-09-29" },
+  "status": "pending_payment | confirmed | cancelled",
+  "paymentStatus": "pending | paid",
+  "currency": "INR",
+  "subtotalInPaise": 30000, "totalInPaise": 30000,
+  "itemCount": 3,
+  "items": [{ "name": "Chicken Biriyani", "quantity": 2 }],
+  "moreItemLines": 0,
+  "createdAt": "…", "updatedAt": "…"
+}
+```
+
+- `items` lists at most the first **10** lines (name and quantity, from the
+  order's own snapshots — never the live menu, so a later rename or reprice
+  changes nothing) and `moreItemLines` counts the rest; `itemCount` is the
+  total portions across every line. No per-line prices.
+- `outlet`/`menu` are display-only names, omitted (not an error) if that
+  document no longer exists.
+- Never present: `userId` or any customer identity (name, phone, email),
+  `organizationId`, payment or provider data, or any other backend metadata.
+
+Errors: `400 invalid_argument` (bad `limit`/`outletId`/`cursor`), `401
+unauthenticated`, `403 permission_denied`, `404 not_found` (unknown or foreign
+outlet), `503 unavailable`.
+
+**Indexes.** `firestore.indexes.json` gained two composite indexes, both
+`orders`, `COLLECTION_GROUP` scope (the document-path tie-break is implicit, in
+the same direction as the last field): `organizationId` ascending + `createdAt`
+descending (all outlets), and `organizationId` ascending + `outletId` ascending +
+`createdAt` descending (one outlet). The Firestore emulator does not enforce
+composite indexes, so these can only be confirmed against real Firestore once
+deployed.
+
 ## Explore (public customer discovery)
 
 `GET /explore/outlets`, `GET /explore/outlets/{outletId}`, and
@@ -1213,6 +1309,15 @@ the fixed `asia-south1` region), stripping the `/api` prefix before
 forwarding. Local development therefore needs `VITE_FIREBASE_PROJECT_ID` set
 in `.env.local` in addition to the Descope variables described in
 [authentication.md](./authentication.md).
+
+To check `/org/orders` by hand, `scripts/seed-org-orders.mjs` seeds an
+organization you created through `/org/onboarding` with outlets (one inactive),
+more than 50 orders in every status, and a second, unrelated organization. It is
+**emulator-only**: it refuses to run unless `FIRESTORE_EMULATOR_HOST` is set to a
+loopback address. Usage and options are in the header of the script, e.g.
+`FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-org-orders.mjs --org-slug <slug>`
+(`--as staff|manager|invited|revoked|owner` changes your own membership to try
+each kind of member; `--clean` removes what it created).
 
 Tests that need a live Firestore emulator (`functions/src/**/*.emulator.test.ts`)
 are excluded from the default `npm run test:run` (see root `vite.config.ts`)

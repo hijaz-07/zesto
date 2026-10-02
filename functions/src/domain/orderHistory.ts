@@ -231,7 +231,7 @@ export function decodeOrderHistoryCursor(raw: string): OrderHistoryCursor {
  * @return {Order} The parsed order.
  * @throws {Error} If the document has no parent chain, or is malformed.
  */
-function parseOrderFromPath(doc: QueryDocumentSnapshot): Order {
+export function parseOrderFromPath(doc: QueryDocumentSnapshot): Order {
   const menuRef = doc.ref.parent.parent;
   const outletRef = menuRef?.parent.parent;
   const organizationRef = outletRef?.parent.parent;
@@ -254,7 +254,7 @@ function parseOrderFromPath(doc: QueryDocumentSnapshot): Order {
  *   Outlets keyed by outlet id, menus keyed by menu id (both globally unique
  *   auto-ids).
  */
-async function loadOrderContext(
+export async function loadOrderContext(
   db: Firestore,
   orders: Order[],
 ): Promise<{outlets: Map<string, Outlet>; menus: Map<string, Menu>}> {

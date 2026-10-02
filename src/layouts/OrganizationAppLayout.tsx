@@ -40,7 +40,7 @@ export function OrganizationAppLayout({ organizationId, role }: OrganizationAppL
             element={<OrganizationMenuEditorPage organizationId={organizationId} role={role} />}
           />
           <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
-          <Route path="orders" element={<OrganizationOrdersPage />} />
+          <Route path="orders" element={<OrganizationOrdersPage organizationId={organizationId} />} />
           <Route path="analytics" element={<OrganizationAnalyticsPage />} />
           <Route path="settings" element={<OrganizationSettingsPage />} />
           <Route path="*" element={<Navigate to="dashboard" replace />} />
