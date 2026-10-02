@@ -2,6 +2,7 @@ import type {Firestore} from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";
 import type {ZodError} from "zod";
 import {authenticateRequest, type SessionValidator, type VerifiedSession} from "../auth/session";
+import {listOrdersQuerySchema, listOwnedOrders} from "../domain/orderHistory";
 import {
   createOrder,
   createOrderBodySchema,
@@ -32,8 +33,8 @@ export interface OrdersRouteDeps {
 }
 
 /**
- * Builds the routes for `/orders` — the customer order-creation and
- * ownership-read API (see docs/architecture/http-api.md and this
+ * Builds the routes for `/orders` — the customer order-creation, order-history
+ * and ownership-read API (see docs/architecture/http-api.md and this
  * checkpoint's "Order creation API"/"Order read API" notes). Unlike the
  * organization-management routes (`organizations.ts`/`outlets.ts`/
  * `menus.ts`/`menuItems.ts`), these are NOT nested under
@@ -49,6 +50,7 @@ export interface OrdersRouteDeps {
 export function createOrderRoutes(deps: OrdersRouteDeps): RouteDefinition[] {
   return [
     {method: "POST", path: "/orders", handler: (ctx) => handlePostOrders(ctx, deps)},
+    {method: "GET", path: "/orders", handler: (ctx) => handleListOrders(ctx, deps)},
     {method: "GET", path: "/orders/:orderId", handler: (ctx) => handleGetOrder(ctx, deps)},
     {
       method: "POST",
@@ -124,6 +126,50 @@ async function handlePostOrders(
       data: {order: toOrderResponse(order)},
       userId: session.userId,
     };
+  } catch (error) {
+    return mapKnownError(error);
+  }
+}
+
+/**
+ * `GET /orders`: one page of the caller's own order history, newest first
+ * (see `domain/orderHistory.ts`). Like every other authenticated route here,
+ * it authenticates before reading anything from the request, and the caller's
+ * identity comes ONLY from the verified session — `userId` is not a query
+ * parameter this endpoint knows about, so one in the query string is ignored.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with
+ *   `{orders, nextCursor}` — an empty `orders` for a caller with no orders.
+ */
+async function handleListOrders(
+  ctx: RouteContext,
+  deps: OrdersRouteDeps,
+): Promise<ApiResult> {
+  let session: VerifiedSession;
+  try {
+    session = await authenticateRequest(
+      {headers: {authorization: authorizationHeader(ctx.request)}},
+      deps.validator,
+    );
+  } catch (error) {
+    return mapKnownError(error);
+  }
+
+  const parsedQuery = listOrdersQuerySchema.safeParse(ctx.request.query);
+  if (!parsedQuery.success) {
+    return {
+      kind: "error",
+      status: 400,
+      code: "invalid_argument",
+      message: firstZodIssueMessage(parsedQuery.error),
+    };
+  }
+
+  try {
+    const page = await listOwnedOrders(deps.db, session.userId, parsedQuery.data);
+    return {kind: "success", status: 200, data: page, userId: session.userId};
   } catch (error) {
     return mapKnownError(error);
   }

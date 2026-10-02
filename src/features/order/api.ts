@@ -1,5 +1,5 @@
 import { apiFetch } from '../../lib/api/client';
-import type { Order, OrderId } from './types';
+import type { Order, OrderHistoryPage, OrderId } from './types';
 
 /**
  * The authenticated customer order API (functions/src/routes/orders.ts).
@@ -39,4 +39,29 @@ export function createOrder(input: CreateOrderInput): Promise<OrderResponseEnvel
 /** Reads one order the caller owns. */
 export function getOrder(orderId: OrderId): Promise<OrderResponseEnvelope> {
   return apiFetch<OrderResponseEnvelope>(`/orders/${orderId}`);
+}
+
+export interface ListOrdersParams {
+  /** The `nextCursor` of the previous page; omit for the first page. */
+  cursor?: string;
+  /** A hint only: the backend enforces its own default and maximum. */
+  limit?: number;
+}
+
+/**
+ * Reads one page of the caller's own order history, newest first. Only a
+ * cursor and a page-size hint ever go to the server: which orders come back is
+ * decided entirely by the backend from the signed-in session, never by
+ * anything sent here.
+ */
+export function listOrders(params: ListOrdersParams = {}): Promise<OrderHistoryPage> {
+  const query = new URLSearchParams();
+  if (params.limit !== undefined) {
+    query.set('limit', String(params.limit));
+  }
+  if (params.cursor) {
+    query.set('cursor', params.cursor);
+  }
+  const queryString = query.toString();
+  return apiFetch<OrderHistoryPage>(queryString ? `/orders?${queryString}` : '/orders');
 }

@@ -22,6 +22,20 @@ export function createOrderErrorMessage(error: unknown): string {
   return "Couldn't place your order. Please check your connection and try again.";
 }
 
+/** Maps a failure from the order-history list API to a customer-facing message. */
+export function listOrdersErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.status === 503) {
+    return 'Zesto is temporarily unavailable. Please try again in a moment.';
+  }
+  if (error instanceof ApiError && error.status === 401) {
+    return 'Your session has expired. Please sign in again.';
+  }
+  if (error instanceof ApiError) {
+    return error.message;
+  }
+  return 'Something went wrong. Please check your connection and try again.';
+}
+
 /** Maps a failure from the single-order read API to a customer-facing message. */
 export function getOrderErrorMessage(error: unknown): string {
   if (error instanceof ApiError && error.status === 503) {

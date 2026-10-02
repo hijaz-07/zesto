@@ -58,6 +58,25 @@ export function businessToday(now: Date = new Date()): string {
   return BUSINESS_DATE_FORMATTER.format(now);
 }
 
+const BUSINESS_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: BUSINESS_TIME_ZONE,
+  day: 'numeric',
+  month: 'short',
+  year: 'numeric',
+  hour: 'numeric',
+  minute: '2-digit',
+});
+
+/**
+ * An ISO instant as a readable date and time in Zesto's business time zone,
+ * e.g. "29 Sept 2026, 10:30 am". Pinned to Asia/Kolkata rather than the
+ * viewer's zone so the date and the time always agree with each other and with
+ * the (also Asia/Kolkata) menu schedules shown elsewhere.
+ */
+export function formatBusinessDateTime(isoDateTime: ISODateString): string {
+  return BUSINESS_DATE_TIME_FORMATTER.format(new Date(isoDateTime));
+}
+
 /** An ISO instant's calendar date in Zesto's business time zone, `YYYY-MM-DD`. */
 export function businessDateOf(isoDateTime: ISODateString): string {
   return BUSINESS_DATE_FORMATTER.format(new Date(isoDateTime));

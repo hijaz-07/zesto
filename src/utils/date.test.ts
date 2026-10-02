@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { businessDateOf, businessTimeOf, businessToday, formatDate, getOrderingState, toBusinessTimestamp } from './date';
+import {
+  businessDateOf,
+  businessTimeOf,
+  businessToday,
+  formatBusinessDateTime,
+  formatDate,
+  getOrderingState,
+  toBusinessTimestamp,
+} from './date';
 
 const orderingOpensAt = '2026-09-28T04:00:00+05:30';
 const orderingClosesAt = '2026-09-29T10:00:00+05:30';
@@ -26,6 +34,28 @@ describe('formatDate', () => {
   it('does not shift the calendar date across a month/year boundary', () => {
     process.env.TZ = 'EST5EDT';
     expect(formatDate('2026-01-01')).toBe('1 Jan 2026');
+  });
+});
+
+describe('formatBusinessDateTime', () => {
+  const originalTz = process.env.TZ;
+
+  afterEach(() => {
+    process.env.TZ = originalTz;
+  });
+
+  it('formats an instant as a date and time in Asia/Kolkata', () => {
+    expect(formatBusinessDateTime('2026-09-29T10:30:00+05:30')).toMatch(/^29 Sep(t)? 2026, 10:30\s?(am|AM)$/);
+  });
+
+  it('reads the same date and time whatever the viewer\'s own time zone', () => {
+    process.env.TZ = 'EST5EDT';
+    expect(formatBusinessDateTime('2026-09-29T10:30:00+05:30')).toMatch(/^29 Sep(t)? 2026, 10:30\s?(am|AM)$/);
+  });
+
+  it('moves to the next calendar day once the business time zone does, not the viewer\'s', () => {
+    // 20:00 UTC on the 29th is already 01:30 on the 30th in Asia/Kolkata.
+    expect(formatBusinessDateTime('2026-09-29T20:00:00Z')).toMatch(/^30 Sep(t)? 2026, 1:30\s?(am|AM)$/);
   });
 });
 

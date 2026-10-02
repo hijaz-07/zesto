@@ -745,6 +745,75 @@ remaining-quantity concept anywhere in the menu or menu item model (see
 `Order`'s immutable `unitPriceInPaiseAtOrder` snapshot) is a future Orders
 concern, not part of this implementation.
 
+## Customer order history
+
+### `GET /orders`
+
+The signed-in customer's own orders, newest first, one page at a time
+(`functions/src/routes/orders.ts` + `functions/src/domain/orderHistory.ts`).
+Authenticated (any signed-in Descope user; no organization membership is
+involved or special-cased — an organization's owner/staff see only the orders
+they themselves placed as a customer).
+
+**Ownership.** The caller is the verified session's user and nothing else:
+`userId` is not a request input, so a `userId` query parameter is ignored. The
+query is `collectionGroup("orders").where("userId", "==", <session user>)`, so
+another customer's order can never be in the result set to begin with.
+
+**Query parameters** (both optional; anything else is ignored):
+
+- `limit` — a positive integer page-size hint. Defaults to `20`; the server
+  clamps it to a hard maximum of `50`, so asking for more just returns `50`.
+  Not a positive integer (e.g. `0`, `-1`, `abc`, `1.5`, repeated) → `400`.
+- `cursor` — the `nextCursor` of the previous page. An opaque value; one this
+  endpoint did not issue → `400`.
+
+**Ordering and paging.** `createdAt` descending, then document path descending
+as a tie-break, so orders sharing a timestamp are never skipped or repeated
+between pages. The cursor encodes the last returned order's `createdAt` and
+path. It carries no authority: it is only a boundary inside a query already
+filtered to the caller's own `userId`, so a forged or borrowed cursor can only
+move where in the caller's own history a page starts.
+
+Response (`200`): `{ "orders": [...], "nextCursor": string | null }`.
+`nextCursor` is `null` on the last page; a customer with no orders gets
+`{ "orders": [], "nextCursor": null }`. Each order is a customer-safe summary:
+
+```json
+{
+  "id": "…", "outletId": "…", "menuId": "…",
+  "outlet": { "name": "Main Canteen" },
+  "menu": { "title": "Tuesday Menu", "menuDate": "2026-09-29" },
+  "status": "pending_payment | confirmed | cancelled",
+  "paymentStatus": "pending | paid",
+  "currency": "INR",
+  "subtotalInPaise": 30000, "totalInPaise": 30000,
+  "itemCount": 3,
+  "items": [{ "name": "Chicken Biriyani", "quantity": 2 }],
+  "moreItemLines": 0,
+  "createdAt": "…", "updatedAt": "…"
+}
+```
+
+- `itemCount` is the total portions across every line; `items` lists at most
+  the first 3 lines (names and quantities from the order's own snapshots,
+  never the live menu) and `moreItemLines` counts the rest. Prices per line,
+  and the full order, are read with `GET /orders/{orderId}`.
+- `outlet`/`menu` are display-only names read from the live documents (one
+  read per distinct outlet/menu on the page). They are omitted, not an error,
+  if that document no longer exists, and an inactive outlet or archived menu
+  still resolves — history must not vanish when an outlet or menu is retired.
+- Never present: `userId`, `organizationId`, payment or provider data, or any
+  other backend metadata.
+
+Errors: `400 invalid_argument` (bad `limit`/`cursor`), `401 unauthenticated`,
+`503 unavailable`.
+
+**Index.** `firestore.indexes.json` gained a composite index: `orders`,
+`COLLECTION_GROUP` scope, `userId` ascending + `createdAt` descending. The
+document-path tie-break is implicit in that index, in the same direction as
+its last field.
+
 ## Explore (public customer discovery)
 
 `GET /explore/outlets`, `GET /explore/outlets/{outletId}`, and

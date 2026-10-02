@@ -118,9 +118,10 @@ function validCreateBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("createOrderRoutes", () => {
-  it("registers exactly the 4 documented routes", () => {
+  it("registers exactly the 5 documented routes", () => {
     const routes = createOrderRoutes({db: {} as Firestore});
     expect(routes.map((r) => `${r.method} ${r.path}`).sort()).toEqual([
+      "GET /orders",
       "GET /orders/:orderId",
       "POST /orders",
       "POST /orders/:orderId/payment",
@@ -188,6 +189,68 @@ describe("POST /orders", () => {
     // Still 401 — a forged body userId cannot substitute for a real session,
     // and (via untouchedDb) never even reaches the domain layer.
     expect(result).toMatchObject({kind: "error", status: 401});
+  });
+});
+
+describe("GET /orders", () => {
+  function listRequest(query: Record<string, unknown> = {}): RouteContext {
+    return ctx({request: request({method: "GET", path: "/orders", query, body: undefined})});
+  }
+
+  it("maps a rejected session to 401 with WWW-Authenticate: Bearer, without touching Firestore", async () => {
+    const handler = routeFor("GET", "/orders", untouchedDb(), rejectingValidator());
+
+    const result = await handler(listRequest());
+
+    expect(result).toMatchObject({
+      kind: "error",
+      status: 401,
+      code: "unauthenticated",
+      headers: {"WWW-Authenticate": "Bearer"},
+    });
+  });
+
+  it("maps an infrastructure failure to 503, without touching Firestore", async () => {
+    const handler = routeFor("GET", "/orders", untouchedDb(), unavailableValidator());
+
+    const result = await handler(listRequest());
+
+    expect(result).toMatchObject({kind: "error", status: 503, code: "unavailable"});
+  });
+
+  it("authenticates before reading the query: an invalid query under a rejected session is still 401", async () => {
+    const handler = routeFor("GET", "/orders", untouchedDb(), rejectingValidator());
+
+    const result = await handler(listRequest({limit: "not-a-number", cursor: "!!"}));
+
+    expect(result).toMatchObject({kind: "error", status: 401});
+  });
+
+  it("ignores a request-supplied userId: it cannot stand in for a real session", async () => {
+    const handler = routeFor("GET", "/orders", untouchedDb(), rejectingValidator());
+
+    const result = await handler(listRequest({userId: "U-attacker"}));
+
+    expect(result).toMatchObject({kind: "error", status: 401});
+  });
+
+  it.each([
+    ["a non-numeric limit", {limit: "abc"}],
+    ["a zero limit", {limit: "0"}],
+    ["a negative limit", {limit: "-5"}],
+    ["a fractional limit", {limit: "2.5"}],
+    ["an empty limit", {limit: ""}],
+    ["a repeated limit", {limit: ["1", "2"]}],
+    ["an empty cursor", {cursor: ""}],
+    ["a repeated cursor", {cursor: ["a", "b"]}],
+    ["a cursor that was never issued", {cursor: "not-a-real-cursor"}],
+    ["a cursor with characters outside the base64url alphabet", {cursor: "abc/def=="}],
+  ])("rejects %s as 400, without touching Firestore", async (_label, query) => {
+    const handler = routeFor("GET", "/orders", untouchedDb(), acceptingValidator("U-1"));
+
+    const result = await handler(listRequest(query));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
   });
 });
 

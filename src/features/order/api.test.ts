@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { apiFetch } from '../../lib/api/client';
-import { createOrder, getOrder } from './api';
+import { createOrder, getOrder, listOrders } from './api';
 
 const apiFetchMock = vi.hoisted(() => vi.fn());
 vi.mock('../../lib/api/client', () => ({
@@ -119,5 +119,73 @@ describe('order api', () => {
     apiFetchMock.mockRejectedValue(error);
 
     await expect(getOrder('order-1')).rejects.toBe(error);
+  });
+});
+
+describe('listOrders', () => {
+  const page = { orders: [], nextCursor: null };
+
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('GETs /orders with no query string and no body when given no params', async () => {
+    apiFetchMock.mockResolvedValue(page);
+
+    await listOrders();
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders');
+  });
+
+  it('sends only the page-size hint and cursor it is given, as query parameters', async () => {
+    apiFetchMock.mockResolvedValue(page);
+
+    await listOrders({ limit: 20, cursor: 'abc_DEF-123' });
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders?limit=20&cursor=abc_DEF-123');
+  });
+
+  it('omits an absent cursor', async () => {
+    apiFetchMock.mockResolvedValue(page);
+
+    await listOrders({ limit: 20 });
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders?limit=20');
+  });
+
+  it('never sends a user identifier: ListOrdersParams has no such field', async () => {
+    apiFetchMock.mockResolvedValue(page);
+
+    await listOrders({
+      limit: 5,
+      // @ts-expect-error -- userId is not a field of ListOrdersParams; ownership is decided by the server.
+      userId: 'U-attacker',
+    });
+
+    // Only `limit` is ever read, so even a smuggled-in field cannot reach the URL.
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders?limit=5');
+  });
+
+  it('percent-encodes a cursor rather than splicing it into the URL', async () => {
+    apiFetchMock.mockResolvedValue(page);
+
+    await listOrders({ cursor: 'a&b=c' });
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders?cursor=a%26b%3Dc');
+  });
+
+  it('resolves with the exact page returned by apiFetch', async () => {
+    const withOrders = { orders: [], nextCursor: 'next-cursor' };
+    apiFetchMock.mockResolvedValue(withOrders);
+
+    await expect(listOrders()).resolves.toBe(withOrders);
+  });
+
+  it('propagates a rejection from apiFetch as-is', async () => {
+    const error = new Error('boom');
+    apiFetchMock.mockRejectedValue(error);
+
+    await expect(listOrders()).rejects.toBe(error);
   });
 });

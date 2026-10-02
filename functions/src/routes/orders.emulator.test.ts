@@ -1,7 +1,7 @@
 // @vitest-environment node
 import {createHmac, randomUUID} from "node:crypto";
 import {getApps, initializeApp} from "firebase-admin/app";
-import {Timestamp, getFirestore, type Firestore} from "firebase-admin/firestore";
+import {Timestamp, getFirestore, type DocumentReference, type Firestore} from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from "vitest";
 import type {SessionValidator} from "../auth/session";
@@ -61,7 +61,11 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
-  await archiveFixtureMenus();
+  try {
+    await deleteSeededOrders();
+  } finally {
+    await archiveFixtureMenus();
+  }
 });
 
 // Every menu this file publishes (see `publishTracked`). Left alone, each
@@ -761,6 +765,453 @@ describe("GET /orders/:orderId (Firestore emulator)", () => {
   it("returns 404, not 500, for a nonexistent order", async () => {
     const result = await callGet(acceptingValidator(freshUserId()), "no-such-order");
     expect(result).toMatchObject({kind: "error", status: 404, code: "not_found"});
+  });
+});
+
+interface OrderSummaryShape {
+  id: string;
+  outletId: string;
+  menuId: string;
+  outlet?: {name: string};
+  menu?: {title: string; menuDate: string};
+  status: string;
+  paymentStatus: string;
+  currency: string;
+  subtotalInPaise: number;
+  totalInPaise: number;
+  itemCount: number;
+  items: Array<{name: string; quantity: number}>;
+  moreItemLines: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface OrderHistoryShape {
+  orders: OrderSummaryShape[];
+  nextCursor: string | null;
+}
+
+async function callList(
+  validator: SessionValidator,
+  query: Record<string, unknown> = {},
+): Promise<ApiResult> {
+  const routes = createOrderRoutes({db, validator});
+  return handleRequest(
+    routes,
+    request({method: "GET", path: "/orders", query}),
+    () => {},
+  );
+}
+
+function historyOf(result: ApiResult): OrderHistoryShape {
+  if (result.kind !== "success") throw new Error(`expected success, got ${JSON.stringify(result)}`);
+  return result.data as OrderHistoryShape;
+}
+
+// Orders written by `seedOrders`. The emulator answers a collection-group
+// query (`resolveOrderById`/`getOwnedOrder` look orders up that way) by
+// scanning every document in the group, and this suite's concurrency tests
+// already run at ~3-4s of their 5s timeout, so ~150 orphaned seeded orders
+// left behind would push later tests over it. Delete them after each test.
+const seededOrderRefs: DocumentReference[] = [];
+
+/** Deletes every order `seedOrders` wrote since the last call. */
+async function deleteSeededOrders(): Promise<void> {
+  const refs = seededOrderRefs.splice(0);
+  const BATCH_LIMIT = 400;
+  for (let start = 0; start < refs.length; start += BATCH_LIMIT) {
+    const batch = db.batch();
+    for (const ref of refs.slice(start, start + BATCH_LIMIT)) {
+      batch.delete(ref);
+    }
+    await batch.commit();
+  }
+}
+
+interface SeedOrderInput {
+  userId: string;
+  organizationId: string;
+  outletId: string;
+  menuId: string;
+  createdAt: Timestamp;
+  status?: "pending_payment" | "confirmed" | "cancelled";
+  paymentStatus?: "pending" | "paid";
+  items?: Array<{itemId: string; name: string; priceInPaise: number; quantity: number}>;
+}
+
+/**
+ * Writes orders straight into Firestore with an exact `createdAt`, bypassing
+ * `createOrder`. `createOrder` stamps `Timestamp.now()` (millisecond
+ * resolution), so back-to-back real orders can tie — fine in production, but
+ * it would make "newest first" and pagination assertions flaky here. The shape
+ * is exactly what `createOrder` writes (the route re-validates it with
+ * `parseOrder` on every read). Returns the new order ids, in input order.
+ * Every seeded order is deleted again by `afterEach` (see `deleteSeededOrders`).
+ */
+async function seedOrders(inputs: SeedOrderInput[]): Promise<string[]> {
+  const batch = db.batch();
+  const ids: string[] = [];
+  for (const input of inputs) {
+    const ref = db
+      .collection("organizations").doc(input.organizationId)
+      .collection("outlets").doc(input.outletId)
+      .collection("menus").doc(input.menuId)
+      .collection("orders").doc();
+    seededOrderRefs.push(ref);
+    const items = (input.items ?? [{itemId: "seed-item", name: "Seed Dish", priceInPaise: 5000, quantity: 1}])
+      .map((item) => ({...item, lineTotalInPaise: item.priceInPaise * item.quantity}));
+    const subtotalInPaise = items.reduce((sum, item) => sum + item.lineTotalInPaise, 0);
+    batch.create(ref, {
+      id: ref.id,
+      userId: input.userId,
+      organizationId: input.organizationId,
+      outletId: input.outletId,
+      menuId: input.menuId,
+      status: input.status ?? "pending_payment",
+      paymentStatus: input.paymentStatus ?? "pending",
+      currency: "INR",
+      subtotalInPaise,
+      totalInPaise: subtotalInPaise,
+      items,
+      createdAt: input.createdAt,
+      updatedAt: input.createdAt,
+    });
+    ids.push(ref.id);
+  }
+  await batch.commit();
+  return ids;
+}
+
+const HISTORY_BASE_MILLIS = Date.UTC(2026, 8, 1, 6, 0, 0);
+
+/** A fixed instant `minutes` after a fixed base, so tests choose exact orderings. */
+function minutesAfterBase(minutes: number): Timestamp {
+  return Timestamp.fromMillis(HISTORY_BASE_MILLIS + minutes * 60_000);
+}
+
+describe("GET /orders — order history (Firestore emulator)", () => {
+  // One organization/outlet/menu shared by every test that only needs somewhere
+  // for seeded orders to point (each test uses its own fresh customers, so
+  // nothing leaks between them). Building and publishing a full fixture per
+  // test is ~a dozen sequential emulator round trips; doing that 20+ times
+  // measurably slowed this file and, under the full parallel suite, pushed the
+  // payment concurrency tests that follow past their 5s timeout. The menu is a
+  // never-published draft on purpose: listing history does not depend on menu
+  // state, and it keeps the shared fixture out of the public Explore feed and
+  // out of `afterEach`'s archive step. Tests that genuinely need a live,
+  // orderable menu (placing an order through POST /orders, or retiring the
+  // outlet/menu) build their own with `setupPublishedMenuWithItem`.
+  let shared: {organizationId: string; ownerId: string; outletId: string; menuId: string} | undefined;
+
+  beforeAll(async () => {
+    const {organizationId, ownerId} = await setupOrgWithOwner();
+    const {outletId} = await setupOutlet(organizationId, ownerId);
+    const menu = await createDraftMenu(organizationId, outletId, ownerId);
+    shared = {organizationId, ownerId, outletId, menuId: menu.id};
+  });
+
+  function sharedHistoryFixture() {
+    if (!shared) throw new Error("the shared order-history fixture was not created");
+    return shared;
+  }
+
+  it("denies an unauthenticated caller (401)", async () => {
+    const result = await callList(rejectingValidator());
+
+    expect(result).toMatchObject({kind: "error", status: 401, code: "unauthenticated"});
+  });
+
+  it("gives an authenticated customer with no orders a valid, empty first page", async () => {
+    const result = await callList(acceptingValidator(freshUserId()));
+
+    expect(result).toMatchObject({kind: "success", status: 200});
+    expect(historyOf(result)).toEqual({orders: [], nextCursor: null});
+  });
+
+  it("returns only the caller's own orders; customer B never sees customer A's", async () => {
+    const {organizationId, outletId, menuId} = sharedHistoryFixture();
+    const customerA = freshUserId();
+    const customerB = freshUserId();
+    const customerC = freshUserId();
+    const [a1, a2] = await seedOrders([
+      {userId: customerA, organizationId, outletId, menuId, createdAt: minutesAfterBase(1)},
+      {userId: customerA, organizationId, outletId, menuId, createdAt: minutesAfterBase(3)},
+    ]);
+    const [b1] = await seedOrders([
+      {userId: customerB, organizationId, outletId, menuId, createdAt: minutesAfterBase(2)},
+    ]);
+
+    const forA = historyOf(await callList(acceptingValidator(customerA)));
+    const forB = historyOf(await callList(acceptingValidator(customerB)));
+    const forC = historyOf(await callList(acceptingValidator(customerC)));
+
+    expect(forA.orders.map((o) => o.id)).toEqual([a2, a1]);
+    expect(forB.orders.map((o) => o.id)).toEqual([b1]);
+    expect(forC.orders).toEqual([]);
+  });
+
+  it("ignores a userId in the query string: it cannot be used to read another customer's orders", async () => {
+    const {organizationId, outletId, menuId} = sharedHistoryFixture();
+    const customerA = freshUserId();
+    const customerB = freshUserId();
+    await seedOrders([
+      {userId: customerA, organizationId, outletId, menuId, createdAt: minutesAfterBase(1)},
+    ]);
+    const [b1] = await seedOrders([
+      {userId: customerB, organizationId, outletId, menuId, createdAt: minutesAfterBase(2)},
+    ]);
+
+    const result = historyOf(await callList(acceptingValidator(customerB), {userId: customerA}));
+
+    expect(result.orders.map((o) => o.id)).toEqual([b1]);
+  });
+
+  it("gives the organization's own owner and staff no special view of customers' orders", async () => {
+    const {organizationId, ownerId, outletId, menuId} = sharedHistoryFixture();
+    await seedOrders([
+      {userId: freshUserId(), organizationId, outletId, menuId, createdAt: minutesAfterBase(1)},
+    ]);
+    const staffId = freshUserId();
+    await addMembership(organizationId, staffId, "staff");
+
+    expect(historyOf(await callList(acceptingValidator(ownerId))).orders).toEqual([]);
+    expect(historyOf(await callList(acceptingValidator(staffId))).orders).toEqual([]);
+  });
+
+  it("returns orders newest first, whatever order they were written in", async () => {
+    const {organizationId, outletId, menuId} = sharedHistoryFixture();
+    const customerId = freshUserId();
+    const minutes = [5, 1, 9, 3, 7];
+    const ids = await seedOrders(minutes.map((m) => (
+      {userId: customerId, organizationId, outletId, menuId, createdAt: minutesAfterBase(m)}
+    )));
+    const expected = minutes
+      .map((m, i) => ({m, id: ids[i]}))
+      .sort((x, y) => y.m - x.m)
+      .map((entry) => entry.id);
+
+    const result = historyOf(await callList(acceptingValidator(customerId)));
+
+    expect(result.orders.map((o) => o.id)).toEqual(expected);
+    const createdAts = result.orders.map((o) => Date.parse(o.createdAt));
+    expect(createdAts).toEqual([...createdAts].sort((x, y) => y - x));
+  });
+
+  // The one test that exercises the whole real flow (an order created by
+  // POST /orders, with a payment prepared for it) rather than seeded data.
+  // Statuses, the 3-line item summary and the response mapping in general are
+  // unit-tested in `domain/orderHistory.test.ts`.
+  it("lists an order placed through POST /orders: outlet/menu names, kept snapshot, nothing internal exposed", async () => {
+    const {organizationId, ownerId, outletId, menuId, item: itemA} =
+      await setupPublishedMenuWithItem({name: "Chicken Biriyani", priceInPaise: 7500});
+    const itemB = await addItem(organizationId, outletId, menuId, ownerId, {name: "Veg Biriyani", priceInPaise: 6000});
+    const customerId = freshUserId();
+    const created = orderOf(await callCreate(acceptingValidator(customerId), {
+      outletId, menuId,
+      items: [{itemId: itemA.id, quantity: 2}, {itemId: itemB.id, quantity: 1}],
+      idempotencyKey: "history-key",
+    }));
+    await callPreparePayment(acceptingValidator(customerId), created.id);
+    const outletName = (await db
+      .collection("organizations").doc(organizationId).collection("outlets").doc(outletId).get()).get("name");
+    const menuSnapshot = await db
+      .collection("organizations").doc(organizationId).collection("outlets").doc(outletId)
+      .collection("menus").doc(menuId).get();
+
+    // The response body is `{data}` only: `ApiResult.userId` exists purely for
+    // request logging and never reaches the client (see `http/envelope.ts`).
+    const result = historyOf(await callList(acceptingValidator(customerId)));
+
+    expect(result.nextCursor).toBeNull();
+    expect(result.orders).toHaveLength(1);
+    // `toEqual` on the whole object also proves there are no extra fields.
+    expect(result.orders[0]).toEqual({
+      id: created.id,
+      outletId,
+      menuId,
+      outlet: {name: outletName},
+      menu: {title: menuSnapshot.get("title"), menuDate: menuSnapshot.get("menuDate")},
+      status: "pending_payment",
+      paymentStatus: "pending",
+      currency: "INR",
+      subtotalInPaise: 21000,
+      totalInPaise: 21000,
+      itemCount: 3,
+      items: [{name: "Chicken Biriyani", quantity: 2}, {name: "Veg Biriyani", quantity: 1}],
+      moreItemLines: 0,
+      createdAt: created.createdAt,
+      updatedAt: created.updatedAt,
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(customerId);
+    expect(serialized).not.toContain(organizationId);
+    expect(serialized).not.toMatch(/provider|razorpay|order_fake|rzp_|createdBy/i);
+
+    // Historical orders are protected from later menu edits.
+    await updateMenuItem(db, organizationId, outletId, menuId, itemA.id, {name: "Renamed Item", priceInPaise: 99999});
+    const [after] = historyOf(await callList(acceptingValidator(customerId))).orders;
+    expect(after.items).toEqual([{name: "Chicken Biriyani", quantity: 2}, {name: "Veg Biriyani", quantity: 1}]);
+    expect(after.totalInPaise).toBe(21000);
+  });
+
+  it("still lists an order, with its outlet/menu names, after the outlet is deactivated and the menu archived", async () => {
+    const {organizationId, outletId, menuId} = await setupPublishedMenuWithItem();
+    const customerId = freshUserId();
+    await seedOrders([{userId: customerId, organizationId, outletId, menuId, createdAt: minutesAfterBase(1)}]);
+    await archiveMenu(db, organizationId, outletId, menuId);
+    await updateOutlet(db, organizationId, outletId, {status: "inactive"});
+
+    const [summary] = historyOf(await callList(acceptingValidator(customerId))).orders;
+
+    expect(summary.outlet?.name).toBeTruthy();
+    expect(summary.menu?.title).toBeTruthy();
+  });
+
+  it("omits the outlet/menu names, rather than failing, when those documents do not exist", async () => {
+    const customerId = freshUserId();
+    const [orderId] = await seedOrders([{
+      userId: customerId,
+      organizationId: `org-gone-${randomUUID()}`,
+      outletId: `outlet-gone-${randomUUID()}`,
+      menuId: `menu-gone-${randomUUID()}`,
+      createdAt: minutesAfterBase(1),
+    }]);
+
+    const result = historyOf(await callList(acceptingValidator(customerId)));
+
+    expect(result.orders).toHaveLength(1);
+    expect(result.orders[0].id).toBe(orderId);
+    expect(result.orders[0]).not.toHaveProperty("outlet");
+    expect(result.orders[0]).not.toHaveProperty("menu");
+  });
+
+  describe("pagination", () => {
+    async function seedMany(customerId: string, count: number): Promise<string[]> {
+      const {organizationId, outletId, menuId} = sharedHistoryFixture();
+      // Oldest first: the i-th seeded order is the i-th oldest.
+      return seedOrders(Array.from({length: count}, (_unused, i) => (
+        {userId: customerId, organizationId, outletId, menuId, createdAt: minutesAfterBase(i)}
+      )));
+    }
+
+    async function walk(customerId: string, limit: number): Promise<{ids: string[]; pageSizes: number[]}> {
+      const ids: string[] = [];
+      const pageSizes: number[] = [];
+      let cursor: string | null = null;
+      for (let guard = 0; guard < 20; guard++) {
+        const page = historyOf(await callList(
+          acceptingValidator(customerId),
+          cursor === null ? {limit: String(limit)} : {limit: String(limit), cursor},
+        ));
+        ids.push(...page.orders.map((o) => o.id));
+        pageSizes.push(page.orders.length);
+        if (page.nextCursor === null) return {ids, pageSizes};
+        cursor = page.nextCursor;
+      }
+      throw new Error("pagination did not terminate");
+    }
+
+    it("walks newest-first pages with no skips and no duplicates, ending with a null cursor", async () => {
+      const customerId = freshUserId();
+      const oldestFirst = await seedMany(customerId, 7);
+
+      const {ids, pageSizes} = await walk(customerId, 3);
+
+      expect(pageSizes).toEqual([3, 3, 1]);
+      expect(ids).toEqual([...oldestFirst].reverse());
+    });
+
+    it("has no further page when the last page is exactly full", async () => {
+      const customerId = freshUserId();
+      await seedMany(customerId, 4);
+
+      const {pageSizes} = await walk(customerId, 2);
+
+      expect(pageSizes).toEqual([2, 2]);
+    });
+
+    it("never skips or repeats orders that share the exact same createdAt", async () => {
+      const {organizationId, outletId, menuId} = sharedHistoryFixture();
+      const customerId = freshUserId();
+      const sameInstant = minutesAfterBase(10);
+      const tied = await seedOrders(Array.from({length: 5}, () => (
+        {userId: customerId, organizationId, outletId, menuId, createdAt: sameInstant}
+      )));
+      const [older] = await seedOrders([
+        {userId: customerId, organizationId, outletId, menuId, createdAt: minutesAfterBase(1)},
+      ]);
+
+      const {ids} = await walk(customerId, 2);
+
+      expect(ids).toHaveLength(6);
+      expect(new Set(ids).size).toBe(6);
+      expect(new Set(ids.slice(0, 5))).toEqual(new Set(tied));
+      expect(ids[5]).toBe(older);
+    });
+
+    it("uses a default page size of 20 when no limit is given", async () => {
+      const customerId = freshUserId();
+      await seedMany(customerId, 25);
+
+      const page = historyOf(await callList(acceptingValidator(customerId)));
+
+      expect(page.orders).toHaveLength(20);
+      expect(page.nextCursor).not.toBeNull();
+    });
+
+    it("caps the page size at 50 server-side, however large a limit is requested", async () => {
+      const customerId = freshUserId();
+      const oldestFirst = await seedMany(customerId, 55);
+
+      const first = historyOf(await callList(acceptingValidator(customerId), {limit: "100000"}));
+      expect(first.orders).toHaveLength(50);
+      expect(first.nextCursor).not.toBeNull();
+      expect(first.orders.map((o) => o.id)).toEqual([...oldestFirst].reverse().slice(0, 50));
+
+      const second = historyOf(await callList(
+        acceptingValidator(customerId), {limit: "100000", cursor: first.nextCursor as string},
+      ));
+      expect(second.orders.map((o) => o.id)).toEqual([...oldestFirst].reverse().slice(50));
+      expect(second.nextCursor).toBeNull();
+    });
+
+    it("keeps every page restricted to the requester: another customer's cursor never reveals the first customer's orders", async () => {
+      const {organizationId, outletId, menuId} = sharedHistoryFixture();
+      const customerA = freshUserId();
+      const customerB = freshUserId();
+      const aIds = await seedOrders(Array.from({length: 4}, (_unused, i) => (
+        {userId: customerA, organizationId, outletId, menuId, createdAt: minutesAfterBase(i * 2)}
+      )));
+      const bIds = await seedOrders(Array.from({length: 4}, (_unused, i) => (
+        {userId: customerB, organizationId, outletId, menuId, createdAt: minutesAfterBase(i * 2 + 1)}
+      )));
+      const firstOfA = historyOf(await callList(acceptingValidator(customerA), {limit: "1"}));
+      expect(firstOfA.nextCursor).not.toBeNull();
+
+      // B replays A's cursor — which points at one of A's own orders.
+      const asB = historyOf(await callList(
+        acceptingValidator(customerB), {limit: "50", cursor: firstOfA.nextCursor as string},
+      ));
+
+      const seen = asB.orders.map((o) => o.id);
+      expect(seen.every((id) => bIds.includes(id))).toBe(true);
+      expect(seen.some((id) => aIds.includes(id))).toBe(false);
+    });
+
+    it("lets a customer with no orders use a cursor without ever receiving anything", async () => {
+      const {organizationId, outletId, menuId} = sharedHistoryFixture();
+      const customerA = freshUserId();
+      await seedOrders(Array.from({length: 3}, (_unused, i) => (
+        {userId: customerA, organizationId, outletId, menuId, createdAt: minutesAfterBase(i)}
+      )));
+      const firstOfA = historyOf(await callList(acceptingValidator(customerA), {limit: "1"}));
+
+      const asNobody = historyOf(await callList(
+        acceptingValidator(freshUserId()), {cursor: firstOfA.nextCursor as string},
+      ));
+
+      expect(asNobody).toEqual({orders: [], nextCursor: null});
+    });
   });
 });
 
