@@ -197,8 +197,13 @@ rules_version = '2';
 //     order, always derived server-side from the verified Descope session
 //     (functions/src/auth/session.ts), never accepted from a client.
 //   - status: string (required) — one of 'pending_payment' | 'confirmed' |
-//     'cancelled'. A new order always starts 'pending_payment'; payment
-//     integration (a later checkpoint) will transition it.
+//     'preparing' | 'ready' | 'cancelled'. A new order always starts
+//     'pending_payment'. Only trusted backend code moves it: a verified
+//     payment makes it 'confirmed' (domain/payments.ts's
+//     markPaymentSucceeded), and an active organization member moves a paid
+//     order 'confirmed' -> 'preparing' -> 'ready'
+//     (domain/orderFulfillment.ts's transitionOrderStatus). 'ready' and
+//     'cancelled' are terminal for now.
 //   - paymentStatus: string (required) — 'pending' for v1; a new order
 //     always starts here, payment integration transitions it later.
 //   - currency: string (required) — 'INR' for v1.
@@ -212,6 +217,11 @@ rules_version = '2';
 //     creation. Changing the source menu item's name, price, or enabled
 //     state afterward never changes an existing order.
 //   - createdAt, updatedAt: timestamp (required)
+//   - preparingStartedAt (timestamp) + preparingStartedBy (string, the
+//     member's Descope user ID): optional; written together, once, by the
+//     transition into 'preparing'. readyAt + readyBy likewise for 'ready'.
+//     Never overwritten by a repeated request, and never returned by any
+//     API response.
 // Provisioned by trusted backend code only
 // (functions/src/domain/orders.ts's createOrder), inside one Firestore
 // transaction together with the idempotency record at

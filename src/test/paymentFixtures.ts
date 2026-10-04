@@ -34,6 +34,20 @@ export const confirmedOrder: Order = {
   updatedAt: '2026-09-30T08:05:00+05:30',
 };
 
+/** The same paid order once the organization has started preparing it. */
+export const preparingOrder: Order = {
+  ...confirmedOrder,
+  status: 'preparing',
+  updatedAt: '2026-09-30T08:20:00+05:30',
+};
+
+/** The same paid order once the organization has marked it ready. */
+export const readyOrder: Order = {
+  ...confirmedOrder,
+  status: 'ready',
+  updatedAt: '2026-09-30T08:40:00+05:30',
+};
+
 /** Distinct, obviously-fake values, so a test can tell exactly which one reached Checkout. */
 export const preparedPayment: PreparedPayment = {
   paymentId: 'order-1',

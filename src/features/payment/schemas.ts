@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { Order } from '../order/types';
+import { ORDER_STATUSES, type Order } from '../order/types';
 import type { PaymentResponse, PreparedPayment } from './types';
 
 /**
@@ -41,7 +41,10 @@ const orderSchema = z.object({
   organizationId: z.string(),
   outletId: z.string(),
   menuId: z.string(),
-  status: z.enum(['pending_payment', 'confirmed', 'cancelled']),
+  // Every order status, not just the ones payment itself produces: a replayed
+  // verification (a retried request, a second tab) can be answered after the
+  // organization has already moved the paid order on to `preparing`/`ready`.
+  status: z.enum(ORDER_STATUSES),
   paymentStatus: z.enum(['pending', 'paid']),
   currency: z.literal('INR'),
   subtotalInPaise: z.number().int().nonnegative(),

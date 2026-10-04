@@ -1,7 +1,14 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
-import { cancelledSummary, confirmedSummary, pendingSummary } from '../../test/orderHistoryFixtures';
+import {
+  cancelledSummary,
+  confirmedSummary,
+  pendingSummary,
+  preparingSummary,
+  readySummary,
+} from '../../test/orderHistoryFixtures';
 import { OrderHistoryCard } from './OrderHistoryCard';
+import type { OrderSummary } from './types';
 
 describe('OrderHistoryCard', () => {
   it('shows the outlet, menu title and menu date', () => {
@@ -47,6 +54,32 @@ describe('OrderHistoryCard', () => {
     render(<OrderHistoryCard order={confirmedSummary} onClick={vi.fn()} />);
 
     expect(screen.getByText(/^Placed 28 Sep(t)? 2026, 10:30\s?(am|AM)$/)).toBeInTheDocument();
+  });
+
+  it('shows a preparing order as Preparing and Paid, rather than failing to render', () => {
+    render(<OrderHistoryCard order={preparingSummary} onClick={vi.fn()} />);
+
+    expect(screen.getByText('Preparing')).toBeInTheDocument();
+    expect(screen.getByText('Paid')).toBeInTheDocument();
+    expect(screen.queryByText('Confirmed')).not.toBeInTheDocument();
+    expect(screen.queryByText('Payment pending')).not.toBeInTheDocument();
+  });
+
+  it('shows a ready order as Ready and Paid, rather than failing to render', () => {
+    render(<OrderHistoryCard order={readySummary} onClick={vi.fn()} />);
+
+    expect(screen.getByText('Ready')).toBeInTheDocument();
+    expect(screen.getByText('Paid')).toBeInTheDocument();
+    expect(screen.queryByText('Confirmed')).not.toBeInTheDocument();
+  });
+
+  it('shows an order in a status this build does not know as words, never a blank or a crash', () => {
+    const future = { ...confirmedSummary, status: 'picked_up' as OrderSummary['status'] };
+
+    render(<OrderHistoryCard order={future} onClick={vi.fn()} />);
+
+    expect(screen.getByText('Picked up')).toBeInTheDocument();
+    expect(screen.getByText('Main Canteen')).toBeInTheDocument();
   });
 
   it('shows a confirmed, paid order as Confirmed and Paid', () => {

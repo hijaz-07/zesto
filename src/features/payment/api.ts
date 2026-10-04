@@ -1,5 +1,5 @@
 import { ApiError, apiFetch } from '../../lib/api/client';
-import type { OrderId } from '../order/types';
+import { isPaymentConfirmedStatus, type OrderId } from '../order/types';
 import { preparePaymentResponseSchema, verifyPaymentResponseSchema } from './schemas';
 import type { PreparedPayment, RazorpayCheckoutCallback, VerifiedPayment } from './types';
 
@@ -65,12 +65,17 @@ export async function verifyPayment(orderId: OrderId, callback: RazorpayCheckout
  * this order: the payment succeeded AND the order is confirmed and paid.
  * This — never Checkout's browser callback — is the only thing the UI may
  * treat as "payment successful".
+ *
+ * "Confirmed" includes an order the organization has since moved into
+ * fulfilment (`preparing`, `ready`): replaying a verification for a payment
+ * that already succeeded returns the order as it stands now, and that is still
+ * proof of payment. A `pending_payment` or `cancelled` order never is.
  */
 export function isPaymentConfirmed(result: VerifiedPayment, orderId: OrderId): boolean {
   return (
     result.order.id === orderId &&
     result.payment.status === 'succeeded' &&
-    result.order.status === 'confirmed' &&
+    isPaymentConfirmedStatus(result.order.status) &&
     result.order.paymentStatus === 'paid'
   );
 }

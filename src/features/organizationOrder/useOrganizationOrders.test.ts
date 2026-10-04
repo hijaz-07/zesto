@@ -511,6 +511,140 @@ describe('useOrganizationOrders', () => {
     });
   });
 
+  describe('loadId', () => {
+    it('is 0 while there are no rows, and positive once the first page lands', async () => {
+      listMock.mockResolvedValue(page([confirmedOrgOrder]));
+
+      const { result } = renderOrders();
+      expect(result.current.loadId).toBe(0);
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+
+      expect(result.current.loadId).toBeGreaterThan(0);
+    });
+
+    it('grows with each refresh that lands, and refresh returns the id its own load will carry', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      const first = result.current.loadId;
+
+      let asked!: number;
+      act(() => {
+        asked = result.current.refresh();
+      });
+      expect(asked).toBeGreaterThan(first);
+      expect(result.current.loadId).toBe(first);
+      await waitFor(() => expect(result.current.refreshing).toBe(false));
+
+      expect(result.current.loadId).toBe(asked);
+    });
+
+    it('is what refresh returns even when the call is a no-op: the load already in flight', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+      const inFlight = deferred<OrganizationOrdersPage>();
+      listMock.mockReturnValueOnce(inFlight.promise);
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+
+      let first!: number;
+      let second!: number;
+      act(() => {
+        first = result.current.refresh();
+        second = result.current.refresh();
+      });
+      expect(second).toBe(first);
+      expect(listMock).toHaveBeenCalledTimes(2);
+
+      await act(async () => inFlight.resolve(page([confirmedOrgOrder])));
+      expect(result.current.loadId).toBe(first);
+    });
+
+    it('is the first load for a refresh asked while that load is still in flight', async () => {
+      const firstLoad = deferred<OrganizationOrdersPage>();
+      listMock.mockReturnValueOnce(firstLoad.promise);
+
+      const { result } = renderOrders();
+      let asked!: number;
+      act(() => {
+        asked = result.current.refresh();
+      });
+      await act(async () => firstLoad.resolve(page([confirmedOrgOrder])));
+
+      expect(listMock).toHaveBeenCalledTimes(1);
+      expect(result.current.loadId).toBe(asked);
+    });
+
+    it('stays as it was when a refresh fails, since the rows on screen are still the old ones', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+      listMock.mockRejectedValueOnce(new ApiError(503, 'unavailable', 'down'));
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      const before = result.current.loadId;
+      act(() => {
+        result.current.refresh();
+      });
+      await waitFor(() => expect(result.current.refreshError).not.toBeNull());
+
+      expect(result.current.loadId).toBe(before);
+    });
+
+    it('is 0 again in the access-lost error state, and larger than before once access is restored', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+      listMock.mockRejectedValueOnce(new ApiError(403, 'permission_denied', 'no'));
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      const before = result.current.loadId;
+      act(() => {
+        result.current.refresh();
+      });
+      await waitFor(() => expect(result.current.status).toBe('error'));
+      expect(result.current.loadId).toBe(0);
+
+      act(() => {
+        result.current.refresh();
+      });
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+
+      expect(result.current.loadId).toBeGreaterThan(before);
+    });
+
+    it('is not changed by load more or by replacing a row: they do not re-read the rows already shown', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder], 'cursor-1'));
+      listMock.mockResolvedValueOnce(page([pendingOrgOrder], null));
+
+      const { result } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      const before = result.current.loadId;
+
+      act(() => result.current.loadMore());
+      await waitFor(() => expect(result.current.orders).toHaveLength(2));
+      act(() => result.current.replaceOrder({ ...confirmedOrgOrder, status: 'preparing' }));
+
+      expect(result.current.loadId).toBe(before);
+    });
+
+    it('grows when the outlet filter changes, since that is a new load', async () => {
+      listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+      listMock.mockResolvedValueOnce(page([pendingOrgOrder]));
+
+      const { result, rerender } = renderOrders();
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      const before = result.current.loadId;
+
+      rerender({ organizationId: 'org-1', outletId: 'outlet-2' });
+      expect(result.current.loadId).toBe(0);
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+
+      expect(result.current.loadId).toBeGreaterThan(before);
+    });
+  });
+
   describe('changing scope', () => {
     it('starts over for a new outlet filter: loading, not the previous outlet\'s orders', async () => {
       const second = deferred<OrganizationOrdersPage>();
@@ -572,6 +706,83 @@ describe('useOrganizationOrders', () => {
       await waitFor(() => expect(result.current.orders[0]?.id).toBe('order-pending-2'));
 
       expect(listMock).toHaveBeenLastCalledWith('org-2', { outletId: undefined, limit: 20 });
+    });
+
+    describe('replaceOrder', () => {
+      const started = { ...confirmedOrgOrder, status: 'preparing' as const, updatedAt: '2026-09-28T10:40:00+05:30' };
+
+      it("swaps in the backend's row for that order, leaving the others and their order untouched", async () => {
+        listMock.mockResolvedValue(page([cancelledOrgOrder, confirmedOrgOrder, pendingOrgOrder], 'next'));
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.status).toBe('ready'));
+
+        act(() => result.current.replaceOrder(started));
+
+        expect(result.current.orders).toEqual([cancelledOrgOrder, started, pendingOrgOrder]);
+        expect(result.current.hasMore).toBe(true);
+        expect(listMock).toHaveBeenCalledTimes(1);
+      });
+
+      it('ignores an order that is not in the list (e.g. the outlet filter changed while it was in flight)', async () => {
+        listMock.mockResolvedValue(page([cancelledOrgOrder]));
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.status).toBe('ready'));
+
+        act(() => result.current.replaceOrder(started));
+
+        expect(result.current.orders).toEqual([cancelledOrgOrder]);
+      });
+
+      it('does nothing while the list is still loading', async () => {
+        const first = deferred<OrganizationOrdersPage>();
+        listMock.mockReturnValue(first.promise);
+        const { result } = renderOrders();
+
+        act(() => result.current.replaceOrder(started));
+
+        expect(result.current.status).toBe('loading');
+        expect(result.current.orders).toEqual([]);
+        first.resolve(page([confirmedOrgOrder]));
+        await waitFor(() => expect(result.current.orders).toEqual([confirmedOrgOrder]));
+      });
+
+      it('does nothing in the access-lost error state: no rows reappear', async () => {
+        listMock.mockRejectedValue(new ApiError(403, 'permission_denied', 'No.'));
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.status).toBe('error'));
+
+        act(() => result.current.replaceOrder(started));
+
+        expect(result.current.status).toBe('error');
+        expect(result.current.orders).toEqual([]);
+      });
+
+      it('is replaced by the next refresh, which is the backend\'s own view', async () => {
+        listMock.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.status).toBe('ready'));
+        act(() => result.current.replaceOrder(started));
+        const ready = { ...confirmedOrgOrder, status: 'ready' as const };
+        listMock.mockResolvedValueOnce(page([ready]));
+
+        act(() => result.current.refresh());
+
+        await waitFor(() => expect(result.current.orders).toEqual([ready]));
+      });
+
+      it('keeps the pages already loaded and the cursor when it swaps a row', async () => {
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'a'), 'cursor-2'));
+        listMock.mockResolvedValueOnce(page(manyOrgOrders(2, 'b'), null));
+        const { result } = renderOrders();
+        await waitFor(() => expect(result.current.status).toBe('ready'));
+
+        act(() => result.current.replaceOrder({ ...manyOrgOrders(2, 'a')[0], status: 'preparing' }));
+        act(() => result.current.loadMore());
+
+        await waitFor(() => expect(result.current.orders).toHaveLength(4));
+        expect(listMock).toHaveBeenLastCalledWith('org-1', { outletId: undefined, limit: 20, cursor: 'cursor-2' });
+        expect(result.current.orders[0].status).toBe('preparing');
+      });
     });
 
     it('returns to a previous filter by fetching it afresh', async () => {

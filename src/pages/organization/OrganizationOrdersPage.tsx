@@ -6,26 +6,37 @@ import { LoadingState } from '../../components/common/LoadingState';
 import { PageHeader } from '../../components/common/PageHeader';
 import { OrganizationPageToolbar } from '../../components/layout/OrganizationPageToolbar';
 import { Button } from '../../components/ui/Button';
-import type { OrganizationId, OutletId } from '../../domain/types';
+import type { OrganizationId, OrganizationMemberRole, OutletId } from '../../domain/types';
 import {
   isOrganizationOrdersForbidden,
   listOrganizationOrdersErrorMessage,
 } from '../../features/organizationOrder/errors';
+import { canFulfillOrders } from '../../features/organizationOrder/fulfillment';
+import { OrderFulfillmentActions } from '../../features/organizationOrder/OrderFulfillmentActions';
 import { OrganizationOrdersTable } from '../../features/organizationOrder/OrganizationOrdersTable';
+import { useOrderFulfillment } from '../../features/organizationOrder/useOrderFulfillment';
 import { useOrganizationOrders } from '../../features/organizationOrder/useOrganizationOrders';
 import { useOutlets } from '../../features/outlet/useOutlets';
 import { useOnBecameVisible } from '../../hooks/useOnBecameVisible';
 
 export interface OrganizationOrdersPageProps {
   organizationId: OrganizationId;
+  /** The caller's membership role (from `GET /organizations`, threaded down via `OrganizationGate` -> `OrganizationAppLayout`). Decides only whether the fulfilment actions are shown — see `canFulfillOrders`. */
+  role: OrganizationMemberRole;
 }
 
 const ALL_OUTLETS = '';
 
 /**
  * `/org/orders` — the organization's orders, newest first, loaded from the
- * backend a page at a time (`useOrganizationOrders`). Read-only: it shows what
- * has been ordered and its payment/status, and offers no way to change an order.
+ * backend a page at a time (`useOrganizationOrders`). It shows what has been
+ * ordered and its payment/status, and lets a member move a paid order along:
+ * "Start preparing" on a confirmed order, "Mark ready" (after a confirmation)
+ * on a preparing one (`useOrderFulfillment`). Both are requests the backend
+ * decides — the row shown afterwards is the server's own answer, and a refused
+ * action refreshes the list rather than trusting what was on screen. Orders
+ * can't be changed in any other way here, and nothing is shown to customers
+ * beyond their order's status.
  *
  * The outlet filter is only a request — the backend checks the chosen outlet
  * really belongs to the organization and that the signed-in member may read its
@@ -37,12 +48,31 @@ const ALL_OUTLETS = '';
  * returning to it is not a mount; the visibility hook refreshes the list then,
  * and the Refresh button does the same on demand. Nothing polls.
  */
-export function OrganizationOrdersPage({ organizationId }: OrganizationOrdersPageProps) {
+export function OrganizationOrdersPage({ organizationId, role }: OrganizationOrdersPageProps) {
   const [selectedOutletId, setSelectedOutletId] = useState<OutletId>(ALL_OUTLETS);
   const outletId = selectedOutletId === ALL_OUTLETS ? null : selectedOutletId;
-  const { status, orders, error, hasMore, loadingMore, loadMoreError, refreshing, refreshError, retry, loadMore, refresh } =
-    useOrganizationOrders(organizationId, outletId);
+  const {
+    status,
+    orders,
+    error,
+    hasMore,
+    loadingMore,
+    loadMoreError,
+    refreshing,
+    refreshError,
+    loadId,
+    retry,
+    loadMore,
+    refresh,
+    replaceOrder,
+  } = useOrganizationOrders(organizationId, outletId);
   const { status: outletsStatus, outlets } = useOutlets(organizationId);
+  const { pendingOrderIds, errors: actionErrors, run: runAction } = useOrderFulfillment({
+    organizationId,
+    onOrderUpdated: replaceOrder,
+    onNeedsRefresh: refresh,
+    listLoadId: loadId,
+  });
 
   const pageRef = useRef<HTMLDivElement>(null);
   useOnBecameVisible(pageRef, refresh);
@@ -84,7 +114,21 @@ export function OrganizationOrdersPage({ organizationId }: OrganizationOrdersPag
   } else {
     content = (
       <>
-        <OrganizationOrdersTable orders={orders} />
+        <OrganizationOrdersTable
+          orders={orders}
+          renderActions={
+            canFulfillOrders(role)
+              ? (order) => (
+                  <OrderFulfillmentActions
+                    order={order}
+                    pending={pendingOrderIds.has(order.id)}
+                    error={actionErrors[order.id] ?? null}
+                    onRun={runAction}
+                  />
+                )
+              : undefined
+          }
+        />
 
         {loadMoreError !== null && (
           <p role="alert" className="text-center text-sm text-danger">

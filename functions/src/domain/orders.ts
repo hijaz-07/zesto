@@ -29,9 +29,15 @@ import {parseOutlet, type Outlet} from "./outlets";
  * enabled state must never change the order (see root CLAUDE.md's "Menu
  * editing"). All money is integer paise; `totalInPaise` equals
  * `subtotalInPaise` for v1 — there is no tax/fee/discount system yet.
+ *
+ * Status lifecycle: `pending_payment` -> `confirmed` is owned by
+ * `domain/payments.ts` (`markPaymentSucceeded`) and `confirmed` -> `preparing`
+ * -> `ready` by `domain/orderFulfillment.ts` (`transitionOrderStatus`);
+ * nothing else writes `status`. `ready` and `cancelled` are terminal for now
+ * (pickup and cancellation are later features).
  */
-export type OrderStatus = "pending_payment" | "confirmed" | "cancelled";
-const ORDER_STATUS_VALUES = ["pending_payment", "confirmed", "cancelled"] as const;
+export type OrderStatus = "pending_payment" | "confirmed" | "preparing" | "ready" | "cancelled";
+const ORDER_STATUS_VALUES = ["pending_payment", "confirmed", "preparing", "ready", "cancelled"] as const;
 
 /**
  * `createOrder` always writes `"pending"`. `"paid"` is set exactly once, by
@@ -75,6 +81,21 @@ export interface Order {
   items: OrderItemSnapshot[];
   createdAt: Timestamp;
   updatedAt: Timestamp;
+  /**
+   * Fulfillment audit trail — who moved the order into `preparing`/`ready`,
+   * and when. Each pair is written exactly once, by
+   * `domain/orderFulfillment.ts`'s `transitionOrderStatus`, in the same
+   * transaction as the status change, and never overwritten afterwards (a
+   * repeated request is a no-op). Absent on any order that has not reached
+   * that state. The `*By` values are organization members' Descope user IDs;
+   * they are internal and never part of any API response (see
+   * `toOrderResponse`, `OrganizationOrderSummaryResponse`). This is
+   * deliberately not a general event history — see root CLAUDE.md.
+   */
+  preparingStartedAt?: Timestamp;
+  preparingStartedBy?: string;
+  readyAt?: Timestamp;
+  readyBy?: string;
 }
 
 /**
@@ -172,6 +193,16 @@ const orderDocSchema = z.object({
     (value) => value instanceof Timestamp,
     "updatedAt must be a Firestore Timestamp",
   ),
+  preparingStartedAt: z.custom<Timestamp>(
+    (value) => value instanceof Timestamp,
+    "preparingStartedAt must be a Firestore Timestamp",
+  ).optional(),
+  preparingStartedBy: z.string().min(1).optional(),
+  readyAt: z.custom<Timestamp>(
+    (value) => value instanceof Timestamp,
+    "readyAt must be a Firestore Timestamp",
+  ).optional(),
+  readyBy: z.string().min(1).optional(),
 });
 
 /**

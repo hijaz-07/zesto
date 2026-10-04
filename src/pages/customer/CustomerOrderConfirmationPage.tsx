@@ -9,7 +9,7 @@ import { Card } from '../../components/ui/Card';
 import { useAuth } from '../../features/auth/useAuth';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
 import { getOrderErrorMessage } from '../../features/order/errors';
-import type { Order } from '../../features/order/types';
+import { isPaymentConfirmedStatus, type Order } from '../../features/order/types';
 import { useOrder } from '../../features/order/useOrder';
 import { paymentNoticeText } from '../../features/payment/errors';
 import { checkoutDescription } from '../../features/payment/razorpayCheckout';
@@ -20,7 +20,16 @@ import { formatPaiseAsRupees } from '../../utils/currency';
 const ORDER_STATUS_LABEL: Record<Order['status'], string> = {
   pending_payment: 'Payment required',
   confirmed: 'Confirmed',
+  preparing: 'Preparing',
+  ready: 'Ready for pickup',
   cancelled: 'Cancelled',
+};
+
+/** What a paid order's card says, by where the organization has got to with it. */
+const PAID_ORDER_MESSAGE: Partial<Record<Order['status'], string>> = {
+  confirmed: 'Payment successful. Your order is confirmed.',
+  preparing: "Payment successful. We're preparing your order.",
+  ready: 'Payment successful. Your order is ready for pickup.',
 };
 
 const PAYMENT_STATUS_LABEL: Record<Order['paymentStatus'], string> = {
@@ -80,7 +89,8 @@ export function CustomerOrderConfirmationPage() {
       />
     );
   } else if (order) {
-    const isConfirmed = order.status === 'confirmed' && order.paymentStatus === 'paid';
+    // Paid and accepted — including once the organization has started on it.
+    const isConfirmed = isPaymentConfirmedStatus(order.status) && order.paymentStatus === 'paid';
     const needsPayment = order.status === 'pending_payment' && order.paymentStatus === 'pending';
     const verifyFailed = notice?.kind === 'verify_failed';
     const noticeText = notice ? paymentNoticeText(notice) : null;
@@ -103,7 +113,7 @@ export function CustomerOrderConfirmationPage() {
             <Badge tone="success" className="self-start">
               {ORDER_STATUS_LABEL[order.status]}
             </Badge>
-            <p className="text-sm text-text">Payment successful. Your order is confirmed.</p>
+            <p className="text-sm text-text">{PAID_ORDER_MESSAGE[order.status]}</p>
           </Card>
         ) : (
           <Card

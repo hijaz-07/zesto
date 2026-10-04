@@ -154,9 +154,16 @@ endpoint (see [http-api.md](./http-api.md#explore-public-customer-discovery))
 ### Order
 A customer's pre-order against a specific `Menu`. An `Order` records
 who placed it, which `Outlet`/`Menu` it belongs to, its current
-status (e.g. placed, paid, ready, collected, cancelled), and the line
-items that make it up. Order ownership and status are never trusted
-from the frontend — they are validated server-side.
+status, and the line items that make it up. Order ownership and status
+are never trusted from the frontend — they are validated server-side.
+
+Status today is `pending_payment` → `confirmed` (set only by a verified
+payment) → `preparing` → `ready` (set by an active organization member
+through the explicit fulfillment actions), or `cancelled`. `ready` and
+`cancelled` are terminal for now; collection (`picked_up`) and the
+cancellation workflow are later features. The fulfillment transitions,
+and who may make them, are in
+[http-api.md](./http-api.md#organization-order-fulfillment).
 
 ### OrderItem
 A single line within an `Order`: a reference to the `MenuItem`

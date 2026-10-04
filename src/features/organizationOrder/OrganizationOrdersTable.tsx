@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { Badge } from '../../components/ui/Badge';
 import { Card } from '../../components/ui/Card';
 import { formatPaiseAsRupees } from '../../utils/currency';
@@ -7,6 +8,12 @@ import type { OrganizationOrderSummary } from './types';
 
 export interface OrganizationOrdersTableProps {
   orders: OrganizationOrderSummary[];
+  /**
+   * What goes in each row's trailing "Action" cell. Omit it for a read-only
+   * table: the column is then not rendered at all (a person who may not act on
+   * orders is not shown an empty column).
+   */
+  renderActions?: (order: OrganizationOrderSummary) => ReactNode;
 }
 
 const HEADER_CELL = 'px-4 py-3 font-medium';
@@ -21,11 +28,13 @@ const HEADER_CELL = 'px-4 py-3 font-medium';
  * dashboard shows none. On narrow screens the table scrolls sideways rather than
  * dropping columns.
  */
-export function OrganizationOrdersTable({ orders }: OrganizationOrdersTableProps) {
+export function OrganizationOrdersTable({ orders, renderActions }: OrganizationOrdersTableProps) {
   return (
     <Card className="overflow-hidden p-0">
       <div className="overflow-x-auto">
-        <table className="w-full min-w-[56rem] border-collapse text-left text-sm">
+        <table
+          className={`w-full ${renderActions ? 'min-w-[66rem]' : 'min-w-[56rem]'} border-collapse text-left text-sm`}
+        >
           <caption className="sr-only">Orders, newest first</caption>
           <thead className="border-b border-border bg-background text-xs uppercase tracking-wide text-muted">
             <tr>
@@ -53,11 +62,16 @@ export function OrganizationOrdersTable({ orders }: OrganizationOrdersTableProps
               <th scope="col" className={HEADER_CELL}>
                 Status
               </th>
+              {renderActions && (
+                <th scope="col" className={HEADER_CELL}>
+                  Action
+                </th>
+              )}
             </tr>
           </thead>
           <tbody>
             {orders.map((order) => (
-              <OrderRow key={order.id} order={order} />
+              <OrderRow key={order.id} order={order} renderActions={renderActions} />
             ))}
           </tbody>
         </table>
@@ -66,7 +80,13 @@ export function OrganizationOrdersTable({ orders }: OrganizationOrdersTableProps
   );
 }
 
-function OrderRow({ order }: { order: OrganizationOrderSummary }) {
+function OrderRow({
+  order,
+  renderActions,
+}: {
+  order: OrganizationOrderSummary;
+  renderActions?: (order: OrganizationOrderSummary) => ReactNode;
+}) {
   const payment = organizationOrderPaymentBadge(order);
   const status = organizationOrderStatusBadge(order);
   const portions = order.itemCount === 1 ? '1 item' : `${order.itemCount} items`;
@@ -108,6 +128,7 @@ function OrderRow({ order }: { order: OrganizationOrderSummary }) {
       <td className="px-4 py-3">
         <Badge tone={status.tone}>{status.label}</Badge>
       </td>
+      {renderActions && <td className="px-4 py-3">{renderActions(order)}</td>}
     </tr>
   );
 }

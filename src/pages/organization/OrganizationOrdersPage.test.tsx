@@ -2,8 +2,12 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getOutlets } from '../../features/outlet/api';
-import { listOrganizationOrders } from '../../features/organizationOrder/api';
-import type { OrganizationOrdersPage as OrdersPage } from '../../features/organizationOrder/types';
+import type { OrganizationMemberRole } from '../../domain/types';
+import { listOrganizationOrders, runFulfillmentAction } from '../../features/organizationOrder/api';
+import type {
+  OrganizationOrdersPage as OrdersPage,
+  OrganizationOrderSummary,
+} from '../../features/organizationOrder/types';
 import { ApiError } from '../../lib/api/client';
 import { FakeIntersectionObserver } from '../../test/fakeIntersectionObserver';
 import {
@@ -13,6 +17,8 @@ import {
   manyOrgOrders,
   orgOutlets,
   pendingOrgOrder,
+  preparingOrgOrder,
+  readyOrgOrder,
 } from '../../test/organizationOrderFixtures';
 import { OrganizationOrdersPage } from './OrganizationOrdersPage';
 
@@ -20,18 +26,37 @@ vi.mock('../../features/organizationOrder/api');
 vi.mock('../../features/outlet/api');
 
 const mockedList = vi.mocked(listOrganizationOrders);
+const mockedRunAction = vi.mocked(runFulfillmentAction);
 const mockedGetOutlets = vi.mocked(getOutlets);
 
 function page(orders: OrdersPage['orders'], nextCursor: string | null = null): OrdersPage {
   return { orders, nextCursor };
 }
 
-function renderPage(organizationId = 'org-1') {
+/** A promise the test settles by hand, to hold a request in flight. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function renderPage(organizationId = 'org-1', role: OrganizationMemberRole = 'owner') {
   return render(
     <MemoryRouter initialEntries={['/org/orders']}>
-      <OrganizationOrdersPage organizationId={organizationId} />
+      <OrganizationOrdersPage organizationId={organizationId} role={role} />
     </MemoryRouter>,
   );
+}
+
+/** The table row of the order with this id. */
+function rowOf(orderId: string): HTMLElement {
+  const row = screen.getByText(`#${orderId}`).closest('tr');
+  if (!row) {
+    throw new Error(`no row for ${orderId}`);
+  }
+  return row;
 }
 
 function filter() {
@@ -46,6 +71,7 @@ function bodyRows() {
 describe('OrganizationOrdersPage', () => {
   beforeEach(() => {
     mockedList.mockReset();
+    mockedRunAction.mockReset();
     mockedGetOutlets.mockReset();
     mockedGetOutlets.mockResolvedValue({ outlets: orgOutlets });
     FakeIntersectionObserver.install();
@@ -683,6 +709,450 @@ describe('OrganizationOrdersPage', () => {
       unmount();
 
       expect(FakeIntersectionObserver.live()).toHaveLength(0);
+    });
+  });
+
+  describe('fulfillment actions', () => {
+    /** A promise the test settles by hand, to hold a request in flight. */
+    function pendingAction() {
+      let resolve!: (order: OrganizationOrderSummary) => void;
+      let reject!: (error: unknown) => void;
+      const promise = new Promise<OrganizationOrderSummary>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      mockedRunAction.mockReturnValueOnce(promise);
+      return { resolve, reject };
+    }
+
+    // What the backend answers when `order-confirmed-1` is started: the same order, now preparing.
+    const startedOrder: OrganizationOrderSummary = { ...preparingOrgOrder, id: confirmedOrgOrder.id };
+
+    describe('which rows offer a button', () => {
+      it('offers "Start preparing" on a confirmed order and "Mark ready" on a preparing one, and nothing else', async () => {
+        mockedList.mockResolvedValue(
+          page([confirmedOrgOrder, preparingOrgOrder, readyOrgOrder, pendingOrgOrder, cancelledOrgOrder]),
+        );
+
+        renderPage();
+        await screen.findByRole('table');
+
+        expect(within(rowOf('order-confirmed-1')).getByRole('button', { name: /Start preparing/ })).toBeInTheDocument();
+        expect(within(rowOf('order-preparing-5')).getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+        for (const id of ['order-ready-6', 'order-pending-2', 'order-cancelled-3']) {
+          expect(within(rowOf(id)).queryByRole('button')).not.toBeInTheDocument();
+        }
+        expect(screen.getAllByRole('button', { name: /Start preparing|Mark ready/ })).toHaveLength(2);
+      });
+
+      it.each(['owner', 'manager', 'staff'] as const)('shows the Action column to an %s', async (role) => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+
+        renderPage('org-1', role);
+        await screen.findByRole('table');
+
+        expect(screen.getByRole('columnheader', { name: 'Action' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Start preparing/ })).toBeInTheDocument();
+      });
+
+      it('shows no Action column and no buttons to a role it does not know (the backend still decides)', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder, preparingOrgOrder]));
+
+        renderPage('org-1', 'visitor' as unknown as OrganizationMemberRole);
+        await screen.findByRole('table');
+
+        expect(screen.queryByRole('columnheader', { name: 'Action' })).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /Start preparing|Mark ready/ })).not.toBeInTheDocument();
+        expect(screen.getAllByRole('columnheader')).toHaveLength(8);
+      });
+
+      it('shows no buttons while loading, or when access to the orders is denied', async () => {
+        mockedList.mockRejectedValue(new ApiError(403, 'permission_denied', 'No.'));
+
+        renderPage();
+
+        await screen.findByRole('alert');
+        expect(screen.queryByRole('button', { name: /Start preparing|Mark ready/ })).not.toBeInTheDocument();
+      });
+    });
+
+    describe('Start preparing', () => {
+      it('asks the backend for exactly that order and action, and nothing else', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        mockedRunAction.mockResolvedValue(startedOrder);
+
+        renderPage('org-9');
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        await waitFor(() => expect(mockedRunAction).toHaveBeenCalledTimes(1));
+        expect(mockedRunAction).toHaveBeenCalledWith('org-9', 'order-confirmed-1', 'start-preparing');
+      });
+
+      it('disables the button while the request is pending, and ignores a second press', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        const action = pendingAction();
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        const busy = await screen.findByRole('button', { name: /Starting…/ });
+        expect(busy).toBeDisabled();
+        fireEvent.click(busy);
+        expect(mockedRunAction).toHaveBeenCalledTimes(1);
+
+        action.resolve(startedOrder);
+        await screen.findByRole('button', { name: /Mark ready/ });
+      });
+
+      it("updates the row from the backend's answer: it becomes Preparing and offers Mark ready, without re-listing", async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder, pendingOrgOrder]));
+        mockedRunAction.mockResolvedValue(startedOrder);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Preparing')).toBeInTheDocument());
+        expect(within(rowOf('order-confirmed-1')).getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+        expect(within(rowOf('order-pending-2')).getByText('Payment pending')).toBeInTheDocument();
+        expect(mockedList).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('treats an already-done repeat (the backend answering 200 with the same state) like any success', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        mockedRunAction.mockResolvedValue(startedOrder);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        expect(await screen.findByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).getByText('Preparing')).toBeInTheDocument();
+      });
+    });
+
+    describe('Mark ready', () => {
+      const alreadyPreparing = page([preparingOrgOrder]);
+
+      it('does not ask the backend until the confirmation is accepted', async () => {
+        mockedList.mockResolvedValue(alreadyPreparing);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark ready/ }));
+
+        expect(screen.getByText('Mark this order ready?')).toBeInTheDocument();
+        expect(screen.getByText("The customer will see it as ready for pickup. This can't be undone.")).toBeInTheDocument();
+        expect(mockedRunAction).not.toHaveBeenCalled();
+      });
+
+      it('sends nothing if the confirmation is cancelled', async () => {
+        mockedList.mockResolvedValue(alreadyPreparing);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark ready/ }));
+        fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+
+        expect(mockedRunAction).not.toHaveBeenCalled();
+        expect(screen.queryByText('Mark this order ready?')).not.toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+      });
+
+      it('asks the backend once confirmed, disables the buttons meanwhile, then shows the order as Ready with no action', async () => {
+        mockedList.mockResolvedValue(alreadyPreparing);
+        const action = pendingAction();
+
+        renderPage('org-9');
+        fireEvent.click(await screen.findByRole('button', { name: /Mark ready/ }));
+        fireEvent.click(screen.getByRole('button', { name: 'Yes, mark ready' }));
+
+        expect(mockedRunAction).toHaveBeenCalledWith('org-9', 'order-preparing-5', 'mark-ready');
+        expect(await screen.findByRole('button', { name: 'Marking ready…' })).toBeDisabled();
+        expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+
+        action.resolve({ ...readyOrgOrder, id: 'order-preparing-5' });
+
+        await waitFor(() => expect(within(rowOf('order-preparing-5')).getByText('Ready')).toBeInTheDocument());
+        expect(within(rowOf('order-preparing-5')).queryByRole('button')).not.toBeInTheDocument();
+        expect(screen.queryByText('Mark this order ready?')).not.toBeInTheDocument();
+      });
+    });
+
+    describe('when the backend refuses', () => {
+      it('on a 409 (the order moved on): says so, and re-reads the list so the row shows the real state', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(new ApiError(409, 'conflict', 'This order is ready, so it can\'t be moved to preparing.'));
+        // Someone else already took it all the way to ready.
+        mockedList.mockResolvedValueOnce(page([{ ...readyOrgOrder, id: 'order-confirmed-1' }]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        const alert = await screen.findByRole('alert');
+        expect(alert).toHaveTextContent('This order has changed since you loaded it. The list has been refreshed.');
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+        await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Ready')).toBeInTheDocument());
+        expect(within(rowOf('order-confirmed-1')).queryByRole('button')).not.toBeInTheDocument();
+      });
+
+      it("on a 409 from Mark ready: closes the confirmation and shows the order's real state", async () => {
+        mockedList.mockResolvedValueOnce(page([preparingOrgOrder]));
+        mockedRunAction.mockRejectedValue(new ApiError(409, 'conflict', 'x'));
+        mockedList.mockResolvedValueOnce(page([readyOrgOrder].map((order) => ({ ...order, id: 'order-preparing-5' }))));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark ready/ }));
+        fireEvent.click(screen.getByRole('button', { name: 'Yes, mark ready' }));
+
+        await waitFor(() => expect(within(rowOf('order-preparing-5')).getByText('Ready')).toBeInTheDocument());
+        expect(screen.queryByText('Mark this order ready?')).not.toBeInTheDocument();
+        expect(screen.getByRole('alert')).toHaveTextContent('This order has changed since you loaded it.');
+      });
+
+      it('on a 404: says the order could not be found and re-reads the list', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(new ApiError(404, 'not_found', 'Order not found.'));
+        mockedList.mockResolvedValueOnce(page([]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        await screen.findByText('No orders yet');
+        expect(mockedList).toHaveBeenCalledTimes(2);
+      });
+
+      it('on a 403: re-reads the list, and when access is really gone shows the access-denied state with no rows or buttons', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder, preparingOrgOrder]));
+        mockedRunAction.mockRejectedValue(new ApiError(403, 'permission_denied', 'You do not have access to this organization.'));
+        mockedList.mockRejectedValueOnce(new ApiError(403, 'permission_denied', 'You do not have access to this organization.'));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        const alert = await screen.findByRole('alert');
+        expect(alert).toHaveTextContent("You don't have access to these orders");
+        expect(screen.queryByRole('table')).not.toBeInTheDocument();
+        expect(screen.queryByText('#order-confirmed-1')).not.toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /Start preparing|Mark ready/ })).not.toBeInTheDocument();
+        expect(mockedList).toHaveBeenCalledTimes(2);
+      });
+
+      it('on a 403 when the list is still readable: keeps the rows, and says the person cannot change this order', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(new ApiError(403, 'permission_denied', 'x'));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent("You don't have access to change this order.");
+        expect(screen.getByText('#order-confirmed-1')).toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).getByText('Confirmed')).toBeInTheDocument();
+      });
+
+      it('on a 503: shows the message, does not re-list, leaves the row as it was, and lets the person try again', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValueOnce(new ApiError(503, 'unavailable', 'x'));
+        mockedRunAction.mockResolvedValueOnce(startedOrder);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent('Zesto is temporarily unavailable.');
+        expect(mockedList).toHaveBeenCalledTimes(1);
+        expect(within(rowOf('order-confirmed-1')).getByText('Confirmed')).toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: /Start preparing/ }));
+
+        await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Preparing')).toBeInTheDocument());
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(mockedRunAction).toHaveBeenCalledTimes(2);
+      });
+
+      it('on a network failure: shows a generic message and keeps the button', async () => {
+        mockedList.mockResolvedValue(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(new TypeError('Failed to fetch'));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong.');
+        expect(screen.getByRole('button', { name: /Start preparing/ })).toBeEnabled();
+      });
+    });
+
+    describe('Refresh and the authoritative state', () => {
+      it("shows the backend's state after Refresh, even where it disagrees with what an action showed", async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockResolvedValue(startedOrder);
+        // By the time of the refresh someone has finished the order.
+        mockedList.mockResolvedValueOnce(page([{ ...readyOrgOrder, id: 'order-confirmed-1' }]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByRole('button', { name: /Mark ready/ });
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+        await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Ready')).toBeInTheDocument());
+        expect(screen.queryByRole('button', { name: /Start preparing|Mark ready/ })).not.toBeInTheDocument();
+      });
+
+      it('keeps working across a Refresh that fails: the updated row stays, and its next action is still offered', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockResolvedValue(startedOrder);
+        mockedList.mockRejectedValueOnce(new ApiError(500, 'internal', 'Something broke on our side.'));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByRole('button', { name: /Mark ready/ });
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+        expect(await screen.findByText(/Couldn't refresh/)).toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).getByText('Preparing')).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+      });
+    });
+
+    describe('a refused action\'s message, once the list is read again', () => {
+      const conflict = new ApiError(409, 'conflict', 'x');
+      const unavailable = new ApiError(503, 'unavailable', 'x');
+      const forbidden = new ApiError(403, 'permission_denied', 'x');
+      const rowAlert = (orderId: string) => within(rowOf(orderId)).getByRole('alert');
+
+      it('stays beside the row the refused action itself re-read, but goes when a later Refresh succeeds', async () => {
+        const laterRefresh = deferred<OrdersPage>();
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(conflict);
+        mockedList.mockResolvedValueOnce(page([{ ...readyOrgOrder, id: 'order-confirmed-1' }]));
+        mockedList.mockReturnValueOnce(laterRefresh.promise);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+
+        // The re-read the 409 asked for has landed — and its explanation is still there.
+        await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Ready')).toBeInTheDocument());
+        expect(rowAlert('order-confirmed-1')).toHaveTextContent('This order has changed since you loaded it.');
+
+        // Pressing Refresh alone does not clear it: only a refresh that succeeds does.
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+        expect(await screen.findByRole('button', { name: 'Refreshing…' })).toBeInTheDocument();
+        expect(rowAlert('order-confirmed-1')).toHaveTextContent('This order has changed since you loaded it.');
+
+        await act(async () => laterRefresh.resolve(page([{ ...readyOrgOrder, id: 'order-confirmed-1' }])));
+
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).getByText('Ready')).toBeInTheDocument();
+      });
+
+      it('goes when access is restored after the refused action turned out to be real access loss', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(forbidden);
+        mockedList.mockRejectedValueOnce(forbidden);
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        expect(await screen.findByRole('alert')).toHaveTextContent("You don't have access to these orders");
+
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+        expect(await screen.findByRole('button', { name: /Start preparing/ })).toBeEnabled();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        expect(screen.queryByText("You don't have access to change this order.")).not.toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).getByText('Confirmed')).toBeInTheDocument();
+      });
+
+      it('goes when the list is read again after access was lost and restored by coming back to the page', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(forbidden);
+        mockedList.mockRejectedValueOnce(forbidden);
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByText("You don't have access to these orders");
+        const observer = FakeIntersectionObserver.live()[0];
+        act(() => observer.emit(false));
+        act(() => observer.emit(true));
+
+        expect(await screen.findByRole('button', { name: /Start preparing/ })).toBeEnabled();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('survives a refresh that fails, and goes when the next one succeeds', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(unavailable);
+        mockedList.mockRejectedValueOnce(new ApiError(500, 'internal', 'boom'));
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByText('Zesto is temporarily unavailable. Please try again in a moment.');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+        await screen.findByText(/Couldn't refresh/);
+        expect(rowAlert('order-confirmed-1')).toHaveTextContent('Zesto is temporarily unavailable.');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+
+        await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+        expect(screen.getByRole('button', { name: /Start preparing/ })).toBeEnabled();
+      });
+
+      it('goes when the page is refreshed by coming back to it', async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(unavailable);
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByRole('alert');
+        const observer = FakeIntersectionObserver.live()[0];
+        act(() => observer.emit(false));
+        act(() => observer.emit(true));
+
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+        await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+      });
+
+      it("is not shown again by a later visit to the outlet it was raised under", async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(unavailable);
+        mockedList.mockResolvedValueOnce(page([pendingOrgOrder]));
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await screen.findByRole('alert');
+        await waitFor(() => expect(filter()).not.toBeDisabled());
+
+        fireEvent.change(filter(), { target: { value: 'outlet-2' } });
+        await screen.findByText('#order-pending-2');
+        fireEvent.change(filter(), { target: { value: '' } });
+
+        expect(await screen.findByRole('button', { name: /Start preparing/ })).toBeEnabled();
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it("shows a second refusal through the re-read it asked for, after the first one's message was cleared", async () => {
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedRunAction.mockRejectedValue(conflict);
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+        mockedList.mockResolvedValueOnce(page([confirmedOrgOrder]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Start preparing/ }));
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+        await screen.findByRole('alert');
+
+        fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(3));
+        await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByRole('button', { name: /Start preparing/ }));
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(4));
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled());
+
+        expect(rowAlert('order-confirmed-1')).toHaveTextContent('This order has changed since you loaded it.');
+      });
     });
   });
 });

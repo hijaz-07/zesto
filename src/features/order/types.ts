@@ -11,7 +11,25 @@ import type { ISODateString } from '../../types/common';
 
 export type OrderId = string;
 
-export type OrderStatus = 'pending_payment' | 'confirmed' | 'cancelled';
+/**
+ * Every status the backend gives an order (functions/src/domain/orders.ts's
+ * `OrderStatus`). `preparing` and `ready` are set by the organization as it
+ * fulfils a paid order; the customer never changes them.
+ */
+export const ORDER_STATUSES = ['pending_payment', 'confirmed', 'preparing', 'ready', 'cancelled'] as const;
+
+export type OrderStatus = (typeof ORDER_STATUSES)[number];
+
+/**
+ * Whether a payment has confirmed an order — it is `confirmed`, or has since
+ * moved on into fulfilment (`preparing`, `ready`). Once the organization starts
+ * work on an order it is no longer `confirmed`, but it is still a paid order,
+ * so anything that asks "has this been paid and accepted?" must use this
+ * rather than comparing with `'confirmed'`.
+ */
+export function isPaymentConfirmedStatus(status: OrderStatus): boolean {
+  return status === 'confirmed' || status === 'preparing' || status === 'ready';
+}
 
 /** `'paid'` is only ever set by the backend, after server-side verification of a Razorpay payment (see ../payment). */
 export type OrderPaymentStatus = 'pending' | 'paid';

@@ -118,11 +118,13 @@ function ctxFor(organizationId: string, query: Record<string, unknown> = {}, hea
 }
 
 describe("createOrganizationOrderRoutes", () => {
-  it("registers exactly GET /organizations/:organizationId/orders", () => {
+  it("registers the order list and exactly the two fulfillment actions", () => {
     const routes = createOrganizationOrderRoutes({db: untouchedDb()});
 
     expect(routes.map((route) => `${route.method} ${route.path}`)).toEqual([
       "GET /organizations/:organizationId/orders",
+      "POST /organizations/:organizationId/orders/:orderId/start-preparing",
+      "POST /organizations/:organizationId/orders/:orderId/mark-ready",
     ]);
   });
 });

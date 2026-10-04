@@ -20,6 +20,8 @@ type OrganizationOrdersState =
   | {
       scope: string;
       status: 'ready';
+      /** The first-page load these rows came from (see `UseOrganizationOrdersResult.loadId`). */
+      loadId: number;
       orders: OrganizationOrderSummary[];
       nextCursor: string | null;
       loadMore: LoadMoreState;
@@ -41,6 +43,14 @@ export interface UseOrganizationOrdersResult {
   refreshing: boolean;
   /** The failure of the last `refresh`, if any; the list on screen is kept, as it was (a 403 aside: see `refresh`). */
   refreshError: unknown;
+  /**
+   * Which first-page load the rows on screen came from: a number that grows with
+   * every load started (initial, retry, refresh, a new outlet filter), so a larger
+   * value means the rows are the server's newer answer. It identifies a *load*,
+   * not a change to the list — "load more" and `replaceOrder` leave it as it was.
+   * 0 while there are no rows on screen (loading, or the error state).
+   */
+  loadId: number;
   /** Re-fetches from the first page, showing the loading state (used after a failed load). */
   retry: () => void;
   /**
@@ -58,8 +68,21 @@ export interface UseOrganizationOrdersResult {
    * and kept if the refresh fails — except for a 403 (access lost), which clears
    * the list and shows the access error instead. A no-op while the first load or
    * another refresh is in flight.
+   *
+   * Returns the `loadId` the rows will carry once the load that answers this call
+   * lands: the new load's, or — for a call that is a no-op — the one already in
+   * flight. A caller that needs to tell "the load I asked for" from any later one
+   * (see `useOrderFulfillment`) compares against it; everyone else ignores it.
    */
-  refresh: () => void;
+  refresh: () => number;
+  /**
+   * Swaps in the backend's own row for an order already on screen — what a
+   * successful fulfilment action returns. The row is the server's answer, never
+   * something the client composed. Ignored if the list isn't loaded, belongs to
+   * another scope, or doesn't contain the order (e.g. the outlet filter changed
+   * while the request was in flight).
+   */
+  replaceOrder: (order: OrganizationOrderSummary) => void;
 }
 
 /**
@@ -90,7 +113,7 @@ export function useOrganizationOrders(
   }, [state]);
 
   const fetchFirstPage = useCallback(
-    (keepListOnError: boolean) => {
+    (keepListOnError: boolean): number => {
       const mine = ++generation.current;
       listOrganizationOrders(organizationId, { outletId: outletId ?? undefined, limit: PAGE_SIZE }).then(
         (page) => {
@@ -98,6 +121,7 @@ export function useOrganizationOrders(
             setState({
               scope,
               status: 'ready',
+              loadId: mine,
               orders: page.orders,
               nextCursor: page.nextCursor,
               loadMore: 'idle',
@@ -135,6 +159,7 @@ export function useOrganizationOrders(
           }
         },
       );
+      return mine;
     },
     [organizationId, outletId, scope],
   );
@@ -153,24 +178,24 @@ export function useOrganizationOrders(
     fetchFirstPage(false);
   }, [fetchFirstPage, scope]);
 
-  const refresh = useCallback(() => {
+  const refresh = useCallback((): number => {
     const current = stateRef.current;
+    // A no-op is answered by the load already in flight, which is always the latest one started.
     if (current.scope !== scope || current.status === 'loading') {
-      return;
+      return generation.current;
     }
     if (current.status === 'error') {
       setState({ scope, status: 'loading' });
-      fetchFirstPage(false);
-      return;
+      return fetchFirstPage(false);
     }
     if (current.refreshing) {
-      return;
+      return generation.current;
     }
     const refreshing: OrganizationOrdersState = { ...current, refreshing: true, refreshError: null };
     // Recorded now, not on the next render, so a second tap before React re-renders is still a no-op.
     stateRef.current = refreshing;
     setState(refreshing);
-    fetchFirstPage(true);
+    return fetchFirstPage(true);
   }, [fetchFirstPage, scope]);
 
   const loadMore = useCallback(() => {
@@ -237,6 +262,22 @@ export function useOrganizationOrders(
     );
   }, [organizationId, outletId, scope]);
 
+  const replaceOrder = useCallback(
+    (updated: OrganizationOrderSummary) => {
+      setState((previous) => {
+        if (
+          previous.scope !== scope ||
+          previous.status !== 'ready' ||
+          !previous.orders.some((order) => order.id === updated.id)
+        ) {
+          return previous;
+        }
+        return { ...previous, orders: previous.orders.map((order) => (order.id === updated.id ? updated : order)) };
+      });
+    },
+    [scope],
+  );
+
   // A state loaded for another scope is not this scope's data: show loading until the new fetch lands.
   const view: OrganizationOrdersState = state.scope === scope ? state : { scope, status: 'loading' };
 
@@ -249,8 +290,10 @@ export function useOrganizationOrders(
     loadMoreError: view.status === 'ready' ? view.loadMoreError : null,
     refreshing: view.status === 'ready' && view.refreshing,
     refreshError: view.status === 'ready' ? view.refreshError : null,
+    loadId: view.status === 'ready' ? view.loadId : 0,
     retry,
     loadMore,
     refresh,
+    replaceOrder,
   };
 }

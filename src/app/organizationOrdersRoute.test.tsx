@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AuthProvider } from '../features/auth/AuthProvider';
 import { getOutlets } from '../features/outlet/api';
-import { listOrganizationOrders } from '../features/organizationOrder/api';
+import { listOrganizationOrders, runFulfillmentAction } from '../features/organizationOrder/api';
 import { descopeMock } from '../test/mockDescopeSdk';
 import { confirmedOrgOrder, orgOutlets, pendingOrgOrder } from '../test/organizationOrderFixtures';
 import { AppRoutes } from './routes';
@@ -19,6 +19,7 @@ vi.mock('../features/outlet/api');
 vi.mock('../features/organizationOrder/api');
 
 const mockedList = vi.mocked(listOrganizationOrders);
+const mockedRunAction = vi.mocked(runFulfillmentAction);
 const mockedGetOutlets = vi.mocked(getOutlets);
 
 function membership(role: 'owner' | 'manager' | 'staff') {
@@ -79,6 +80,7 @@ describe('/org/orders inside the organization shell', { timeout: 30_000 }, () =>
     vi.stubEnv('VITE_DESCOPE_PROJECT_ID', 'P-test-project');
     getOrganizationsMock.mockReset();
     mockedList.mockReset();
+    mockedRunAction.mockReset();
     mockedGetOutlets.mockReset();
     mockedGetOutlets.mockResolvedValue({ outlets: orgOutlets });
     mockedList.mockResolvedValue({ orders: [confirmedOrgOrder, pendingOrgOrder], nextCursor: null });
@@ -89,9 +91,10 @@ describe('/org/orders inside the organization shell', { timeout: 30_000 }, () =>
     vi.unstubAllGlobals();
   });
 
-  // The page does not branch on the member's role — the backend decides who may
-  // read orders (owner/manager/staff alike; see the backend's authorization
-  // tests) — so one mount through the real route is enough here.
+  // Reading orders does not depend on the member's role — the backend decides who
+  // may read them (owner/manager/staff alike; see the backend's authorization
+  // tests). The role only decides whether the fulfilment buttons are shown (see
+  // the last test here); the backend re-checks it on every action regardless.
   it("shows the orders page to a member, loading the organization from the member's own membership", async () => {
     getOrganizationsMock.mockResolvedValue({ organizations: [membership('owner')] });
 
@@ -139,6 +142,22 @@ describe('/org/orders inside the organization shell', { timeout: 30_000 }, () =>
     ).toBeInTheDocument();
     expect(mockedList).toHaveBeenCalledWith('org-1', { outletId: undefined, limit: 20 });
   });
+
+  it.each(['owner', 'manager', 'staff'] as const)(
+    "gives an %s the fulfilment action, sent for the organization of the member's own membership",
+    async (role) => {
+      getOrganizationsMock.mockResolvedValue({ organizations: [membership(role)] });
+      mockedRunAction.mockResolvedValue({ ...confirmedOrgOrder, status: 'preparing' });
+
+      renderRoutesAt('/org/orders?organizationId=org-attacker');
+      const button = await screen.findByRole('button', { name: /Start preparing/ }, SHELL_RENDER_WAIT);
+      fireEvent.click(button);
+
+      await waitFor(() => expect(mockedRunAction).toHaveBeenCalledTimes(1));
+      expect(mockedRunAction).toHaveBeenCalledWith('org-1', 'order-confirmed-1', 'start-preparing');
+      expect(await screen.findByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+    },
+  );
 
   it('sends a signed-out visitor to /login without requesting any orders', async () => {
     descopeMock.reset();

@@ -5,6 +5,8 @@ import {
   confirmedOrgOrder,
   longOrgOrder,
   pendingOrgOrder,
+  preparingOrgOrder,
+  readyOrgOrder,
 } from '../../test/organizationOrderFixtures';
 import { OrganizationOrdersTable } from './OrganizationOrdersTable';
 import type { OrganizationOrderSummary } from './types';
@@ -115,6 +117,49 @@ describe('OrganizationOrdersTable', () => {
     renderTable([confirmedOrgOrder]);
 
     expect(screen.queryByText(/more$/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['preparing', preparingOrgOrder, 'Preparing'],
+    ['ready', readyOrgOrder, 'Ready'],
+  ])('shows the %s status badge (and Paid) for a paid, fulfilled order', (_name, order, label) => {
+    renderTable([order]);
+
+    const cells = within(bodyRows()[0]).getAllByRole('cell');
+    expect(cells[6]).toHaveTextContent('Paid');
+    expect(cells[7]).toHaveTextContent(label);
+  });
+
+  describe('the optional Action column', () => {
+    it('is not rendered at all when no renderActions is given', () => {
+      renderTable([confirmedOrgOrder]);
+
+      expect(screen.queryByRole('columnheader', { name: 'Action' })).not.toBeInTheDocument();
+      expect(within(bodyRows()[0]).getAllByRole('cell')).toHaveLength(8);
+    });
+
+    it('adds a trailing "Action" column after Status when renderActions is given', () => {
+      render(<OrganizationOrdersTable orders={[confirmedOrgOrder]} renderActions={() => <span>act</span>} />);
+
+      const headers = screen.getAllByRole('columnheader').map((header) => header.textContent);
+      expect(headers).toHaveLength(9);
+      expect(headers[7]).toBe('Status');
+      expect(headers[8]).toBe('Action');
+    });
+
+    it("renders each order's own actions in its own row's last cell", () => {
+      render(
+        <OrganizationOrdersTable
+          orders={[confirmedOrgOrder, preparingOrgOrder]}
+          renderActions={(order) => <button type="button">Do it to {order.id}</button>}
+        />,
+      );
+
+      const rows = bodyRows();
+      const lastCell = (row: HTMLElement) => within(row).getAllByRole('cell')[8];
+      expect(within(lastCell(rows[0])).getByRole('button')).toHaveTextContent('Do it to order-confirmed-1');
+      expect(within(lastCell(rows[1])).getByRole('button')).toHaveTextContent('Do it to order-preparing-5');
+    });
   });
 
   it('falls back gracefully when the outlet or menu no longer exists', () => {

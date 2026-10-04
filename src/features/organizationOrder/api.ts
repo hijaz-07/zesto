@@ -1,6 +1,7 @@
 import type { OrganizationId, OutletId } from '../../domain/types';
-import { apiFetch } from '../../lib/api/client';
-import type { OrganizationOrdersPage } from './types';
+import { ApiError, apiFetch } from '../../lib/api/client';
+import type { FulfillmentAction } from './fulfillment';
+import type { OrganizationOrdersPage, OrganizationOrderSummary } from './types';
 
 export interface ListOrganizationOrdersParams {
   /** Narrows the list to one outlet. A requested filter only: the backend verifies it belongs to the organization. */
@@ -35,4 +36,31 @@ export function listOrganizationOrders(
   const queryString = query.toString();
   const path = `/organizations/${organizationId}/orders`;
   return apiFetch<OrganizationOrdersPage>(queryString ? `${path}?${queryString}` : path);
+}
+
+/**
+ * Asks the backend to move an order along
+ * (`POST /organizations/{organizationId}/orders/{orderId}/start-preparing` or
+ * `.../mark-ready`). Sends NO body: the action is in the URL, and everything
+ * else — the order's current state, whether it is paid, who is acting, whether
+ * they may — is decided by the backend. Resolves with the order's row as it
+ * stands afterwards (the same shape the list returns); an action whose result
+ * already holds resolves too, unchanged. A refusal rejects with the
+ * `ApiError`: 403 (no access), 404 (no such order here), 409 (the order is not
+ * in a state this can act on).
+ */
+export async function runFulfillmentAction(
+  organizationId: OrganizationId,
+  orderId: string,
+  action: FulfillmentAction,
+): Promise<OrganizationOrderSummary> {
+  const data = await apiFetch<{ order?: OrganizationOrderSummary } | undefined>(
+    `/organizations/${encodeURIComponent(organizationId)}/orders/${encodeURIComponent(orderId)}/${action}`,
+    { method: 'POST' },
+  );
+  // A row for some other order must never be swapped into this one's place.
+  if (!data?.order || data.order.id !== orderId) {
+    throw new ApiError(200, 'invalid_response', 'The server returned a response in an unexpected shape.');
+  }
+  return data.order;
 }

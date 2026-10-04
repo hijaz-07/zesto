@@ -22,6 +22,22 @@ export const confirmedSummary: OrderSummary = {
   updatedAt: '2026-09-28T10:35:00+05:30',
 };
 
+/** A paid order the organization has started preparing. */
+export const preparingSummary: OrderSummary = {
+  ...confirmedSummary,
+  id: 'order-preparing',
+  status: 'preparing',
+  updatedAt: '2026-09-28T10:40:00+05:30',
+};
+
+/** A paid order the organization has marked ready for pickup. */
+export const readySummary: OrderSummary = {
+  ...confirmedSummary,
+  id: 'order-ready',
+  status: 'ready',
+  updatedAt: '2026-09-28T10:50:00+05:30',
+};
+
 /** An order still waiting for payment. */
 export const pendingSummary: OrderSummary = {
   ...confirmedSummary,

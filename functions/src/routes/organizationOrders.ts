@@ -12,8 +12,14 @@ import {
   type VerifiedSession,
 } from "../auth/session";
 import {
+  ORDER_FULFILLMENT_ROLES,
+  transitionOrderStatus,
+  type FulfillmentTarget,
+} from "../domain/orderFulfillment";
+import {
   listOrganizationOrders,
   listOrganizationOrdersQuerySchema,
+  loadOrganizationOrderSummary,
 } from "../domain/organizationOrders";
 import type {
   ApiResult,
@@ -31,19 +37,27 @@ export interface OrganizationOrdersRouteDeps {
 /**
  * Roles that may view the organization's orders: every active member,
  * including staff — the same set that may view outlets, menus, and menu
- * items. This checkpoint's order access is read-only; there is deliberately no
- * order-mutating route here, so no manage-roles set exists yet.
+ * items. The roles that may change an order's fulfillment state are a separate
+ * set, `ORDER_FULFILLMENT_ROLES`, defined with the transition itself (it
+ * happens to be the same three roles today, but they are different decisions).
  */
 const VIEW_ROLES: readonly OrganizationMemberRole[] =
   ["owner", "manager", "staff"];
 
 /**
  * Builds the routes for `/organizations/{organizationId}/orders` — the
- * organization-side, read-only counterpart of the customer's `GET /orders`
- * (see `routes/orders.ts`). Unlike that identity-scoped endpoint, this one is
- * tenant-scoped like `routes/outlets.ts`/`routes/menus.ts`: the organization is
- * named in the path, and what that name is worth is decided by the caller's
- * own active membership, never by the name itself.
+ * organization-side counterpart of the customer's `/orders` (see
+ * `routes/orders.ts`): the order list, and the two fulfillment actions. Unlike
+ * that identity-scoped API, these are tenant-scoped like `routes/outlets.ts`/
+ * `routes/menus.ts`: the organization is named in the path, and what that name
+ * is worth is decided by the caller's own active membership, never by the name
+ * itself.
+ *
+ * The fulfillment actions are explicit, body-less operations — like a menu's
+ * `publish`/`archive` — not a generic "set status": the target comes from the
+ * URL, and everything else (the order's current state, whether it is paid,
+ * who is acting) is read from the server. Both call the same
+ * `transitionOrderStatus`, so the rules exist in exactly one place.
  *
  * @param {OrganizationOrdersRouteDeps} deps The routes' dependencies.
  * @return {RouteDefinition[]} The routes to register with the router.
@@ -56,6 +70,16 @@ export function createOrganizationOrderRoutes(
       method: "GET",
       path: "/organizations/:organizationId/orders",
       handler: (ctx) => handleGetOrganizationOrders(ctx, deps),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/orders/:orderId/start-preparing",
+      handler: (ctx) => handleFulfillmentAction(ctx, deps, "preparing"),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/orders/:orderId/mark-ready",
+      handler: (ctx) => handleFulfillmentAction(ctx, deps, "ready"),
     },
   ];
 }
@@ -154,6 +178,66 @@ async function handleGetOrganizationOrders(
 }
 
 /**
+ * `POST /organizations/{organizationId}/orders/{orderId}/start-preparing` and
+ * `.../mark-ready`: moves a paid order to `preparing` / `ready`. Any active
+ * `owner`/`manager`/`staff` member may do either (`ORDER_FULFILLMENT_ROLES`).
+ * Takes no request body, so there is nothing for a caller to assert: a body or
+ * query string (an `organizationId`, `outletId`, `status`, `userId`, ...) is
+ * never read.
+ *
+ * Authentication, then authorization, run before the order is looked up; the
+ * order is then resolved INSIDE the caller's organization by
+ * `transitionOrderStatus`, so another organization's order is a plain 404.
+ * Repeating an action whose result already holds is a `200` that changes
+ * nothing; any other state the order cannot move from is a `409 conflict`.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrganizationOrdersRouteDeps} deps The route's dependencies.
+ * @param {FulfillmentTarget} to The status this route moves the order into.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with `{order}` — the
+ *   order's row in the same shape the list uses.
+ */
+async function handleFulfillmentAction(
+  ctx: RouteContext,
+  deps: OrganizationOrdersRouteDeps,
+  to: FulfillmentTarget,
+): Promise<ApiResult> {
+  let caller: AuthorizedCaller;
+  try {
+    caller = await authenticateAndAuthorize(ctx, deps, ORDER_FULFILLMENT_ROLES);
+  } catch (error) {
+    return mapKnownError(error);
+  }
+  const {session, membership} = caller;
+
+  try {
+    const result = await transitionOrderStatus(deps.db, {
+      membership,
+      orderId: ctx.params?.orderId,
+      to,
+    });
+    const order = await loadOrganizationOrderSummary(deps.db, result.order);
+    return {
+      kind: "success",
+      status: 200,
+      data: {order},
+      userId: session.userId,
+      logContext: {
+        from: result.previousStatus,
+        to,
+        outcome: result.changed ? "transitioned" : "unchanged",
+      },
+    };
+  } catch (error) {
+    return {
+      ...mapKnownError(error),
+      userId: session.userId,
+      logContext: {to, outcome: "rejected"},
+    };
+  }
+}
+
+/**
  * @param {ZodError} error A failed `safeParse` result's error.
  * @return {string} The first validation issue's message, or a generic
  *   fallback if the error has none.
@@ -165,7 +249,8 @@ function firstZodIssueMessage(error: ZodError): string {
 /**
  * Maps an `HttpsError` thrown by the auth boundary (`authenticateRequest`),
  * the tenant-authorization boundary (`requireOrganizationRole`), or the
- * domain layer (a malformed cursor, an unknown outlet) to its response.
+ * domain layer (a malformed cursor, an unknown outlet or order, a refused
+ * fulfillment transition) to its response.
  * Anything else — including a non-`HttpsError` — is not a known failure, so
  * it is rethrown for the caller's generic 500 handling. Duplicated per route
  * file, matching this codebase's established convention.
@@ -195,6 +280,11 @@ function mapKnownError(error: unknown): ApiResult {
     return {kind: "error", status, code: "permission_denied", message};
   case 404:
     return {kind: "error", status, code: "not_found", message};
+  case 409:
+    // The order is not in a state this action can act on (or changed under
+    // it): a stale or racing request, not a malformed one. Distinct from
+    // `already_exists`, which the other routes use for taken slugs/keys.
+    return {kind: "error", status, code: "conflict", message};
   case 503:
     return {kind: "error", status, code: "unavailable", message};
   default:

@@ -4,9 +4,10 @@
  *
  * It writes outlets, menus, orders and members straight into the Firestore
  * EMULATOR so the dashboard can be checked by hand: pagination (more than 50
- * orders), the outlet filter, paid / pending_payment / cancelled orders, an
- * inactive outlet with historical orders, and a second, unrelated organization
- * whose orders must never show up.
+ * orders), the outlet filter, confirmed / preparing / ready / pending_payment /
+ * cancelled orders (so both fulfillment actions, "Start preparing" and "Mark
+ * ready", have orders to act on), an inactive outlet with historical orders, and
+ * a second, unrelated organization whose orders must never show up.
  *
  * SAFETY: this refuses to run unless FIRESTORE_EMULATOR_HOST is set to a
  * loopback address. With that variable set the Admin SDK talks only to the
@@ -185,9 +186,29 @@ function lcg(seed) {
 const now = Date.now();
 const minutesAgo = (minutes) => Timestamp.fromMillis(now - minutes * 60_000);
 
-function statusFor(index) {
+// Of every 20 orders: 8 confirmed (ready to be started), 2 preparing, 2 ready,
+// 5 awaiting payment, 2 cancelled unpaid, 1 cancelled after being paid. The
+// preparing/ready ones carry the same audit fields the fulfillment transition
+// writes (who and when), so the dashboard can be checked against realistic data.
+function statusFor(index, createdAt) {
   const slot = index % 20;
-  if (slot < 12) return {status: 'confirmed', paymentStatus: 'paid'};
+  const later = (minutes) => Timestamp.fromMillis(createdAt.toMillis() + minutes * 60_000);
+  if (slot < 8) return {status: 'confirmed', paymentStatus: 'paid'};
+  if (slot < 10) {
+    return {
+      status: 'preparing', paymentStatus: 'paid',
+      preparingStartedAt: later(5), preparingStartedBy: 'U-seed-staff',
+      updatedAt: later(5),
+    };
+  }
+  if (slot < 12) {
+    return {
+      status: 'ready', paymentStatus: 'paid',
+      preparingStartedAt: later(5), preparingStartedBy: 'U-seed-staff',
+      readyAt: later(15), readyBy: 'U-seed-staff',
+      updatedAt: later(15),
+    };
+  }
   if (slot < 17) return {status: 'pending_payment', paymentStatus: 'pending'};
   if (slot < 19) return {status: 'cancelled', paymentStatus: 'pending'};
   return {status: 'cancelled', paymentStatus: 'paid'}; // paid, then cancelled
@@ -214,13 +235,14 @@ function buildOrder({organizationId, outlet, index, dishes, customerPool, create
     organizationId,
     outletId: outlet.id,
     menuId: outlet.menuId,
-    ...statusFor(index),
     currency: 'INR',
     subtotalInPaise,
     totalInPaise: subtotalInPaise,
     items: lines,
     createdAt,
     updatedAt: createdAt,
+    // Last, so a fulfilled order's own `updatedAt` replaces the default above.
+    ...statusFor(index, createdAt),
   };
 }
 
@@ -402,7 +424,7 @@ const total = OUTLETS.reduce((sum, outlet) => sum + outlet.orders, 0);
 console.log(`
 Seeded "${organization.slug}" (${organization.id}):
   - ${OUTLETS.length} outlets: ${OUTLETS.map((o) => `${o.name} (${o.status}, ${o.orders} orders)`).join('; ')}
-  - ${total} orders in total (paid, pending_payment and cancelled; one with 13 item lines; four sharing one timestamp)
+  - ${total} orders in total (confirmed, preparing, ready, pending_payment and cancelled; one with 13 item lines; four sharing one timestamp)
   - members: ${SEED_USERS.manager} (manager), ${SEED_USERS.staff} (staff), ${SEED_USERS.invited} (invited), ${SEED_USERS.revoked} (revoked)
 Seeded "${OTHER_ORG.slug}": a second, unrelated organization with ${OTHER_OUTLET.orders} orders.
   Its dish names start with "OTHER-ORG": none of them may ever appear in /org/orders.

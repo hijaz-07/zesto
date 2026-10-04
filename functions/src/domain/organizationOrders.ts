@@ -1,4 +1,5 @@
 import {FieldPath, type Firestore, type Query} from "firebase-admin/firestore";
+import * as logger from "firebase-functions/logger";
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
@@ -138,6 +139,35 @@ export function toOrganizationOrderSummary(
     createdAt: order.createdAt.toDate().toISOString(),
     updatedAt: order.updatedAt.toDate().toISOString(),
   };
+}
+
+/**
+ * The list shape for one order whose outlet and menu names still have to be
+ * looked up — for the fulfillment routes, which answer with the same row the
+ * list shows so the dashboard can swap it in. `order` must already be one the
+ * caller is authorized for (see `transitionOrderStatus`).
+ *
+ * The names are display-only and this is called AFTER the order's write has
+ * committed, so failing to read them must not turn a successful write into an
+ * error response: the row is returned without them (exactly as the list does
+ * for a document that no longer exists) and the failure is logged.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {Order} order An order of the caller's organization.
+ * @return {Promise<OrganizationOrderSummaryResponse>} The organization-facing
+ *   list shape for it.
+ */
+export async function loadOrganizationOrderSummary(
+  db: Firestore,
+  order: Order,
+): Promise<OrganizationOrderSummaryResponse> {
+  try {
+    const {outlets, menus} = await loadOrderContext(db, [order]);
+    return toOrganizationOrderSummary(order, outlets.get(order.outletId), menus.get(order.menuId));
+  } catch (error) {
+    logger.warn("Could not read outlet/menu names for an order summary.", {orderId: order.id, error});
+    return toOrganizationOrderSummary(order, undefined, undefined);
+  }
 }
 
 /**

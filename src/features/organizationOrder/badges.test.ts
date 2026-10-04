@@ -7,13 +7,15 @@ describe('organizationOrderStatusBadge', () => {
   it.each([
     ['pending_payment', 'pending', 'Payment pending', 'warning'],
     ['confirmed', 'paid', 'Confirmed', 'success'],
+    ['preparing', 'paid', 'Preparing', 'warning'],
+    ['ready', 'paid', 'Ready', 'success'],
     ['cancelled', 'pending', 'Cancelled', 'danger'],
   ] as const)('maps %s to "%s" label/tone', (status, paymentStatus, label, tone) => {
     expect(organizationOrderStatusBadge({ status, paymentStatus })).toEqual({ label, tone });
   });
 
   it("is always the label and tone the customer's own list shows for the same order", () => {
-    const statuses: OrderStatus[] = ['pending_payment', 'confirmed', 'cancelled'];
+    const statuses: OrderStatus[] = ['pending_payment', 'confirmed', 'preparing', 'ready', 'cancelled'];
     const payments: OrderPaymentStatus[] = ['pending', 'paid'];
     for (const status of statuses) {
       for (const paymentStatus of payments) {
@@ -27,6 +29,13 @@ describe('organizationOrderStatusBadge', () => {
 describe('organizationOrderPaymentBadge', () => {
   it('shows Paid (success) whenever the backend says the order is paid', () => {
     expect(organizationOrderPaymentBadge({ status: 'confirmed', paymentStatus: 'paid' })).toEqual({
+      label: 'Paid',
+      tone: 'success',
+    });
+  });
+
+  it.each(['preparing', 'ready'] as const)('shows Paid (success) for a %s order', (status) => {
+    expect(organizationOrderPaymentBadge({ status, paymentStatus: 'paid' })).toEqual({
       label: 'Paid',
       tone: 'success',
     });

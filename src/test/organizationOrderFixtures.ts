@@ -23,6 +23,22 @@ export const confirmedOrgOrder: OrganizationOrderSummary = {
   updatedAt: '2026-09-28T10:35:00+05:30',
 };
 
+/** A paid order the organization has started preparing, as the list/action endpoints return it. */
+export const preparingOrgOrder: OrganizationOrderSummary = {
+  ...confirmedOrgOrder,
+  id: 'order-preparing-5',
+  status: 'preparing',
+  updatedAt: '2026-09-28T10:40:00+05:30',
+};
+
+/** A paid order the organization has marked ready for pickup. */
+export const readyOrgOrder: OrganizationOrderSummary = {
+  ...confirmedOrgOrder,
+  id: 'order-ready-6',
+  status: 'ready',
+  updatedAt: '2026-09-28T10:50:00+05:30',
+};
+
 /** An order still waiting for payment. */
 export const pendingOrgOrder: OrganizationOrderSummary = {
   ...confirmedOrgOrder,

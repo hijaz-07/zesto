@@ -5,6 +5,8 @@ import {
   confirmedOrder,
   pendingOrder,
   preparedPayment,
+  preparingOrder,
+  readyOrder,
   succeededPayment,
 } from '../../test/paymentFixtures';
 import { isPaymentConfirmed, preparePayment, verifyPayment } from './api';
@@ -142,6 +144,21 @@ describe('verifyPayment', () => {
     expect(result.payment).toEqual(succeededPayment);
   });
 
+  it.each([
+    ['preparing', preparingOrder],
+    ['ready', readyOrder],
+  ])(
+    'parses a replayed verification answered after the organization moved the order on to %s',
+    async (_status, order) => {
+      apiFetchMock.mockResolvedValue({ order, payment: succeededPayment });
+
+      const result = await verifyPayment('order-1', checkoutCallback);
+
+      expect(result.order).toEqual(order);
+      expect(result.payment).toEqual(succeededPayment);
+    },
+  );
+
   it('rejects a response whose order or payment is missing or malformed', async () => {
     apiFetchMock.mockResolvedValueOnce({ order: confirmedOrder });
     await expect(verifyPayment('order-1', checkoutCallback)).rejects.toMatchObject({ code: 'invalid_response' });
@@ -168,6 +185,24 @@ describe('verifyPayment', () => {
 describe('isPaymentConfirmed', () => {
   it('is true only when the payment succeeded and the order is confirmed and paid', () => {
     expect(isPaymentConfirmed({ order: confirmedOrder, payment: succeededPayment }, 'order-1')).toBe(true);
+  });
+
+  it.each([
+    ['preparing', preparingOrder],
+    ['ready', readyOrder],
+  ])('is still true once the organization has moved the paid order on to %s (a replayed verification)', (_status, order) => {
+    expect(isPaymentConfirmed({ order, payment: succeededPayment }, 'order-1')).toBe(true);
+  });
+
+  it.each([
+    ['preparing', { ...preparingOrder, paymentStatus: 'pending' as const }],
+    ['ready', { ...readyOrder, paymentStatus: 'pending' as const }],
+  ])('is false for a %s order that is not paid', (_status, order) => {
+    expect(isPaymentConfirmed({ order, payment: succeededPayment }, 'order-1')).toBe(false);
+  });
+
+  it('is false for a preparing order whose payment did not succeed', () => {
+    expect(isPaymentConfirmed({ order: preparingOrder, payment: { ...succeededPayment, status: 'failed' } }, 'order-1')).toBe(false);
   });
 
   it.each([

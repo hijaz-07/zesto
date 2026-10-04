@@ -14,6 +14,8 @@ import {
   FakeRazorpay,
   pendingOrder,
   preparedPayment,
+  preparingOrder,
+  readyOrder,
   succeededPayment,
 } from '../../test/paymentFixtures';
 import { CustomerOrderConfirmationPage } from './CustomerOrderConfirmationPage';
@@ -485,6 +487,54 @@ describe('CustomerOrderConfirmationPage — payment', () => {
     await waitFor(() => expect(screen.getByText('Cancelled')).toBeInTheDocument());
     expect(screen.queryByRole('button', { name: /pay/i })).not.toBeInTheDocument();
     expect(screen.queryByText('Payment required')).not.toBeInTheDocument();
+  });
+
+  describe('once the organization has started on a paid order', () => {
+    it.each([
+      ['preparingOrder', preparingOrder, 'Preparing', "Payment successful. We're preparing your order."],
+      ['readyOrder', readyOrder, 'Ready for pickup', 'Payment successful. Your order is ready for pickup.'],
+    ])('shows a %s as confirmed and paid, with its own status, and no way to pay again', async (_name, fulfilled, label, message) => {
+      mockedGetOrder.mockResolvedValue({ order: fulfilled });
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText('Order confirmed')).toBeInTheDocument());
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByText(message)).toBeInTheDocument();
+      expect(screen.getByText('Paid')).toBeInTheDocument();
+      expect(screen.queryByText('Payment required')).not.toBeInTheDocument();
+      expect(screen.queryByText('Pay to confirm your order.')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /pay/i })).not.toBeInTheDocument();
+      expect(mockedPreparePayment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['preparingOrder', preparingOrder, 'Preparing'],
+      ['readyOrder', readyOrder, 'Ready for pickup'],
+    ])('treats a verification replay answered with a %s as the payment succeeding, not as a failure', async (_name, fulfilled, label) => {
+      // The customer's own browser verifies late (or a second time) after the
+      // server already confirmed the payment and the organization moved on.
+      mockedVerifyPayment.mockResolvedValue({ order: fulfilled, payment: succeededPayment });
+      await renderPendingOrder();
+      await openCheckout();
+
+      act(() => FakeRazorpay.last.succeed());
+
+      await waitFor(() => expect(screen.getByText('Order confirmed')).toBeInTheDocument());
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.queryByText(/couldn't verify|could not verify|verification/i)).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /pay|retry/i })).not.toBeInTheDocument();
+    });
+
+    it('does not show a pending-payment order as fulfilled', async () => {
+      mockedGetOrder.mockResolvedValue({ order: pendingOrder });
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText('Payment required')).toBeInTheDocument());
+      expect(screen.queryByText('Preparing')).not.toBeInTheDocument();
+      expect(screen.queryByText('Ready for pickup')).not.toBeInTheDocument();
+    });
   });
 
   it('never renders anything secret-shaped in any payment state', async () => {
