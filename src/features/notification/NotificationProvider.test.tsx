@@ -374,3 +374,129 @@ describe('NotificationProvider — scope', () => {
     expect(mockedGetUnreadCount).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('NotificationProvider — the visibility throttle', () => {
+  /** Hide the page and show it again `awayMs` later, as a real return to the tab does. */
+  async function returnToPage(awayMs: number) {
+    setVisibility('hidden');
+    await advance(awayMs);
+    setVisibility('visible');
+    await flush();
+  }
+
+  /** Every read's start time, in ms since the first read. */
+  function recordReadTimes(): number[] {
+    const times: number[] = [];
+    let first: number | null = null;
+    mockedGetUnreadCount.mockImplementation(async () => {
+      first = first ?? Date.now();
+      times.push(Date.now() - first);
+      return 1;
+    });
+    return times;
+  }
+
+  it('a return to the page after the throttle window reads once, straight away', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    await returnToPage(12_000);
+
+    expect(times).toEqual([0, 12_000]);
+  });
+
+  it('a return inside the window of the last read does not read again', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    await returnToPage(3_000);
+
+    expect(times).toEqual([0]);
+  });
+
+  it('the window is 10 s measured from the last read: 9.9 s is too soon, exactly 10 s is allowed', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    await returnToPage(9_900);
+    expect(times).toEqual([0]);
+
+    // The page was hidden for 9.9 s above; hiding it for another 100 ms makes it 10.0 s since the read.
+    await returnToPage(100);
+    expect(times).toEqual([0, 10_000]);
+  });
+
+  it('repeated visibility flapping (a hidden/visible pair every 6 s) never reads twice within 10 s', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    for (let flap = 0; flap < 10; flap++) {
+      await returnToPage(6_000);
+    }
+
+    // Without the throttle this would be 11 reads, one per flap; now it is one every other flap.
+    expect(times).toEqual([0, 12_000, 24_000, 36_000, 48_000, 60_000]);
+    const gaps = times.slice(1).map((time, index) => time - times[index]);
+    expect(Math.min(...gaps)).toBeGreaterThanOrEqual(10_000);
+  });
+
+  it('a throttled return does not lose the poll beat: the next read still comes 30 s after the last one', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    await returnToPage(3_000); // skipped (3 s after the read at 0)
+    await advance(NOTIFICATION_POLL_MS - 3_000 - 1);
+    expect(times).toEqual([0]);
+
+    await advance(1);
+
+    expect(times).toEqual([0, NOTIFICATION_POLL_MS]);
+    // …and the beat carries on from there.
+    await advance(NOTIFICATION_POLL_MS);
+    expect(times).toEqual([0, NOTIFICATION_POLL_MS, NOTIFICATION_POLL_MS * 2]);
+  });
+
+  it('a flicker that ends hidden leaves no timer running', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    setVisibility('hidden');
+    await advance(2_000);
+    setVisibility('visible'); // throttled: re-arms the beat…
+    setVisibility('hidden'); // …and this clears it again
+    await advance(NOTIFICATION_POLL_MS * 5);
+
+    expect(times).toEqual([0]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('an explicit refresh is never throttled, and it starts the window itself', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+    await advance(2_000);
+
+    fireEvent.click(screen.getByText('refresh now'));
+    await flush();
+    expect(times).toEqual([0, 2_000]);
+
+    await returnToPage(3_000); // 3 s after that read, so still inside the window
+    expect(times).toEqual([0, 2_000]);
+  });
+
+  it('the ordinary poll beat is unaffected: 30 s apart while the page stays visible', async () => {
+    const times = recordReadTimes();
+    renderProvider();
+    await flush();
+
+    await advance(NOTIFICATION_POLL_MS * 3);
+
+    expect(times).toEqual([0, NOTIFICATION_POLL_MS, NOTIFICATION_POLL_MS * 2, NOTIFICATION_POLL_MS * 3]);
+  });
+});

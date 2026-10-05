@@ -3,6 +3,7 @@ import { listNotifications, markAllNotificationsRead, markNotificationRead } fro
 import { useOptionalNotifications } from './context';
 import { isPermanentNotificationFailure, markReadErrorMessage, markReadNeedsRefresh } from './errors';
 import type { AppNotification, NotificationFilter, NotificationId, NotificationScope } from './types';
+import { visibilityRefreshAllowed } from './visibilityThrottle';
 
 /** A page-size hint; the backend applies its own default (20) and hard maximum (50). */
 const PAGE_SIZE = 20;
@@ -103,6 +104,8 @@ export function useNotifications(scope: NotificationScope, filter: NotificationF
   const [markAllHasMore, setMarkAllHasMore] = useState(false);
   const generation = useRef(0);
   const mounted = useRef(true);
+  // When the last first-page read started, for the visibility throttle (see `visibilityThrottle.ts`).
+  const lastFetchAt = useRef(-Infinity);
   // A layout effect, not a passive one: it runs inside the commit itself, so a tap
   // on a button that has just rendered can never see the state from before it.
   const stateRef = useRef(state);
@@ -113,6 +116,7 @@ export function useNotifications(scope: NotificationScope, filter: NotificationF
   const fetchFirstPage = useCallback(
     (keepListOnError: boolean) => {
       const mine = ++generation.current;
+      lastFetchAt.current = Date.now();
       listNotifications(stableScope.current, { limit: PAGE_SIZE, unread: unreadOnly }).then(
         (page) => {
           if (generation.current === mine) {
@@ -182,7 +186,9 @@ export function useNotifications(scope: NotificationScope, filter: NotificationF
   // Coming back to the tab/window: the list may have moved while the person was away.
   useEffect(() => {
     function onVisibilityChange() {
-      if (document.visibilityState !== 'hidden') {
+      // Throttled like the unread-count poller: a flickering visibility signal must not
+      // send a list request every time it flips back to visible.
+      if (document.visibilityState !== 'hidden' && visibilityRefreshAllowed(lastFetchAt.current, Date.now())) {
         refresh();
       }
     }

@@ -3,6 +3,7 @@ import { getUnreadCount } from './api';
 import { NotificationContext, type NotificationContextValue, type NotificationPollStop } from './context';
 import { isPermanentNotificationFailure } from './errors';
 import type { NotificationScope } from './types';
+import { visibilityRefreshAllowed } from './visibilityThrottle';
 import { ApiError } from '../../lib/api/client';
 
 /** How often the unread count is re-read while the page is visible. */
@@ -38,7 +39,11 @@ function scopeKey(scope: NotificationScope): string {
  * - about every `NOTIFICATION_POLL_MS`, only while the page is visible — the
  *   timer is cleared when the tab goes hidden and nothing is requested;
  * - at once when the page becomes visible again (the count may have moved while
- *   the person was away), after which the beat resumes;
+ *   the person was away), after which the beat resumes — unless the last read
+ *   started less than `VISIBILITY_REFRESH_MIN_INTERVAL_MS` ago (see
+ *   `visibilityThrottle.ts`), in which case no read is made and the beat is simply
+ *   re-armed for what is left of its interval, so a flickering visibility signal
+ *   cannot turn into a request per flicker;
  * - on request (`refreshUnreadCount`), e.g. after a notification was marked read.
  *
  * Reads never overlap: the next one is scheduled only after the previous one
@@ -70,6 +75,8 @@ export function NotificationProvider({
     let stopped = false;
     let inFlight = false;
     let again = false;
+    // When the last read started, whatever caused it: the visibility throttle measures from here.
+    let lastReadAt = -Infinity;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
     const isHidden = () => document.visibilityState === 'hidden';
@@ -77,10 +84,10 @@ export function NotificationProvider({
       clearTimeout(timer);
       timer = undefined;
     };
-    const scheduleNextIfVisible = () => {
+    const scheduleNextIfVisible = (delayMs = pollIntervalMs) => {
       stopTimer();
       if (!cancelled && !stopped && !isHidden()) {
-        timer = setTimeout(() => void read(), pollIntervalMs);
+        timer = setTimeout(() => void read(), delayMs);
       }
     };
 
@@ -95,6 +102,7 @@ export function NotificationProvider({
       }
       stopTimer();
       inFlight = true;
+      lastReadAt = Date.now();
       try {
         const unreadCount = await getUnreadCount(effectScope);
         if (cancelled) {
@@ -133,8 +141,19 @@ export function NotificationProvider({
     function onVisibilityChange() {
       if (isHidden()) {
         stopTimer();
-      } else if (timer === undefined && !inFlight) {
+        return;
+      }
+      if (timer !== undefined || inFlight) {
+        return;
+      }
+      const now = Date.now();
+      if (visibilityRefreshAllowed(lastReadAt, now)) {
         void read();
+      } else {
+        // Back so soon after the last read (a flickering pane) that another one would be
+        // noise. Do not read, but do not lose the beat either: the "hidden" just before
+        // this cleared the timer, so re-arm it for what is left of the interval.
+        scheduleNextIfVisible(Math.max(0, pollIntervalMs - (now - lastReadAt)));
       }
     }
 

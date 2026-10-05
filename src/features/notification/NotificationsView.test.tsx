@@ -13,6 +13,7 @@ import {
 import { NotificationProvider } from './NotificationProvider';
 import { NotificationsView, OPEN_READ_GRACE_MS } from './NotificationsView';
 import type { AppNotification, NotificationScope, NotificationsPage } from './types';
+import { VISIBILITY_REFRESH_MIN_INTERVAL_MS } from './visibilityThrottle';
 
 vi.mock('./api');
 
@@ -584,6 +585,26 @@ describe('NotificationsView — opening a notification', () => {
 });
 
 describe('NotificationsView — refreshing', () => {
+  // Only the clock is faked (timers and promises stay real): the visibility throttle measures
+  // from `Date.now()`, and these tests need to say how long the person was away.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+  });
+
+  /**
+   * The tab is hidden and comes back after `awaySeconds` (by default long enough for the throttle to
+   * allow a re-read): a real return is always a "hidden" followed by a "visible".
+   */
+  function returnToPage(awaySeconds = VISIBILITY_REFRESH_MIN_INTERVAL_MS / 1000 + 1) {
+    act(() => {
+      visibility = 'hidden';
+      document.dispatchEvent(new Event('visibilitychange'));
+      vi.setSystemTime(Date.now() + awaySeconds * 1000);
+      visibility = 'visible';
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+  }
+
   it('re-reads the list when the tab becomes visible again, without blanking what is on screen', async () => {
     mockedList.mockResolvedValueOnce(page([note('a', { title: 'Old one' })]));
     let release: (value: NotificationsPage) => void = () => {};
@@ -591,9 +612,7 @@ describe('NotificationsView — refreshing', () => {
     renderView();
     await screen.findByText('Old one');
 
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
+    returnToPage();
 
     expect(mockedList).toHaveBeenCalledTimes(2);
     // No flicker: the old list stays, and no loading state appears, while the refresh is out.
@@ -624,9 +643,7 @@ describe('NotificationsView — refreshing', () => {
     renderView();
     await screen.findByText('Keep me');
 
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
+    returnToPage();
     await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
 
     expect(screen.getByText('Keep me')).toBeInTheDocument();
@@ -639,9 +656,7 @@ describe('NotificationsView — refreshing', () => {
     renderView(ORG);
     await screen.findByText('Secret');
 
-    act(() => {
-      document.dispatchEvent(new Event('visibilitychange'));
-    });
+    returnToPage();
 
     expect(await screen.findByText("You don't have access to these notifications")).toBeInTheDocument();
     expect(screen.queryByText('Secret')).not.toBeInTheDocument();
@@ -664,5 +679,94 @@ describe('NotificationsView — refreshing', () => {
 
     await settle(30_000); // 3 -> 2: a fall is never a reason to re-read
     expect(mockedList).toHaveBeenCalledTimes(2);
+  });
+
+  describe('the visibility throttle', () => {
+    it('the first return to the page re-reads the list, and further returns inside the window do not', async () => {
+      mockedList.mockResolvedValue(page([note('a')]));
+      renderView(CUSTOMER, { provider: false });
+      await screen.findAllByRole('listitem');
+      expect(mockedList).toHaveBeenCalledTimes(1);
+
+      returnToPage();
+      expect(mockedList).toHaveBeenCalledTimes(2);
+
+      // The pane flickers: hidden/visible pairs 1 s and 6 s apart, all inside 10 s of that read.
+      for (const gap of [1, 5, 1, 2]) {
+        returnToPage(gap);
+      }
+
+      expect(mockedList).toHaveBeenCalledTimes(2);
+    });
+
+    it('a return after the window reads again, measured from the last read (exactly 10 s is allowed, 9.9 s is not)', async () => {
+      mockedList.mockResolvedValue(page([note('a')]));
+      renderView(CUSTOMER, { provider: false });
+      await screen.findAllByRole('listitem');
+
+      returnToPage(9.9);
+      expect(mockedList).toHaveBeenCalledTimes(1);
+
+      returnToPage(0.1); // 10.0 s since the read on mount
+      expect(mockedList).toHaveBeenCalledTimes(2);
+
+      returnToPage(9.9);
+      expect(mockedList).toHaveBeenCalledTimes(2);
+      returnToPage(0.1);
+      expect(mockedList).toHaveBeenCalledTimes(3);
+    });
+
+    it('a re-read that was not caused by visibility (Try again, a refresh after an error) also starts the window', async () => {
+      mockedList.mockRejectedValueOnce(new ApiError(500, 'internal', 'x'));
+      mockedList.mockResolvedValue(page([note('a')]));
+      renderView(CUSTOMER, { provider: false });
+      await screen.findByText("Couldn't load notifications");
+
+      fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      await screen.findAllByRole('listitem');
+      expect(mockedList).toHaveBeenCalledTimes(2);
+
+      returnToPage(3);
+      expect(mockedList).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not slow anything else down: Mark all, Load more and the Unread filter are never throttled', async () => {
+      mockedList.mockResolvedValue(page([note('a')], 'cursor-1'));
+      mockedMarkAll.mockResolvedValue({ updated: 1, hasMore: false });
+      renderView(CUSTOMER, { provider: false });
+      await screen.findAllByRole('listitem');
+
+      fireEvent.click(screen.getByRole('button', { name: 'Load more' }));
+      await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+      fireEvent.click(screen.getByRole('button', { name: 'Unread' }));
+      await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(3));
+      fireEvent.click(screen.getByRole('button', { name: 'Mark all as read' }));
+      await waitFor(() => expect(mockedMarkAll).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(4));
+    });
+
+    it('count and list stay consistent: one return after the window sends one count read and one list read, a flicker sends neither', async () => {
+      mockedList.mockResolvedValue(page([note('a')]));
+      mockedCount.mockResolvedValue(1);
+      renderView(CUSTOMER);
+      await screen.findAllByRole('listitem');
+      await waitFor(() => expect(mockedCount).toHaveBeenCalledTimes(1));
+      expect(mockedList).toHaveBeenCalledTimes(1);
+
+      returnToPage();
+      await waitFor(() => expect(mockedCount).toHaveBeenCalledTimes(2));
+      expect(mockedList).toHaveBeenCalledTimes(2);
+
+      for (let flicker = 0; flicker < 3; flicker++) {
+        returnToPage(2);
+      }
+      await Promise.resolve();
+      expect(mockedCount).toHaveBeenCalledTimes(2);
+      expect(mockedList).toHaveBeenCalledTimes(2);
+
+      returnToPage();
+      await waitFor(() => expect(mockedCount).toHaveBeenCalledTimes(3));
+      expect(mockedList).toHaveBeenCalledTimes(3);
+    });
   });
 });
