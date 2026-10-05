@@ -12,6 +12,7 @@ import {
   verifyCheckoutSignature,
   type PaymentProviderGateway,
 } from "../providers/razorpay";
+import {recordNotificationEvent} from "./notificationEvents";
 import {resolveOrderById, type Order} from "./orders";
 
 /**
@@ -467,9 +468,17 @@ export async function markPaymentSucceeded(
     tx.update(paymentRef, paymentUpdate);
     tx.update(orderRef, {status: "confirmed", paymentStatus: "paid", updatedAt: now});
 
+    const confirmedOrder: Order = {...order, status: "confirmed", paymentStatus: "paid", updatedAt: now};
+    // The notification outbox event, committed or rolled back together with the
+    // confirmation itself. Only this branch writes it: the `succeeded` replay
+    // above returned before reaching here, so a retried webhook or a repeated
+    // Checkout verification never records a second one. Delivering it is a
+    // separate, later step that can never fail this transition.
+    recordNotificationEvent(db, tx, confirmedOrder, "order_confirmed", now);
+
     return {
       payment: {...payment, ...paymentUpdate},
-      order: {...order, status: "confirmed", paymentStatus: "paid", updatedAt: now},
+      order: confirmedOrder,
     };
   });
 }

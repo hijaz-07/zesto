@@ -6,6 +6,7 @@ import {
   type OrganizationMemberRole,
   type OrganizationMembership,
 } from "../auth/membership";
+import {recordNotificationEvent, type NotificationEventType} from "./notificationEvents";
 import {resolveOrderById, type Order, type OrderStatus} from "./orders";
 
 /**
@@ -58,6 +59,8 @@ export const ORDER_FULFILLMENT_ROLES: readonly OrganizationMemberRole[] =
 interface FulfillmentRule {
   /** The only status an order may move into this target from. */
   from: OrderStatus;
+  /** The notification outbox event the transition records (see `notificationEvents.ts`). */
+  event: NotificationEventType;
   /** The audit fields written, once, by the transition that enters the target. */
   audit(actorUserId: string, at: Timestamp): Partial<Order>;
 }
@@ -70,14 +73,17 @@ interface FulfillmentRule {
 const FULFILLMENT_TRANSITIONS: Readonly<Record<FulfillmentTarget, FulfillmentRule>> = {
   preparing: {
     from: "confirmed",
+    event: "order_preparing",
     audit: (actorUserId, at) => ({preparingStartedAt: at, preparingStartedBy: actorUserId}),
   },
   ready: {
     from: "preparing",
+    event: "order_ready",
     audit: (actorUserId, at) => ({readyAt: at, readyBy: actorUserId}),
   },
   completed: {
     from: "picked_up",
+    event: "order_completed",
     audit: (actorUserId, at) => ({completedAt: at, completedBy: actorUserId}),
   },
 };
@@ -253,7 +259,12 @@ export async function transitionOrderStatus(
       };
       tx.update(orderRef, updates);
 
-      return {order: {...order, ...updates}, changed: true, previousStatus: order.status};
+      const updatedOrder: Order = {...order, ...updates};
+      // The notification outbox event, committed or rolled back with the
+      // transition. A no-op (returned above) never reaches this line.
+      recordNotificationEvent(db, tx, updatedOrder, FULFILLMENT_TRANSITIONS[to].event, now);
+
+      return {order: updatedOrder, changed: true, previousStatus: order.status};
     });
   } catch (error) {
     if (!(error instanceof HttpsError) && isFirestoreAborted(error)) {

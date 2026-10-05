@@ -1169,6 +1169,71 @@ the Firestore emulator does not enforce composite indexes, so it can only be con
 against real Firestore once deployed. The QR path needs no index (it resolves the order
 with the existing `orders.id` lookup).
 
+## Notifications
+
+An in-app inbox, filled by the backend from order events — never by a client.
+Nothing here creates a notification, and no request names a recipient: every
+route reads and writes only the verified session's OWN inbox (`users/{userId}/notifications`,
+the path carries the user), in one of two scopes:
+
+- `/notifications...` — the caller's **customer** notifications (identity-scoped, like `/orders`).
+- `/organizations/{organizationId}/notifications...` — the caller's notifications **for that
+  organization**. Requires an active `owner`/`manager`/`staff` membership, checked on every
+  request, so a revoked member is refused at once. The scope is the verified membership's
+  organization, not the path as received.
+
+### How a notification comes to exist
+
+```
+order transition (payment confirmed / preparing / ready / picked up / completed)
+   │  same Firestore transaction as the status change
+   ▼
+notificationEvents/{orderId}_{eventType}        (the outbox: pending → processed | failed)
+   │  Firestore onDocumentCreated trigger (onNotificationEventCreated, asia-south1, retry: true)
+   ▼
+policy → recipients → channels (in_app) → users/{userId}/notifications/{eventId}.{audience}
+```
+
+- The event is written by `markPaymentSucceeded`, `transitionOrderStatus` and `redeemPickup`,
+  inside the transaction that commits the new status — so an event exists iff the transition
+  committed. A repeated, refused or rolled-back transition writes none. Webhook replays and
+  repeated Checkout verifications return before the write, so they record none either.
+- Processing runs after the commit, in the trigger, and **can never fail or undo a transition**.
+- Guarantee: **at-least-once processing with deterministic visible notification creation**
+  (not exactly-once). IDs are deterministic and notifications are written with `create`
+  semantics, so reprocessing neither duplicates a notification nor resets `readAt`.
+- Retry: each run first counts an attempt. A transient failure records a bounded `lastError`
+  and rethrows so the trigger retries with backoff; the 5th failed attempt, or a permanent
+  failure (malformed event, an order that does not match, more than 200 active members), marks
+  the event `failed`, logs an error, and returns — no hot loop. A `failed` event stays for a
+  human; reprocessing it by hand is safe.
+- Who is told what (`domain/notificationPolicy.ts`): the customer gets "Order confirmed",
+  "Being prepared", "Ready for pickup" and "Picked up". `order_completed` is recorded but shows
+  no notification. The organization's active owners, managers and staff get one `new_order`
+  notification on `order_confirmed`, and nothing else. Copy names the outlet; it carries no
+  order number, contact detail, payment data or credential.
+
+### Routes
+
+| Route | |
+| --- | --- |
+| `GET …/notifications?limit=&cursor=&unread=true` | A page, newest first: `{notifications, nextCursor}`. Default 20, hard maximum 50. `unread=true` lists only unread ones. |
+| `GET …/notifications/unread-count` | `{unreadCount}`, counted no further than 100. |
+| `POST …/notifications/{notificationId}/read` | `{notification}`. Idempotent: an already-read notification is a `200` that keeps its original `readAt`. |
+| `POST …/notifications/read-all` | `{updated, hasMore}`. Bounded batches (400 per transaction, 5 per call). |
+
+A notification is `{id, type, title, body, orderId, createdAt, readAt}` (`readAt` is `null` while
+unread). `orderId` is what a client builds its deep link from; nothing else internal is returned.
+
+Errors: `401` unauthenticated; `400` for a malformed organization/notification ID, query value or
+cursor; `403` for a caller who is not an active member of the organization (checked before the query
+string is read); `404` for a notification that is not in the caller's own inbox in this scope — someone
+else's, another scope's, and a missing one are indistinguishable.
+
+The list needs two composite indexes on `notifications` (see `firestore.indexes.json`): `scope` ASC,
+`createdAt` DESC, and `scope` ASC, `readAt` ASC, `createdAt` DESC. The emulator does not enforce them,
+so they can only be confirmed against real Firestore once deployed.
+
 ## Explore (public customer discovery)
 
 `GET /explore/outlets`, `GET /explore/outlets/{outletId}`, and

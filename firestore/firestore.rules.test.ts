@@ -788,6 +788,129 @@ describe('firestore.rules: razorpayWebhookEvents/{eventKey}', () => {
   });
 });
 
+describe('firestore.rules: notificationEvents/{eventId}', () => {
+  const EVENT_ID = 'order-1_order_confirmed';
+
+  function outboxEvent(status: 'pending' | 'processed' = 'pending') {
+    return {
+      id: EVENT_ID,
+      type: 'order_confirmed',
+      orderId: 'order-1',
+      organizationId: ORG_A,
+      outletId: 'outlet-1',
+      menuId: 'menu-1',
+      customerUserId: USER_ID,
+      occurredAt: Timestamp.now(),
+      status,
+      attempts: 0,
+    };
+  }
+
+  async function seedEvent() {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), 'notificationEvents', EVENT_ID), outboxEvent());
+    });
+  }
+
+  it('has an explicit backend-only rule, rather than relying on the catch-all alone', () => {
+    const rules = readFileSync('firestore.rules', 'utf8');
+
+    expect(rules).toMatch(/match \/notificationEvents\/\{eventId\}\s*\{\s*allow read, write: if false;/);
+  });
+
+  it('denies all client reads and queries, even for the customer the event is about', async () => {
+    await seedEvent();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'notificationEvents', EVENT_ID)));
+      await assertFails(getDocs(collection(db, 'notificationEvents')));
+    }
+  });
+
+  it('denies a client forging, changing or deleting an event', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(setDoc(doc(db, 'notificationEvents', EVENT_ID), outboxEvent()));
+    }
+
+    await seedEvent();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(updateDoc(doc(db, 'notificationEvents', EVENT_ID), { status: 'processed' }));
+      await assertFails(deleteDoc(doc(db, 'notificationEvents', EVENT_ID)));
+    }
+  });
+});
+
+describe('firestore.rules: users/{userId}/notifications/{notificationId}', () => {
+  const NOTIFICATION_ID = 'order-1_order_ready.customer';
+
+  function inboxNotification() {
+    return {
+      id: NOTIFICATION_ID,
+      type: 'order_ready',
+      scope: 'customer',
+      title: 'Ready for pickup',
+      body: 'Your order from Main Canteen is ready for pickup.',
+      orderId: 'order-1',
+      organizationId: ORG_A,
+      outletId: 'outlet-1',
+      eventId: 'order-1_order_ready',
+      createdAt: Timestamp.now(),
+      readAt: null,
+      expiresAt: Timestamp.now(),
+    };
+  }
+
+  async function seedNotification() {
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(
+        doc(context.firestore(), 'users', USER_ID, 'notifications', NOTIFICATION_ID),
+        inboxNotification(),
+      );
+    });
+  }
+
+  it('has an explicit backend-only rule, rather than relying on the catch-all alone', () => {
+    const rules = readFileSync('firestore.rules', 'utf8');
+
+    expect(rules).toMatch(/match \/notifications\/\{notificationId\}\s*\{\s*allow read, write: if false;/);
+  });
+
+  it('denies a client reading or listing its own inbox, whatever Firebase Auth identity it carries', async () => {
+    await seedNotification();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'users', USER_ID, 'notifications', NOTIFICATION_ID)));
+      await assertFails(getDocs(collection(db, 'users', USER_ID, 'notifications')));
+    }
+  });
+
+  it('denies a client reading someone else\'s inbox', async () => {
+    await seedNotification();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, 'users', 'someone-else', 'notifications', NOTIFICATION_ID)));
+    }
+  });
+
+  it('denies a client creating, marking read, or deleting a notification', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        setDoc(doc(db, 'users', USER_ID, 'notifications', NOTIFICATION_ID), inboxNotification()),
+      );
+    }
+
+    await seedNotification();
+
+    for (const db of Object.values(clients())) {
+      await assertFails(
+        updateDoc(doc(db, 'users', USER_ID, 'notifications', NOTIFICATION_ID), { readAt: Timestamp.now() }),
+      );
+      await assertFails(deleteDoc(doc(db, 'users', USER_ID, 'notifications', NOTIFICATION_ID)));
+    }
+  });
+});
+
 describe('firestore.rules: default deny', () => {
   it('denies client access to any other collection', async () => {
     for (const db of Object.values(clients())) {

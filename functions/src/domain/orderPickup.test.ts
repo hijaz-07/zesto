@@ -88,13 +88,21 @@ async function httpsErrorOf(promise: Promise<unknown>): Promise<HttpsError> {
 /**
  * A Firestore whose single order lookup returns `stored` (or nothing), run
  * through a fake transaction — enough to execute `redeemPickup`'s whole
- * transaction body without an emulator. `updates` records every write.
+ * transaction body without an emulator. `updates` records every order write;
+ * `events` records every notification outbox event written alongside (the
+ * document path and its data).
  *
  * @param {Order | undefined} stored The order the collection-group lookup finds.
- * @return {{db: Firestore, updates: unknown[]}} The fake and its recorded writes.
+ * @return {{db: Firestore, updates: unknown[], events: Array<{path: string, data: unknown}>}} The fake and
+ *   its recorded writes.
  */
-function fakeDbHolding(stored: Order | undefined): {db: Firestore; updates: unknown[]} {
+function fakeDbHolding(stored: Order | undefined): {
+  db: Firestore;
+  updates: unknown[];
+  events: Array<{path: string; data: unknown}>;
+} {
   const updates: unknown[] = [];
+  const events: Array<{path: string; data: unknown}> = [];
   // Also answers the typed-code lookup (`.where().where().orderBy().limit().get()`) with the same order.
   const candidates = stored ? [fakeOrderDoc(stored)] : [];
   const query = {
@@ -108,12 +116,16 @@ function fakeDbHolding(stored: Order | undefined): {db: Firestore; updates: unkn
     update: (...args: unknown[]) => {
       updates.push(args);
     },
+    set: (ref: {path: string}, data: unknown) => {
+      events.push({path: ref.path, data});
+    },
   };
   const db = {
     collectionGroup: () => query,
+    collection: (name: string) => ({doc: (id: string) => ({path: `${name}/${id}`})}),
     runTransaction: async (callback: (t: typeof tx) => Promise<unknown>) => callback(tx),
   } as unknown as Firestore;
-  return {db, updates};
+  return {db, updates, events};
 }
 
 describe("ORDER_PICKUP_ROLES", () => {
@@ -282,7 +294,7 @@ describe("redeemPickup — the transaction, against a fake transaction", () => {
   }
 
   it("moves a ready, paid order to picked_up, writing the status, the audit pair and updatedAt together", async () => {
-    const {db, updates} = fakeDbHolding(order());
+    const {db, updates, events} = fakeDbHolding(order());
 
     const result = await redeem(db);
 
@@ -294,6 +306,13 @@ describe("redeemPickup — the transaction, against a fake transaction", () => {
     expect(written).toMatchObject({status: "picked_up", pickedUpBy: STAFF_ID});
     expect(written.pickedUpAt).toBe(written.updatedAt);
     expect(result.order.pickedUpAt).toBe(written.pickedUpAt);
+    // …and records exactly one outbox event in the same transaction, with the same timestamp.
+    expect(events).toHaveLength(1);
+    expect(events[0].path).toBe(`notificationEvents/${ORDER_ID}_order_picked_up`);
+    expect(events[0].data).toMatchObject({
+      id: `${ORDER_ID}_order_picked_up`, type: "order_picked_up", orderId: ORDER_ID, status: "pending", attempts: 0,
+    });
+    expect((events[0].data as {occurredAt: unknown}).occurredAt).toBe(written.pickedUpAt);
   });
 
   it("records the VERIFIED member as the actor — there is nowhere for a request to name another", async () => {
@@ -338,6 +357,7 @@ describe("redeemPickup — the transaction, against a fake transaction", () => {
     expect(foreign.updates).toEqual([]);
     expect(wrongProof.updates).toEqual([]);
     expect(wrongSecret.updates).toEqual([]);
+    expect([...foreign.events, ...wrongProof.events, ...wrongSecret.events]).toEqual([]);
   });
 
   it("never reveals a foreign order's state: a cross-tenant picked_up order is still just 'no match'", async () => {
@@ -372,13 +392,14 @@ describe("redeemPickup — the transaction, against a fake transaction", () => {
     ["picked_up", "This order has already been picked up."],
     ["completed", "This order has already been picked up and completed."],
     ["cancelled", "This order was cancelled."],
-  ])("refuses a genuine credential for a %s order (409) and writes nothing", async (status, message) => {
-    const {db, updates} = fakeDbHolding(order({status}));
+  ])("refuses a genuine credential for a %s order (409) and writes nothing — not even an outbox event", async (status, message) => {
+    const {db, updates, events} = fakeDbHolding(order({status}));
 
     const error = await httpsErrorOf(redeem(db));
 
     expect(error).toMatchObject({code: "aborted", message});
     expect(updates).toEqual([]);
+    expect(events).toEqual([]);
   });
 
   it("refuses an unpaid order even when it is somehow ready, and an unpaid pending order", async () => {

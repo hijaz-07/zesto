@@ -1,5 +1,6 @@
 import {randomUUID} from "node:crypto";
 import {setGlobalOptions} from "firebase-functions";
+import {onDocumentCreated} from "firebase-functions/v2/firestore";
 import {onRequest} from "firebase-functions/v2/https";
 import type {Response} from "express";
 import {getAdminFirestore} from "./firebaseAdmin";
@@ -12,11 +13,13 @@ import {createExploreRoutes} from "./routes/explore";
 import {createMeRoutes} from "./routes/me";
 import {createMenuItemRoutes} from "./routes/menuItems";
 import {createMenuRoutes} from "./routes/menus";
+import {createNotificationRoutes} from "./routes/notifications";
 import {createOrderRoutes} from "./routes/orders";
 import {createOrganizationOrderRoutes} from "./routes/organizationOrders";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
 import {createWebhookRoutes} from "./routes/webhooks";
+import {handleNotificationEventCreated} from "./domain/notificationEventTrigger";
 import {pickupCredentialSecret} from "./domain/pickupCredential";
 import {razorpayKeySecret, razorpayWebhookSecret} from "./providers/razorpay";
 
@@ -35,6 +38,7 @@ const ROUTES = [
   ...createOrderRoutes({db: getAdminFirestore()}),
   ...createOrganizationOrderRoutes({db: getAdminFirestore()}),
   ...createExploreRoutes({db: getAdminFirestore()}),
+  ...createNotificationRoutes({db: getAdminFirestore()}),
   ...createWebhookRoutes({db: getAdminFirestore()}),
 ];
 
@@ -104,5 +108,26 @@ export const api = onRequest(
       userId: result.userId,
       context: result.logContext,
     });
+  },
+);
+
+/**
+ * Turns each notification outbox event into visible notifications. Fires once
+ * per document created in `notificationEvents` — written inside the same
+ * transaction as the order transition it reports (see
+ * `domain/notificationEvents.ts`) — and processes exactly that event, never
+ * any other document. Same region as the Firestore database (asia-south1),
+ * which a Firestore trigger requires.
+ *
+ * `retry: true` redelivers an invocation that throws, with backoff; the
+ * processor throws only for a transient failure with attempts left, and marks
+ * the event `failed` and returns normally otherwise, so this never retries
+ * forever (see `domain/notificationProcessor.ts`). It holds no secrets and
+ * needs no `secrets` declaration.
+ */
+export const onNotificationEventCreated = onDocumentCreated(
+  {document: "notificationEvents/{eventId}", region: "asia-south1", retry: true},
+  async (event) => {
+    await handleNotificationEventCreated(getAdminFirestore(), event.params.eventId);
   },
 );

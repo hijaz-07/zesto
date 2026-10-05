@@ -13,6 +13,7 @@ import {
   type OrganizationMembership,
 } from "../auth/membership";
 import {isFirestoreAborted} from "./orderFulfillment";
+import {recordNotificationEvent} from "./notificationEvents";
 import {getOwnedOrder, resolveOrderById, type Order} from "./orders";
 import {
   PICKUP_CREDENTIAL_MAX_LENGTH,
@@ -256,7 +257,12 @@ export async function redeemPickup(
       };
       tx.update(orderRef, updates);
 
-      return {order: {...order, ...updates}, via: credential.kind};
+      const pickedUpOrder: Order = {...order, ...updates};
+      // The notification outbox event, committed or rolled back with the
+      // pickup; a refused or repeated pickup threw above and never gets here.
+      recordNotificationEvent(db, tx, pickedUpOrder, "order_picked_up", now);
+
+      return {order: pickedUpOrder, via: credential.kind};
     });
   } catch (error) {
     if (!(error instanceof HttpsError) && isFirestoreAborted(error)) {

@@ -294,6 +294,45 @@ rules_version = '2';
 // functions/src/domain/razorpayWebhooks.ts, after the request's HMAC
 // signature was verified. Never read or written directly by clients.
 //
+// Collection: notificationEvents
+// Document ID: {orderId}_{eventType} — deterministic, so a logical event (one
+// order reaching one status) can exist at most once. eventType is one of
+// order_confirmed | order_preparing | order_ready | order_picked_up |
+// order_completed. Fields (the notification OUTBOX — minimal, no PII):
+//   - id: string — equals the document id.
+//   - type: string — the eventType.
+//   - orderId, organizationId, outletId, menuId, customerUserId: string —
+//     coordinates copied from the authoritative order; never phone/email,
+//     payment or provider fields, a pickup credential or item snapshots.
+//   - occurredAt: timestamp — when the order transition committed.
+//   - status: string — pending | processed | failed.
+//   - attempts: number; lastAttemptAt: timestamp, lastError: string (bounded),
+//     processedAt: timestamp — processing bookkeeping.
+// Written in the SAME transaction as the order transition it reports
+// (functions/src/domain/notificationEvents.ts), so it exists iff the transition
+// committed; processed by the onNotificationEventCreated trigger
+// (functions/src/domain/notificationProcessor.ts). Backend-only, always.
+//
+// Subcollection: users/{userId}/notifications
+// Document ID: {eventId}.{audience} — audience is customer | org, so a
+// recipient has at most one notification per (event, audience). Fields:
+//   - id: string — equals the document id.
+//   - type: string — order_confirmed | order_preparing | order_ready |
+//     order_picked_up (customer) or new_order (organization).
+//   - scope: string — "customer" or "org:<organizationId>".
+//   - title, body: string — display text; no PII, payment data or credentials.
+//   - orderId, organizationId, outletId, eventId: string.
+//   - createdAt: timestamp — the event's occurredAt.
+//   - readAt: timestamp | null — null while unread (an explicit null, so
+//     "readAt == null" queries match).
+//   - expiresAt: timestamp — retention horizon (a TTL policy may use it).
+// Created only by the notification processor, with create semantics (a retry
+// never resets readAt); readAt is changed only by the notification API. Read
+// only through that API with the verified session's own user id: the path
+// itself carries the recipient, so a user can only ever address their own.
+// Backend-only, always: Descope is the only identity provider and
+// request.auth is never a Zesto identity, so no rule can express "my inbox".
+//
 // ===============================================================
 
 service cloud.firestore {
@@ -305,6 +344,13 @@ service cloud.firestore {
 
       // Order idempotency-key reservations. Backend-only, always.
       match /orderIdempotencyKeys/{idempotencyKey} {
+        allow read, write: if false;
+      }
+
+      // In-app notification inbox. Backend-only, always — see the data-model
+      // comment above: request.auth carries no Zesto identity, so a direct
+      // client read could only ever be someone else's.
+      match /notifications/{notificationId} {
         allow read, write: if false;
       }
     }
@@ -360,6 +406,14 @@ service cloud.firestore {
     // like a duplicate, or delete one to force a replay. Written only by
     // functions/src/domain/razorpayWebhooks.ts after signature verification.
     match /razorpayWebhookEvents/{eventKey} {
+      allow read, write: if false;
+    }
+
+    // Notification outbox. Backend-only, always — a client must never be able to
+    // forge an event (a notification for an order that did not change), read
+    // who ordered what, or delete one to suppress a notification. Written only
+    // inside the order-transition transactions.
+    match /notificationEvents/{eventId} {
       allow read, write: if false;
     }
 

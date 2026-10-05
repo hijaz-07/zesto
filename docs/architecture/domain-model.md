@@ -200,9 +200,22 @@ paid order, and decides all of it inside one transaction. Once the order is
 protection. See [http-api.md](./http-api.md#organization-order-pickup).
 
 ### Notification
-A message sent to a `User` about their order or account — e.g. "menu
-published," "order confirmed," "ready for pickup." Delivered via
-push (Firebase Cloud Messaging) and/or in-app.
+A message sent to a `User` about their order or account — e.g. "order
+confirmed," "ready for pickup," or, for an organization's members, "new order."
+Stored in the recipient's own in-app inbox
+(`users/{userId}/notifications/{eventId}.{audience}`), in either a `customer` or
+an `org:{organizationId}` scope. Always created by the backend from a
+`NotificationEvent`, never by a client. Delivery channels (`in_app` today;
+browser push, email and mobile push later) are pluggable behind one interface.
+
+### NotificationEvent
+The outbox record of one order lifecycle transition
+(`notificationEvents/{orderId}_{eventType}`: `order_confirmed`, `order_preparing`,
+`order_ready`, `order_picked_up`, `order_completed`). Written in the same
+transaction as the transition, carrying only the order's coordinates and its
+customer; the order stays the source of truth. A Firestore trigger turns it into
+`Notification`s. An event can exist without producing a visible notification
+(`order_completed`). See [http-api.md](./http-api.md#notifications).
 
 ### DemandSnapshot
 An aggregated view of demand for a `Menu` — total quantity requested

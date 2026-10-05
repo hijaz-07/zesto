@@ -1,4 +1,4 @@
-import { IonContent, IonHeader, IonPage, IonTitle, IonToolbar } from '@ionic/react';
+import { IonButtons, IonContent, IonHeader, IonPage, IonTitle, IonToolbar } from '@ionic/react';
 import { useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { EmptyState } from '../../components/common/EmptyState';
@@ -10,6 +10,7 @@ import { listOrdersErrorMessage } from '../../features/order/errors';
 import { OrderHistoryCard } from '../../features/order/OrderHistoryCard';
 import { useOrderHistory } from '../../features/order/useOrderHistory';
 import { useOnBecameVisible } from '../../hooks/useOnBecameVisible';
+import { NotificationBell } from '../../features/notification/NotificationBell';
 
 /**
  * `/app/orders` — the signed-in customer's own order history, newest first,
@@ -82,6 +83,9 @@ export function CustomerOrdersPage() {
       <IonHeader>
         <IonToolbar>
           <IonTitle>Orders</IonTitle>
+          <IonButtons slot="end">
+            <NotificationBell />
+          </IonButtons>
         </IonToolbar>
       </IonHeader>
       <IonContent>
