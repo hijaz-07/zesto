@@ -5,14 +5,16 @@ import { ApiError } from '../../lib/api/client';
 import type { AuthContextValue } from '../../features/auth/types';
 import { useAuth } from '../../features/auth/useAuth';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
-import { getOrder } from '../../features/order/api';
+import { getOrder, getPickupCredential } from '../../features/order/api';
 import { preparePayment, verifyPayment } from '../../features/payment/api';
 import { loadRazorpayCheckout, RazorpayScriptError } from '../../features/payment/razorpayScript';
 import {
   checkoutCallback,
+  completedOrder,
   confirmedOrder,
   FakeRazorpay,
   pendingOrder,
+  pickedUpOrder,
   preparedPayment,
   preparingOrder,
   readyOrder,
@@ -35,6 +37,7 @@ vi.mock('../../features/payment/razorpayScript', async (importOriginal) => ({
 }));
 
 const mockedGetOrder = vi.mocked(getOrder);
+const mockedGetPickupCredential = vi.mocked(getPickupCredential);
 const mockedUseExploreMenu = vi.mocked(useExploreMenu);
 const mockedUseAuth = vi.mocked(useAuth);
 const mockedPreparePayment = vi.mocked(preparePayment);
@@ -42,6 +45,9 @@ const mockedVerifyPayment = vi.mocked(verifyPayment);
 const mockedLoadRazorpayCheckout = vi.mocked(loadRazorpayCheckout);
 
 const order = pendingOrder;
+
+/** What the backend returns to the order's own customer for a ready order. */
+const pickupCredential = { qrPayload: 'ZP1.order-1.AbCdEfGhIjKlMnOpQrStUv', code: 'K7QX-4M2P' };
 
 function signedInAs(user: AuthContextValue['user']): AuthContextValue {
   return { user, status: 'signedIn', isAuthenticated: true, signOut: vi.fn(async () => {}) };
@@ -61,6 +67,8 @@ function renderPage(orderId = 'order-1') {
 function resetMocks() {
   FakeRazorpay.reset();
   mockedGetOrder.mockReset();
+  mockedGetPickupCredential.mockReset();
+  mockedGetPickupCredential.mockResolvedValue(pickupCredential);
   mockedUseExploreMenu.mockReset();
   mockedUseExploreMenu.mockReturnValue({
     status: 'idle',
@@ -534,6 +542,42 @@ describe('CustomerOrderConfirmationPage — payment', () => {
       await waitFor(() => expect(screen.getByText('Payment required')).toBeInTheDocument());
       expect(screen.queryByText('Preparing')).not.toBeInTheDocument();
       expect(screen.queryByText('Ready for pickup')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('once the order has been handed over to the customer', () => {
+    it.each([
+      ['pickedUpOrder', pickedUpOrder, 'Order picked up', 'Picked up', 'Your order has been collected.'],
+      ['completedOrder', completedOrder, 'Order completed', 'Completed', 'Your order is complete.'],
+    ])('shows a %s as paid, with its own heading, status and message, and no way to pay again', async (_name, handedOver, heading, label, message) => {
+      mockedGetOrder.mockResolvedValue({ order: handedOver });
+
+      renderPage();
+
+      await waitFor(() => expect(screen.getByText(heading)).toBeInTheDocument());
+      expect(screen.getByText(label)).toBeInTheDocument();
+      expect(screen.getByText(message)).toBeInTheDocument();
+      expect(screen.getByText('Paid')).toBeInTheDocument();
+      expect(screen.queryByText('Payment required')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /pay/i })).not.toBeInTheDocument();
+      expect(mockedPreparePayment).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['pickedUpOrder', pickedUpOrder, 'Picked up'],
+      ['completedOrder', completedOrder, 'Completed'],
+    ])('treats a verification replay answered with a %s as the payment succeeding, not as a failure', async (_name, handedOver, label) => {
+      // The customer's own browser verifies late (or a second time) after the
+      // server already confirmed the payment and the order has been handed over.
+      mockedVerifyPayment.mockResolvedValue({ order: handedOver, payment: succeededPayment });
+      await renderPendingOrder();
+      await openCheckout();
+
+      act(() => FakeRazorpay.last.succeed());
+
+      await waitFor(() => expect(screen.getByText(label)).toBeInTheDocument());
+      expect(screen.queryByText(/couldn't verify|could not verify|verification/i)).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /pay|retry/i })).not.toBeInTheDocument();
     });
   });
 

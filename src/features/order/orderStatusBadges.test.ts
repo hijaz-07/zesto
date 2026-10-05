@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { orderStatusBadges } from './orderStatusBadges';
+import { humanizeStatus, orderStatusBadges } from './orderStatusBadges';
 import { isPaymentConfirmedStatus, ORDER_STATUSES, type OrderStatus } from './types';
 
 describe('orderStatusBadges', () => {
@@ -45,6 +45,20 @@ describe('orderStatusBadges', () => {
     ]);
   });
 
+  it('shows a picked-up order as "Picked up" (success) alongside "Paid"', () => {
+    expect(orderStatusBadges({ status: 'picked_up', paymentStatus: 'paid' })).toEqual([
+      { label: 'Picked up', tone: 'success' },
+      { label: 'Paid', tone: 'success' },
+    ]);
+  });
+
+  it('shows a completed order as "Completed" (neutral: nothing is left to do) alongside "Paid"', () => {
+    expect(orderStatusBadges({ status: 'completed', paymentStatus: 'paid' })).toEqual([
+      { label: 'Completed', tone: 'neutral' },
+      { label: 'Paid', tone: 'success' },
+    ]);
+  });
+
   it('gives every status the backend can send a badge with a label', () => {
     for (const status of ORDER_STATUSES) {
       const [badge] = orderStatusBadges({ status, paymentStatus: 'pending' });
@@ -56,17 +70,17 @@ describe('orderStatusBadges', () => {
 
   it('shows a status this build does not know as words, instead of crashing the list', () => {
     // A state the backend added after this bundle was built.
-    const future = { status: 'picked_up' as OrderStatus, paymentStatus: 'paid' as const };
+    const future = { status: 'out_for_delivery' as OrderStatus, paymentStatus: 'paid' as const };
 
     expect(orderStatusBadges(future)).toEqual([
-      { label: 'Picked up', tone: 'neutral' },
+      { label: 'Out for delivery', tone: 'neutral' },
       { label: 'Paid', tone: 'success' },
     ]);
   });
 });
 
 describe('isPaymentConfirmedStatus', () => {
-  it.each(['confirmed', 'preparing', 'ready'] as const)('is true for %s: payment has confirmed the order', (status) => {
+  it.each(['confirmed', 'preparing', 'ready', 'picked_up', 'completed'] as const)('is true for %s: payment has confirmed the order', (status) => {
     expect(isPaymentConfirmedStatus(status)).toBe(true);
   });
 
@@ -78,5 +92,21 @@ describe('isPaymentConfirmedStatus', () => {
     const notConfirmed = ORDER_STATUSES.filter((status) => !isPaymentConfirmedStatus(status));
 
     expect(notConfirmed).toEqual(['pending_payment', 'cancelled']);
+  });
+});
+
+describe('humanizeStatus', () => {
+  it.each([
+    ['out_for_delivery', 'Out for delivery'],
+    ['refunded', 'Refunded'],
+    ['picked_up', 'Picked up'],
+    ['  spaced_out  ', 'Spaced out'],
+  ])('reads %j as "%s"', (status, words) => {
+    expect(humanizeStatus(status)).toBe(words);
+  });
+
+  it('never returns an empty label', () => {
+    expect(humanizeStatus('')).toBe('Unknown');
+    expect(humanizeStatus('___')).toBe('Unknown');
   });
 });

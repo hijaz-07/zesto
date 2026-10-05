@@ -21,6 +21,7 @@ const ORDER_ID = "order-1";
 const ACTIONS = [
   {name: "start-preparing", to: "preparing"},
   {name: "mark-ready", to: "ready"},
+  {name: "complete", to: "completed"},
 ] as const;
 
 beforeEach(() => {
@@ -254,7 +255,12 @@ describe.each(ACTIONS)("POST .../orders/:orderId/$name — before any order is r
 });
 
 describe("there is no generic way to set an order's status", () => {
-  it.each(["status", "fulfillment", "transition", "ready", "preparing", "picked-up", "cancel"])(
+  // In particular nothing under an order's own ID can hand it over: pickup needs
+  // a credential, so it is `POST .../pickups` (organizationOrderPickup.test.ts).
+  it.each([
+    "status", "fulfillment", "transition", "ready", "preparing", "completed", "picked-up", "picked_up",
+    "pickup", "pickups", "collect", "redeem", "redeem-pickup", "handover", "cancel",
+  ])(
     "has no POST .../orders/:orderId/%s route",
     async (action) => {
       const result = await post({db: untouchedDb(), validator: acceptingValidator("U-1")}, action);

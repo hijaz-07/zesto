@@ -299,9 +299,19 @@ describe("transitionOrderStatus (Firestore emulator)", () => {
       ["cancelled", "paid", "preparing"],
       ["cancelled", "paid", "ready"],
       ["ready", "paid", "preparing"],
+      // Completing is only ever the step after a pickup, never a way around it.
+      ["confirmed", "paid", "completed"],
+      ["preparing", "paid", "completed"],
+      ["ready", "paid", "completed"],
+      ["cancelled", "paid", "completed"],
+      ["pending_payment", "pending", "completed"],
+      // Nothing moves backwards out of picked_up.
+      ["picked_up", "paid", "ready"],
+      ["picked_up", "paid", "preparing"],
       // Not paid although past payment: no code path makes this, and it must not be fulfilled.
       ["confirmed", "pending", "preparing"],
       ["preparing", "pending", "ready"],
+      ["picked_up", "pending", "completed"],
     ])("%s (%s) -> %s is a 409", async (status, paymentStatus, to) => {
       const order = await seedOrder({org: orgA, status, paymentStatus});
       const before = await rawOrder(order);
@@ -313,11 +323,13 @@ describe("transitionOrderStatus (Firestore emulator)", () => {
       expect(await rawOrder(order)).toEqual(before);
     });
 
+    // `picked_up` is the one that matters: it needs a pickup credential and must never
+    // be reachable through a generic step (see orderPickup.emulator.test.ts).
     it("never moves an order to a status that is not a fulfillment target", async () => {
       const order = await seedOrder({org: orgA, status: "confirmed"});
       const before = await rawOrder(order);
 
-      for (const to of ["confirmed", "cancelled", "picked_up", "completed", "pending_payment"]) {
+      for (const to of ["confirmed", "cancelled", "picked_up", "pending_payment"]) {
         const error = await rejectionOf(transitionOrderStatus(db, {
           membership: member(orgA.organizationId),
           orderId: order.id,

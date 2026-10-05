@@ -12,11 +12,13 @@ import { ApiError } from '../../lib/api/client';
 import { FakeIntersectionObserver } from '../../test/fakeIntersectionObserver';
 import {
   cancelledOrgOrder,
+  completedOrgOrder,
   confirmedOrgOrder,
   longOrgOrder,
   manyOrgOrders,
   orgOutlets,
   pendingOrgOrder,
+  pickedUpOrgOrder,
   preparingOrgOrder,
   readyOrgOrder,
 } from '../../test/organizationOrderFixtures';
@@ -873,6 +875,120 @@ describe('OrganizationOrdersPage', () => {
         await waitFor(() => expect(within(rowOf('order-preparing-5')).getByText('Ready')).toBeInTheDocument());
         expect(within(rowOf('order-preparing-5')).queryByRole('button')).not.toBeInTheDocument();
         expect(screen.queryByText('Mark this order ready?')).not.toBeInTheDocument();
+      });
+    });
+
+    describe('pickup and completion on the rows', () => {
+      const pickedUp = page([pickedUpOrgOrder]);
+      const completedRow = { ...completedOrgOrder, id: 'order-picked-up-7' };
+
+      it('says "Awaiting pickup" on a ready order, offers "Mark completed" on a picked-up one and nothing on a completed one', async () => {
+        mockedList.mockResolvedValue(
+          page([confirmedOrgOrder, preparingOrgOrder, readyOrgOrder, pickedUpOrgOrder, completedOrgOrder]),
+        );
+
+        renderPage();
+        await screen.findByRole('table');
+
+        expect(within(rowOf('order-ready-6')).getByText('Awaiting pickup')).toBeInTheDocument();
+        expect(within(rowOf('order-ready-6')).queryByRole('button')).not.toBeInTheDocument();
+        expect(within(rowOf('order-picked-up-7')).getByRole('button', { name: /Mark completed/ })).toBeInTheDocument();
+        expect(within(rowOf('order-completed-8')).queryByRole('button')).not.toBeInTheDocument();
+        expect(within(rowOf('order-completed-8')).queryByText('Awaiting pickup')).not.toBeInTheDocument();
+        // The earlier steps are untouched, and nothing else gained a button.
+        expect(within(rowOf('order-confirmed-1')).getByRole('button', { name: /Start preparing/ })).toBeInTheDocument();
+        expect(within(rowOf('order-preparing-5')).getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+        expect(screen.getAllByRole('button', { name: /Start preparing|Mark ready|Mark completed/ })).toHaveLength(3);
+      });
+
+      it('shows each new status as its own badge', async () => {
+        mockedList.mockResolvedValue(page([readyOrgOrder, pickedUpOrgOrder, completedOrgOrder]));
+
+        renderPage();
+        await screen.findByRole('table');
+
+        expect(within(rowOf('order-picked-up-7')).getByText('Picked up')).toBeInTheDocument();
+        expect(within(rowOf('order-completed-8')).getByText('Completed')).toBeInTheDocument();
+      });
+
+      it('"Mark completed" asks the backend for exactly that order and the complete action, with no confirmation', async () => {
+        mockedList.mockResolvedValue(pickedUp);
+        mockedRunAction.mockResolvedValue(completedRow);
+
+        renderPage('org-9');
+        fireEvent.click(await screen.findByRole('button', { name: /Mark completed/ }));
+
+        await waitFor(() => expect(mockedRunAction).toHaveBeenCalledTimes(1));
+        expect(mockedRunAction).toHaveBeenCalledWith('org-9', 'order-picked-up-7', 'complete');
+        expect(screen.queryByRole('group')).not.toBeInTheDocument();
+      });
+
+      it("updates the row from the backend's answer: it becomes Completed with no action, without re-listing", async () => {
+        mockedList.mockResolvedValue(pickedUp);
+        mockedRunAction.mockResolvedValue(completedRow);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark completed/ }));
+
+        await waitFor(() => expect(within(rowOf('order-picked-up-7')).getByText('Completed')).toBeInTheDocument());
+        expect(within(rowOf('order-picked-up-7')).queryByRole('button')).not.toBeInTheDocument();
+        expect(mockedList).toHaveBeenCalledTimes(1);
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('disables the button while the request is pending, and ignores a second press', async () => {
+        mockedList.mockResolvedValue(pickedUp);
+        const action = pendingAction();
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark completed/ }));
+
+        const busy = await screen.findByRole('button', { name: /Completing…/ });
+        expect(busy).toBeDisabled();
+        fireEvent.click(busy);
+        expect(mockedRunAction).toHaveBeenCalledTimes(1);
+
+        action.resolve(completedRow);
+        await waitFor(() => expect(within(rowOf('order-picked-up-7')).getByText('Completed')).toBeInTheDocument());
+      });
+
+      it('on a 409 (someone completed it first): says so, and re-reads the list so the row shows the real state', async () => {
+        mockedList.mockResolvedValueOnce(pickedUp);
+        mockedRunAction.mockRejectedValue(new ApiError(409, 'conflict', 'x'));
+        mockedList.mockResolvedValueOnce(page([completedRow]));
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark completed/ }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent('This order has changed since you loaded it.');
+        await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
+        await waitFor(() => expect(within(rowOf('order-picked-up-7')).getByText('Completed')).toBeInTheDocument());
+        expect(within(rowOf('order-picked-up-7')).queryByRole('button')).not.toBeInTheDocument();
+      });
+
+      it('on a 503: keeps the row and the button available to try again, without re-listing', async () => {
+        mockedList.mockResolvedValue(pickedUp);
+        mockedRunAction.mockRejectedValueOnce(new ApiError(503, 'unavailable', 'down'));
+        mockedRunAction.mockResolvedValueOnce(completedRow);
+
+        renderPage();
+        fireEvent.click(await screen.findByRole('button', { name: /Mark completed/ }));
+
+        expect(await screen.findByRole('alert')).toHaveTextContent('Zesto is temporarily unavailable.');
+        expect(mockedList).toHaveBeenCalledTimes(1);
+        fireEvent.click(screen.getByRole('button', { name: /Mark completed/ }));
+        await waitFor(() => expect(within(rowOf('order-picked-up-7')).getByText('Completed')).toBeInTheDocument());
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+      });
+
+      it('never offers the handover from a row: no button anywhere hands a ready order over', async () => {
+        mockedList.mockResolvedValue(page([readyOrgOrder]));
+
+        renderPage();
+        await screen.findByRole('table');
+
+        expect(screen.queryByRole('button', { name: /pick|hand|collect|redeem/i })).not.toBeInTheDocument();
+        expect(mockedRunAction).not.toHaveBeenCalled();
       });
     });
 

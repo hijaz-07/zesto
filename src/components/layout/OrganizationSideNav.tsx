@@ -11,6 +11,7 @@ import {
   analyticsOutline,
   businessOutline,
   gridOutline,
+  qrCodeOutline,
   receiptOutline,
   restaurantOutline,
   settingsOutline,
@@ -21,6 +22,7 @@ const navItems = [
   { href: '/org/menus', label: 'Menus', icon: restaurantOutline },
   { href: '/org/outlets', label: 'Outlets', icon: businessOutline },
   { href: '/org/orders', label: 'Orders', icon: receiptOutline },
+  { href: '/org/pickup', label: 'Pickup', icon: qrCodeOutline },
   { href: '/org/analytics', label: 'Analytics', icon: analyticsOutline },
   { href: '/org/settings', label: 'Settings', icon: settingsOutline },
 ];

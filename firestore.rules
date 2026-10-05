@@ -197,13 +197,15 @@ rules_version = '2';
 //     order, always derived server-side from the verified Descope session
 //     (functions/src/auth/session.ts), never accepted from a client.
 //   - status: string (required) — one of 'pending_payment' | 'confirmed' |
-//     'preparing' | 'ready' | 'cancelled'. A new order always starts
-//     'pending_payment'. Only trusted backend code moves it: a verified
-//     payment makes it 'confirmed' (domain/payments.ts's
-//     markPaymentSucceeded), and an active organization member moves a paid
-//     order 'confirmed' -> 'preparing' -> 'ready'
-//     (domain/orderFulfillment.ts's transitionOrderStatus). 'ready' and
-//     'cancelled' are terminal for now.
+//     'preparing' | 'ready' | 'picked_up' | 'completed' | 'cancelled'. A new
+//     order always starts 'pending_payment'. Only trusted backend code moves
+//     it: a verified payment makes it 'confirmed' (domain/payments.ts's
+//     markPaymentSucceeded); an active organization member moves a paid order
+//     'confirmed' -> 'preparing' -> 'ready' and 'picked_up' -> 'completed'
+//     (domain/orderFulfillment.ts's transitionOrderStatus); and 'ready' ->
+//     'picked_up' happens only by redeeming the customer's pickup credential
+//     (domain/orderPickup.ts's redeemPickup). 'completed' and 'cancelled' are
+//     terminal.
 //   - paymentStatus: string (required) — 'pending' for v1; a new order
 //     always starts here, payment integration transitions it later.
 //   - currency: string (required) — 'INR' for v1.
@@ -219,9 +221,14 @@ rules_version = '2';
 //   - createdAt, updatedAt: timestamp (required)
 //   - preparingStartedAt (timestamp) + preparingStartedBy (string, the
 //     member's Descope user ID): optional; written together, once, by the
-//     transition into 'preparing'. readyAt + readyBy likewise for 'ready'.
-//     Never overwritten by a repeated request, and never returned by any
-//     API response.
+//     transition into 'preparing'. readyAt + readyBy likewise for 'ready',
+//     pickedUpAt + pickedUpBy for 'picked_up' and completedAt + completedBy
+//     for 'completed'. Never overwritten by a repeated request, and never
+//     returned by any API response.
+//   - There is deliberately NO pickup-credential field: the QR payload /
+//     backup code a customer shows is derived on demand from a server-only
+//     secret (domain/pickupCredential.ts) and is never stored here or
+//     anywhere else.
 // Provisioned by trusted backend code only
 // (functions/src/domain/orders.ts's createOrder), inside one Firestore
 // transaction together with the idempotency record at

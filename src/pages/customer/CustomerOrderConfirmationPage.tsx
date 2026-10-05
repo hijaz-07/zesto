@@ -9,8 +9,12 @@ import { Card } from '../../components/ui/Card';
 import { useAuth } from '../../features/auth/useAuth';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
 import { getOrderErrorMessage } from '../../features/order/errors';
+import { humanizeStatus } from '../../features/order/orderStatusBadges';
+import { PickupCredentialCard } from '../../features/order/PickupCredentialCard';
 import { isPaymentConfirmedStatus, type Order } from '../../features/order/types';
 import { useOrder } from '../../features/order/useOrder';
+import { useOrderPickup } from '../../features/order/useOrderPickup';
+import { useReadyOrderRefresh } from '../../features/order/useReadyOrderRefresh';
 import { paymentNoticeText } from '../../features/payment/errors';
 import { checkoutDescription } from '../../features/payment/razorpayCheckout';
 import type { PaymentNotice } from '../../features/payment/types';
@@ -22,6 +26,8 @@ const ORDER_STATUS_LABEL: Record<Order['status'], string> = {
   confirmed: 'Confirmed',
   preparing: 'Preparing',
   ready: 'Ready for pickup',
+  picked_up: 'Picked up',
+  completed: 'Completed',
   cancelled: 'Cancelled',
 };
 
@@ -30,6 +36,14 @@ const PAID_ORDER_MESSAGE: Partial<Record<Order['status'], string>> = {
   confirmed: 'Payment successful. Your order is confirmed.',
   preparing: "Payment successful. We're preparing your order.",
   ready: 'Payment successful. Your order is ready for pickup.',
+  picked_up: 'Your order has been collected.',
+  completed: 'Your order is complete.',
+};
+
+/** The page heading for an order that has been handed over; every other state keeps the original two. */
+const HANDED_OVER_TITLE: Partial<Record<Order['status'], string>> = {
+  picked_up: 'Order picked up',
+  completed: 'Order completed',
 };
 
 const PAYMENT_STATUS_LABEL: Record<Order['paymentStatus'], string> = {
@@ -58,6 +72,15 @@ function isErrorNotice(notice: PaymentNotice): boolean {
  * confirmed/paid when it's loaded that way from the backend, or when the
  * server's own verification response says so — never because Checkout's
  * browser callback fired. A confirmed order has no Pay action.
+ *
+ * A `ready` order also shows the customer's pickup credential — a QR code and a
+ * backup code to show staff (`PickupCredentialCard`, fetched by `useOrderPickup`
+ * for this customer's own order only and held in memory only) — and is re-read
+ * about every ten seconds while the page is on screen so it moves on to "Picked
+ * up" by itself (`useReadyOrderRefresh`, which stops the moment the order is no
+ * longer ready or the page is hidden). Once the order is `picked_up` or
+ * `completed` the credential is gone, not just hidden, and there is nothing to
+ * do but read the status. A status this build doesn't know is shown as words.
  */
 export function CustomerOrderConfirmationPage() {
   const { orderId } = useParams<{ orderId: string }>();
@@ -72,7 +95,11 @@ export function CustomerOrderConfirmationPage() {
   });
   // After server verification the verify response IS the authoritative order;
   // otherwise it's whatever the backend last returned for this order.
-  const order = confirmedOrder && confirmedOrder.id === fetchedOrder?.id ? confirmedOrder : fetchedOrder;
+  const loadedOrder = confirmedOrder && confirmedOrder.id === fetchedOrder?.id ? confirmedOrder : fetchedOrder;
+  // While it is Ready (and the page is visible) the order is re-read, so it can move on to picked up.
+  const order = useReadyOrderRefresh(loadedOrder);
+  // The pickup credential exists only for the customer's own READY, paid order, and is memory-only.
+  const pickup = useOrderPickup(order?.id, order?.status === 'ready' && order.paymentStatus === 'paid');
   // Best-effort display names only — the order itself never depends on this
   // still resolving (see staleness.ts's identical reasoning for the cart).
   const { menu: liveMenu, outlet: liveOutlet } = useExploreMenu(order?.outletId, order?.menuId);
@@ -94,6 +121,9 @@ export function CustomerOrderConfirmationPage() {
     const needsPayment = order.status === 'pending_payment' && order.paymentStatus === 'pending';
     const verifyFailed = notice?.kind === 'verify_failed';
     const noticeText = notice ? paymentNoticeText(notice) : null;
+    // Typed wider than `string` on purpose: at runtime the lookup can miss, for a
+    // status the backend added after this bundle was built.
+    const statusLabel: string | undefined = ORDER_STATUS_LABEL[order.status];
 
     let payLabel = `Pay ${formatPaiseAsRupees(order.totalInPaise)}`;
     if (phase === 'preparing') {
@@ -106,12 +136,15 @@ export function CustomerOrderConfirmationPage() {
 
     content = (
       <>
-        <PageHeader title={isConfirmed ? 'Order confirmed' : 'Your order'} subtitle={`Order #${order.id}`} />
+        <PageHeader
+          title={HANDED_OVER_TITLE[order.status] ?? (isConfirmed ? 'Order confirmed' : 'Your order')}
+          subtitle={`Order #${order.id}`}
+        />
 
         {isConfirmed ? (
           <Card className="flex flex-col gap-2 border-success/30 bg-success/10">
             <Badge tone="success" className="self-start">
-              {ORDER_STATUS_LABEL[order.status]}
+              {statusLabel}
             </Badge>
             <p className="text-sm text-text">{PAID_ORDER_MESSAGE[order.status]}</p>
           </Card>
@@ -124,11 +157,13 @@ export function CustomerOrderConfirmationPage() {
             }
           >
             <Badge tone={order.status === 'cancelled' ? 'danger' : 'warning'} className="self-start">
-              {ORDER_STATUS_LABEL[order.status]}
+              {statusLabel ?? humanizeStatus(order.status)}
             </Badge>
             {needsPayment && <p className="text-sm text-text">Pay to confirm your order.</p>}
           </Card>
         )}
+
+        <PickupCredentialCard pickup={pickup} />
 
         {(liveOutlet || liveMenu) && (
           <div>

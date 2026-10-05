@@ -17,6 +17,7 @@ import {createOrganizationOrderRoutes} from "./routes/organizationOrders";
 import {createOrganizationRoutes} from "./routes/organizations";
 import {createOutletRoutes} from "./routes/outlets";
 import {createWebhookRoutes} from "./routes/webhooks";
+import {pickupCredentialSecret} from "./domain/pickupCredential";
 import {razorpayKeySecret, razorpayWebhookSecret} from "./providers/razorpay";
 
 // For cost control, you can set the maximum number of containers that can be
@@ -71,8 +72,13 @@ export const api = onRequest(
   // deployed (backed by Cloud Secret Manager). RAZORPAY_KEY_ID is a plain
   // `defineString` param (like DESCOPE_PROJECT_ID) and needs no such
   // declaration. The webhook route lives on this same function — there is
-  // deliberately no second Cloud Function.
-  {region: "asia-south1", secrets: [razorpayKeySecret, razorpayWebhookSecret]},
+  // deliberately no second Cloud Function. PICKUP_CREDENTIAL_SECRET is the
+  // HMAC key pickup credentials (QR payload / backup code) are derived from
+  // (see `domain/pickupCredential.ts`); a third, unrelated secret.
+  {
+    region: "asia-south1",
+    secrets: [razorpayKeySecret, razorpayWebhookSecret, pickupCredentialSecret],
+  },
   async (request, response) => {
     const requestId = randomUUID();
     const startedAt = Date.now();

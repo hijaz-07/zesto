@@ -31,13 +31,18 @@ import {parseOutlet, type Outlet} from "./outlets";
  * `subtotalInPaise` for v1 — there is no tax/fee/discount system yet.
  *
  * Status lifecycle: `pending_payment` -> `confirmed` is owned by
- * `domain/payments.ts` (`markPaymentSucceeded`) and `confirmed` -> `preparing`
- * -> `ready` by `domain/orderFulfillment.ts` (`transitionOrderStatus`);
- * nothing else writes `status`. `ready` and `cancelled` are terminal for now
- * (pickup and cancellation are later features).
+ * `domain/payments.ts` (`markPaymentSucceeded`); `confirmed` -> `preparing` ->
+ * `ready` and `picked_up` -> `completed` by `domain/orderFulfillment.ts`
+ * (`transitionOrderStatus`); and `ready` -> `picked_up` by
+ * `domain/orderPickup.ts` (`redeemPickup`), the only transition that needs a
+ * credential. Nothing else writes `status`. `completed` and `cancelled` are
+ * terminal (cancellation itself is a later feature).
  */
-export type OrderStatus = "pending_payment" | "confirmed" | "preparing" | "ready" | "cancelled";
-const ORDER_STATUS_VALUES = ["pending_payment", "confirmed", "preparing", "ready", "cancelled"] as const;
+export type OrderStatus =
+  "pending_payment" | "confirmed" | "preparing" | "ready" | "picked_up" | "completed" | "cancelled";
+const ORDER_STATUS_VALUES = [
+  "pending_payment", "confirmed", "preparing", "ready", "picked_up", "completed", "cancelled",
+] as const;
 
 /**
  * `createOrder` always writes `"pending"`. `"paid"` is set exactly once, by
@@ -82,20 +87,29 @@ export interface Order {
   createdAt: Timestamp;
   updatedAt: Timestamp;
   /**
-   * Fulfillment audit trail — who moved the order into `preparing`/`ready`,
-   * and when. Each pair is written exactly once, by
-   * `domain/orderFulfillment.ts`'s `transitionOrderStatus`, in the same
-   * transaction as the status change, and never overwritten afterwards (a
-   * repeated request is a no-op). Absent on any order that has not reached
-   * that state. The `*By` values are organization members' Descope user IDs;
-   * they are internal and never part of any API response (see
-   * `toOrderResponse`, `OrganizationOrderSummaryResponse`). This is
-   * deliberately not a general event history — see root CLAUDE.md.
+   * Fulfillment and pickup audit trail — who moved the order into
+   * `preparing`/`ready`/`picked_up`/`completed`, and when. Each pair is written
+   * exactly once, in the same transaction as the status change —
+   * `preparing`/`ready`/`completed` by `domain/orderFulfillment.ts`'s
+   * `transitionOrderStatus`, `picked_up` by `domain/orderPickup.ts`'s
+   * `redeemPickup` — and never overwritten afterwards (a repeated request is a
+   * no-op or a refusal). Absent on any order that has not reached that state.
+   * The `*By` values are organization members' Descope user IDs; they are
+   * internal and never part of any API response (see `toOrderResponse`,
+   * `OrganizationOrderSummaryResponse`). This is deliberately not a general
+   * event history — see root CLAUDE.md.
+   *
+   * The pickup credential itself is NOT stored here or anywhere: it is derived
+   * on demand from a server secret (see `domain/pickupCredential.ts`).
    */
   preparingStartedAt?: Timestamp;
   preparingStartedBy?: string;
   readyAt?: Timestamp;
   readyBy?: string;
+  pickedUpAt?: Timestamp;
+  pickedUpBy?: string;
+  completedAt?: Timestamp;
+  completedBy?: string;
 }
 
 /**
@@ -203,6 +217,16 @@ const orderDocSchema = z.object({
     "readyAt must be a Firestore Timestamp",
   ).optional(),
   readyBy: z.string().min(1).optional(),
+  pickedUpAt: z.custom<Timestamp>(
+    (value) => value instanceof Timestamp,
+    "pickedUpAt must be a Firestore Timestamp",
+  ).optional(),
+  pickedUpBy: z.string().min(1).optional(),
+  completedAt: z.custom<Timestamp>(
+    (value) => value instanceof Timestamp,
+    "completedAt must be a Firestore Timestamp",
+  ).optional(),
+  completedBy: z.string().min(1).optional(),
 });
 
 /**

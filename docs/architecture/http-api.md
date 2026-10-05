@@ -113,7 +113,7 @@ no cacheable, non-personal responses yet. A 401 response additionally gets
 | 404    | `not_found`            | No route registered for the path, or (e.g. `PATCH .../outlets/{outletId}`) the specific resource doesn't exist. |
 | 405    | `method_not_allowed`   | The path exists, but not for this method (`Allow` header lists what does). |
 | 409    | `already_exists`       | `POST /organizations` or `POST .../outlets` with a `slug` that is already taken. |
-| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order). A client should re-read the resource, not retry the same request. Only the organization order routes use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
+| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`, `.../complete`) or a pickup (`POST .../pickups`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order, an order already picked up), a pickup at the wrong outlet, and `GET /orders/{orderId}/pickup-credential` for an order that cannot be collected right now. A client should re-read the resource, not retry the same request. Only the organization order routes and the pickup credential route use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
 | 500    | `internal`             | An unhandled exception in a route handler (e.g. a malformed stored Firestore document). The client never sees the underlying detail. |
 | 503    | `unavailable`          | An infrastructure failure while validating the session (see below) — **not** the caller's fault. |
 
@@ -785,7 +785,7 @@ Response (`200`): `{ "orders": [...], "nextCursor": string | null }`.
   "id": "…", "outletId": "…", "menuId": "…",
   "outlet": { "name": "Main Canteen" },
   "menu": { "title": "Tuesday Menu", "menuDate": "2026-09-29" },
-  "status": "pending_payment | confirmed | preparing | ready | cancelled",
+  "status": "pending_payment | confirmed | preparing | ready | picked_up | completed | cancelled",
   "paymentStatus": "pending | paid",
   "currency": "INR",
   "subtotalInPaise": 30000, "totalInPaise": 30000,
@@ -824,9 +824,10 @@ with an organization's outlets, newest first, one page at a time
 (`functions/src/routes/organizationOrders.ts` +
 `functions/src/domain/organizationOrders.ts`). It is tenant-scoped like the
 outlet/menu routes, not identity-scoped like `GET /orders`. This route only
-reads; the two ways an order is moved along are the fulfillment actions
-[below](#organization-order-fulfillment). Pickup and cancellation are later
-features and are not part of either.
+reads; an order is moved along by the fulfillment actions
+[below](#organization-order-fulfillment) and handed over by
+[pickup](#organization-order-pickup). Cancellation is a later feature and is
+not part of any of them.
 
 **Authorization.** In this order, each step stopping the request if it fails:
 
@@ -872,7 +873,7 @@ fails the request rather than returning the order.
 Response (`200`): `{ "orders": [...], "nextCursor": string | null }`; an
 organization with no orders gets `{ "orders": [], "nextCursor": null }`. Every
 status is listed (`pending_payment`, `confirmed`, `preparing`, `ready`,
-`cancelled`) — there is no status filter yet. Orders from inactive outlets are
+`picked_up`, `completed`, `cancelled`) — there is no status filter yet. Orders from inactive outlets are
 listed like any other. Each row:
 
 ```json
@@ -880,7 +881,7 @@ listed like any other. Each row:
   "id": "…", "outletId": "…", "menuId": "…",
   "outlet": { "name": "Main Canteen" },
   "menu": { "title": "Tuesday Menu", "menuDate": "2026-09-29" },
-  "status": "pending_payment | confirmed | preparing | ready | cancelled",
+  "status": "pending_payment | confirmed | preparing | ready | picked_up | completed | cancelled",
   "paymentStatus": "pending | paid",
   "currency": "INR",
   "subtotalInPaise": 30000, "totalInPaise": 30000,
@@ -914,28 +915,36 @@ deployed.
 
 ## Organization order fulfillment
 
-Two explicit, body-less actions move a **paid** order through the kitchen
-(`functions/src/routes/organizationOrders.ts` +
+Three explicit, body-less actions move a **paid** order through the kitchen and
+out the door (`functions/src/routes/organizationOrders.ts` +
 `functions/src/domain/orderFulfillment.ts`):
 
 ```
 POST /organizations/{organizationId}/orders/{orderId}/start-preparing
 POST /organizations/{organizationId}/orders/{orderId}/mark-ready
+POST /organizations/{organizationId}/orders/{orderId}/complete
 ```
 
 ```
 confirmed --start-preparing--> preparing --mark-ready--> ready
+                                                           |  (pickup, below — needs a credential)
+                                                           v
+                                          completed <--complete-- picked_up
 ```
 
-That is the whole state machine. `ready` and `cancelled` are terminal for now;
-there is no way back (`ready` -> `preparing` is refused), and no pickup
-(`picked_up`/`completed`) or cancellation transition — those are later
-features. Like a menu's `publish`/`archive`, these are explicit operations and
-not a generic "set status": the target is fixed by the URL, nothing in the
-request body or query is read (a `status`, `userId`, `organizationId`,
-`outletId` there is ignored), and pickup, which will need its own verification,
-can therefore never be reached through a status change. Both routes call the
-single `transitionOrderStatus`, so the rules live in exactly one place.
+That is the whole state machine. `completed` and `cancelled` are terminal;
+there is no way back (`ready` -> `preparing`, `picked_up` -> `ready` and the
+like are refused), and no cancellation transition — that is a later feature.
+Like a menu's `publish`/`archive`, these are explicit operations and not a
+generic "set status": the target is fixed by the URL, nothing in the request
+body or query is read (a `status`, `userId`, `organizationId`, `outletId` there
+is ignored). `ready` -> `picked_up` is deliberately **not** one of them: it
+needs a credential, so it is [`POST .../pickups`](#organization-order-pickup),
+and no URL that merely names an order ID can mark that order picked up. All
+three routes call the single `transitionOrderStatus`, so the rules live in
+exactly one place. `complete` needs no credential — it only closes out an order
+that was already handed over — and `ready` -> `completed` is refused: an order
+cannot be completed without having been picked up.
 
 **Authorization.** In this order, each step stopping the request if it fails:
 
@@ -959,14 +968,16 @@ order is indistinguishable from a missing one), decide from what was actually
 read, and write the status, the audit fields and `updatedAt` together. Nothing
 about the order's current state comes from the request.
 
-| The order is…                                  | `start-preparing`            | `mark-ready`                 |
-| ---------------------------------------------- | ---------------------------- | ---------------------------- |
-| `confirmed`, paid                              | → `preparing`, `200`         | `409`                        |
-| `preparing`, paid                              | `200`, nothing changed       | → `ready`, `200`             |
-| `ready`                                        | `409`                        | `200`, nothing changed       |
-| `pending_payment`                              | `409` (not paid yet)         | `409` (not paid yet)         |
-| `cancelled`                                    | `409`                        | `409`                        |
-| `confirmed`/`preparing` but `paymentStatus` ≠ `paid` | `409`                  | `409`                        |
+| The order is…                                  | `start-preparing`            | `mark-ready`                 | `complete`                   |
+| ---------------------------------------------- | ---------------------------- | ---------------------------- | ---------------------------- |
+| `confirmed`, paid                              | → `preparing`, `200`         | `409`                        | `409` (not picked up yet)    |
+| `preparing`, paid                              | `200`, nothing changed       | → `ready`, `200`             | `409` (not picked up yet)    |
+| `ready`                                        | `409`                        | `200`, nothing changed       | `409` (not picked up yet)    |
+| `picked_up`, paid                              | `409`                        | `409`                        | → `completed`, `200`         |
+| `completed`                                    | `409`                        | `409`                        | `200`, nothing changed       |
+| `pending_payment`                              | `409` (not paid yet)         | `409` (not paid yet)         | `409` (not paid yet)         |
+| `cancelled`                                    | `409`                        | `409`                        | `409`                        |
+| right status but `paymentStatus` ≠ `paid`      | `409`                        | `409`                        | `409`                        |
 
 Eligibility is the order's own `status` and `paymentStatus == "paid"`. That is
 sufficient because the only code that writes either is `markPaymentSucceeded`,
@@ -976,11 +987,12 @@ calls Razorpay. A paid-but-not-`paid` order can't occur and is refused rather
 than fulfilled.
 
 **Repeating an action is safe.** An action whose result already holds
-(`preparing` -> `start-preparing`, `ready` -> `mark-ready`) is a `200` that
-writes nothing: the first person stays on record (the audit fields are never
-overwritten) and `updatedAt` does not move. A request for a state the order has
-already moved past (`start-preparing` on a `ready` order) is a `409`, never an
-overwrite.
+(`preparing` -> `start-preparing`, `ready` -> `mark-ready`, `completed` ->
+`complete`) is a `200` that writes nothing: the first person stays on record
+(the audit fields are never overwritten) and `updatedAt` does not move. A
+request for a state the order has already moved past (`start-preparing` on a
+`ready` order) is a `409`, never an overwrite. (Pickup is different on purpose:
+see below.)
 
 **Concurrency.** Two people pressing the same button at once produce exactly one
 write: the second transaction re-runs against the committed state and sees the
@@ -991,8 +1003,9 @@ cannot commit after Firestore's own retries is reported as `409 conflict`, not
 `500`.
 
 **Audit.** The transition that enters `preparing` writes `preparingStartedAt` +
-`preparingStartedBy`, and the one that enters `ready` writes `readyAt` +
-`readyBy` (the member's Descope user ID). Each pair is written once and kept;
+`preparingStartedBy`, the one that enters `ready` writes `readyAt` + `readyBy`,
+and the one that enters `completed` writes `completedAt` + `completedBy` (the
+member's Descope user ID). Each pair is written once and kept;
 they are internal and appear in no API response. The request log line also
 carries the caller's `userId` and `{from, to, outcome}`. This is deliberately
 not a general event history, which is a later feature.
@@ -1006,6 +1019,155 @@ this organization), `409 conflict` (see the table above), `503 unavailable`.
 An order from a since-deactivated outlet can still be fulfilled — its customers
 have already paid. No Firestore index is added: the order is resolved with the
 existing `orders.id` collection-group lookup.
+
+## Organization order pickup
+
+Handing a `ready` order to the customer who comes to collect it
+(`functions/src/routes/organizationOrders.ts` +
+`functions/src/domain/orderPickup.ts` +
+`functions/src/domain/pickupCredential.ts`):
+
+```
+GET  /orders/{orderId}/pickup-credential           (the customer: shows it)
+POST /organizations/{organizationId}/pickups       (staff: redeem it)
+```
+
+```
+ready --pickup(credential)--> picked_up --complete--> completed
+```
+
+### The credential
+
+What the customer shows is a **pickup credential**, in two forms of the same
+proof:
+
+| Form | Looks like | Strength | Used for |
+| ---- | ---------- | -------- | -------- |
+| QR payload | `ZP1.<orderId>.<proof>` | 128 bits | scanning; names its own order |
+| Backup code | `K7QX-4M2P` | 40 bits (8 Crockford-base32 characters) | reading out and typing; does not name its order |
+
+Both are HMAC-SHA256 of the order's ID under a server-only secret
+(`PICKUP_CREDENTIAL_SECRET`, Cloud Secret Manager in production, `functions/.secret.local`
+locally; at least 32 characters; never the same value as a Razorpay secret),
+with different domain-separation strings so that learning one reveals nothing of
+the other. It is **derived on demand and never stored** — not in Firestore, not
+in a log line, not in a URL, not in any API response other than the one below,
+and the frontend must keep it in memory only (never `localStorage`,
+`sessionStorage`, IndexedDB or a query string). It carries no customer, payment or
+provider data and is not a reversible encoding of the order ID (which is not
+secret: it is in URLs and the staff table). A typed code is forgiving the way a
+person needs it to be — case-insensitive, spaces and hyphens ignored, `O`/`I`/`L`
+read as `0`/`1`/`1` — a QR payload is exact. Rotating the secret invalidates every
+outstanding credential at once; the `ZP1` prefix versions the format.
+
+There is no expiry: a credential is valid exactly while its order is `ready` and
+paid, and the first successful pickup kills it (the order is then `picked_up`, and
+the same credential changes nothing). A screenshot of a QR is therefore a bearer
+credential until the order is collected — which is why staff see what was ordered
+and the first successful use wins.
+
+### `GET /orders/{orderId}/pickup-credential`
+
+The **customer's** QR payload and backup code for their own ready order.
+
+**Authorization is the order's customer, and nothing else.** `authenticateRequest`
+gives the verified session user; the order is read from Firestore and its stored
+`userId` compared with that user (`getOwnedOrder`). Knowing an order ID is not
+enough: an unrelated customer gets `404`, indistinguishable from an order that
+does not exist — and so does the organization's own owner, manager or staff, who
+are shown the credential by the customer and never need to fetch it. The secret
+is read only after ownership and state have passed.
+
+Response (`200`): exactly `{ "pickup": { "qrPayload": "ZP1.…", "code": "K7QX-4M2P" } }`
+— no customer identity, Descope ID, payment-provider data, audit field, or secret.
+Only available while the order is `ready` and paid; otherwise `409 conflict` ("This
+order isn't ready for pickup."). The same value on every fetch (a reloaded screen
+shows the same QR); nothing is written. Errors: `400` (malformed `orderId`), `401`,
+`404`, `409 conflict`, `503`. Like every response here it is `Cache-Control: private,
+no-store`. It is deliberately not part of `GET /orders/{orderId}`, the history, or
+any payment response.
+
+### `POST /organizations/{organizationId}/pickups`
+
+Body: `{ "credential": "<QR payload or typed code>", "outletId"?: "<outlet ID>" }`.
+Any active `owner`/`manager`/`staff` member may call it (`ORDER_PICKUP_ROLES`; no
+new role, no per-outlet permission). Only `credential` and `outletId` are read: a
+`status`, `userId`, `organizationId`, `orderId` or `paymentStatus` in the body or
+query is ignored.
+
+It is a `POST .../pickups` and not a route under an order's ID because a typed
+code does not carry an order ID — and because that keeps every `.../orders/{orderId}/…`
+URL credential-free: **no URL that merely names an order can mark it picked up.**
+
+**Authorization and checks**, each stopping the request if it fails:
+
+1. `authenticateRequest` — `401`.
+2. `requireOrganizationRole` with `ORDER_PICKUP_ROLES` — an **active** membership of
+   the verified session user in the path's organization; non-members (including the
+   customer who placed the order), `invited`, `revoked` and unknown-role members are
+   all `403`.
+3. The body is validated (`400`) — after authorization, so a non-member never learns
+   whether theirs was well formed.
+4. The credential's **format** is checked (`400`): a QR payload, or an 8-character
+   code. The message never echoes the input.
+5. Then, **inside one Firestore transaction**:
+   1. the order exists and belongs to the caller's organization;
+   2. the credential is genuine for it (constant-time comparison);
+      — 1 and 2 are the **same `404`** ("No order awaiting pickup matches this
+      code."), as are an unknown order and a typed code that matches nothing, so a
+      caller learns nothing about orders they cannot open, and never that an order
+      "exists but belongs to someone else";
+   3. if `outletId` was sent, the order is that outlet's (`409`, "This order is for a
+      different outlet.") — only reachable with a genuine credential. `outletId` can
+      only *narrow*: membership is organization-wide, and the order's organization is
+      checked regardless;
+   4. the order is `ready` and `paymentStatus == "paid"` (`409`, with a message saying
+      which of: not ready yet, not paid, cancelled, already picked up, already picked
+      up and completed).
+   Then `status`, `pickedUpAt` + `pickedUpBy` (the verified member) and `updatedAt`
+   are written together.
+
+**Verification and transition are one request.** There is no separate "verify"
+call that returns a token for a later "commit" — nothing can happen between a check
+and the write it justifies, and nothing can be replayed from a stale verification.
+
+**A typed code.** It does not name its order, so before the transaction the
+organization's own `ready` and `picked_up` orders (at most 500) are searched for the
+one whose derived code matches. That search is only a *locator*, outside the
+transaction on purpose (so one counter's lookup does not lock every awaiting order
+against the others), and its answer is not trusted: the transaction re-reads that
+single order and re-derives and compares the credential exactly as for a QR. A code
+that matches none, or more than one, order (not realistic at 40 bits, but never
+guessed about) is the same `404`; more than 500 candidates is refused rather than
+searched partially. `picked_up` is included so that a repeat attempt is told
+"already picked up"; once an order is `completed`, its code is simply no match.
+
+**A second claim is a `409`, never a `200`.** Unlike the fulfillment actions, there
+is no "already done, so succeed quietly": a second person presenting a credential for
+an order that has already left is exactly the case staff must be told about, and a
+success would read as "hand it over". Of two counters presenting the same credential
+at once, exactly one write happens and the other is refused ("already been picked
+up", or "just changed by someone else" if the transaction could not retry past the
+contention). A client that loses its connection after sending cannot tell whether the
+pickup was recorded; re-presenting the credential then gives a definitive answer.
+
+Response (`200`): `{ "order": { … } }` — the order's row in the shape the list above
+returns (no customer identity, no actor, no audit field, **no credential**). Errors:
+`400 invalid_argument`, `401 unauthenticated`, `403 permission_denied`, `404
+not_found`, `409 conflict`, `503 unavailable`. The request log carries the caller's
+`userId` and only `{from, to, outcome, via: "qr" | "code"}` — never the credential.
+
+**Audit.** The transition writes `pickedUpAt` + `pickedUpBy`, once, in the same
+transaction; they are never overwritten and appear in no response. Completing the
+order afterwards (`.../orders/{orderId}/complete`, above) writes `completedAt` +
+`completedBy`.
+
+**Indexes.** The typed-code search needs a third composite index on `orders`,
+`COLLECTION_GROUP` scope: `organizationId` ascending + `status` ascending +
+`createdAt` descending. It must be deployed (and READY) before the API that uses it;
+the Firestore emulator does not enforce composite indexes, so it can only be confirmed
+against real Firestore once deployed. The QR path needs no index (it resolves the order
+with the existing `orders.id` lookup).
 
 ## Explore (public customer discovery)
 

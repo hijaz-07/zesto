@@ -34,17 +34,48 @@ and branches on the result:
 | one or more active organizations | redirect to `/org/dashboard` | `OrganizationAppLayout` (unchanged) |
 
 `OrganizationAppLayout` and its child pages (`dashboard`, `menus`, `orders`,
-`analytics`, `settings`) are unmodified by this gate — they are simply
+`pickup`, `analytics`, `settings`) are unmodified by this gate — they are simply
 mounted or not, based on the table above. (The layout hands `orders` the same
 `organizationId` it gives `menus`/`outlets`, plus the caller's `role` — used only
-to decide whether the "Start preparing" / "Mark ready" buttons are shown; the
-backend re-checks membership on every action. `/org/orders` loads
+to decide whether the "Start preparing" / "Mark ready" / "Mark completed" buttons
+are shown; the backend re-checks membership on every action. `/org/orders` loads
 `GET /organizations/{organizationId}/orders`, where the backend — not this
 route — decides whether the signed-in member may read it. A `403` is shown as an
 access problem, not a retryable error — including a `403` that arrives on a
 Refresh or on Load more after access was revoked while the page was open: the
 rows already loaded (and the paging cursor) are cleared, not left on screen. Any
 other failed refresh or Load more keeps them.)
+
+### Pickup: `/org/pickup` and the customer's order page
+
+`/org/pickup` (`OrganizationPickupPage`, in the side navigation as "Pickup") is
+where staff hand ready orders to the customers collecting them. It gets the same
+`organizationId` and `role` as `orders`; the role only decides whether the
+controls are shown (owner, manager and staff see them, anyone else sees only that
+they have no access) and the backend re-checks the caller's active membership on
+every redemption. Staff enter the customer's 8-character backup code, paste or
+let a keyboard-wedge (USB/Bluetooth) scanner type the QR payload into the same
+field, or — only where the browser can really scan — press "Scan QR" (camera +
+`BarcodeDetector`, no bundled decoder; support is detected, never assumed, and a
+camera failure is shown inside the scanner panel without touching the field). The
+optional outlet selector only narrows: the backend refuses an order of another
+outlet and can never be made to accept one it otherwise would not. A successful
+pickup shows the order id, outlet and items and a "Mark completed" action
+(`POST .../orders/{orderId}/complete`); the Orders table likewise reads "Awaiting
+pickup" on a ready order and offers "Mark completed" on a picked-up one. No row
+anywhere hands an order over — only a credential can.
+
+The credential is a secret and is memory-only on both sides. Nothing reads it
+from the address (a `credential`/`orderId`/`organizationId` in the query string is
+ignored), the field is cleared the instant it is sent whatever the outcome, and it
+is never written to `localStorage`, `sessionStorage`, IndexedDB, cookies, history
+or the URL, nor logged (`pickupSecretHygiene.test.ts` fails if the source ever
+could). The customer sees the same QR code and backup code on their own order
+page, `/app/orders/{orderId}`, only while the order is `ready`
+(`GET /orders/{orderId}/pickup-credential`, fetched fresh each visit); that page
+re-reads the order about every ten seconds — only while it is ready and the page is
+visible — so it moves on to "Picked up" by itself, and the credential is dropped
+from memory the moment it does.
 
 After `POST /organizations` succeeds, the client uses the organization and
 membership objects the response already contains to update
@@ -55,7 +86,7 @@ that point.
 ## Routes stay paramless for now
 
 The organization routes are currently `/org/onboarding`, `/org/dashboard`,
-`/org/menus`, `/org/orders`, `/org/analytics`, `/org/settings` — with no
+`/org/menus`, `/org/orders`, `/org/pickup`, `/org/analytics`, `/org/settings` — with no
 `:organizationId` segment. This is intentional, not an oversight: today a
 user can only ever end up as a member of the one organization they created
 (there is no invitation flow yet), so there is nothing to switch between.

@@ -2,9 +2,11 @@ import { render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import {
   cancelledOrgOrder,
+  completedOrgOrder,
   confirmedOrgOrder,
   longOrgOrder,
   pendingOrgOrder,
+  pickedUpOrgOrder,
   preparingOrgOrder,
   readyOrgOrder,
 } from '../../test/organizationOrderFixtures';
@@ -122,6 +124,8 @@ describe('OrganizationOrdersTable', () => {
   it.each([
     ['preparing', preparingOrgOrder, 'Preparing'],
     ['ready', readyOrgOrder, 'Ready'],
+    ['picked_up', pickedUpOrgOrder, 'Picked up'],
+    ['completed', completedOrgOrder, 'Completed'],
   ])('shows the %s status badge (and Paid) for a paid, fulfilled order', (_name, order, label) => {
     renderTable([order]);
 

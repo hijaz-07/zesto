@@ -3,12 +3,17 @@ import type { OrderPaymentStatus, OrderStatus } from '../order/types';
 
 /**
  * The fulfilment actions the order dashboard offers: `confirmed` → `preparing`
- * → `ready`. These are requests only — the backend decides whether each is
- * allowed from the order's real state, who may make it, and whether it is paid
- * (functions/src/domain/orderFulfillment.ts); nothing here is authority. What
- * this module decides is just which button, if any, a row on screen offers.
+ * → `ready`, and `picked_up` → `completed`. These are requests only — the
+ * backend decides whether each is allowed from the order's real state, who may
+ * make it, and whether it is paid (functions/src/domain/orderFulfillment.ts);
+ * nothing here is authority. What this module decides is just which button, if
+ * any, a row on screen offers.
+ *
+ * `ready` → `picked_up` is deliberately NOT here: handing an order over needs
+ * the customer's pickup credential, so it is its own flow on `/org/pickup`
+ * (`usePickupRedeem`) and no button on a row can do it.
  */
-export type FulfillmentAction = 'start-preparing' | 'mark-ready';
+export type FulfillmentAction = 'start-preparing' | 'mark-ready' | 'complete';
 
 export interface FulfillmentActionSpec {
   action: FulfillmentAction;
@@ -41,11 +46,23 @@ const MARK_READY: FulfillmentActionSpec = {
   },
 };
 
+const COMPLETE: FulfillmentActionSpec = {
+  action: 'complete',
+  label: 'Mark completed',
+  pendingLabel: 'Completing…',
+  // No prompt: the food has already been handed over, so closing the order out
+  // tells the customer nothing new, and repeating it is harmless (the backend
+  // answers a repeat with the order as it already is).
+  confirmation: null,
+};
+
 /**
  * The next step an order on screen can be offered, from the status and payment
  * the backend last reported for it: a paid `confirmed` order can be started, a
- * paid `preparing` order can be marked ready, and nothing else is offered — not
- * an order awaiting payment, a cancelled one, or one that is already ready.
+ * paid `preparing` order can be marked ready, a paid `picked_up` order can be
+ * marked completed, and nothing else is offered — not an order awaiting
+ * payment, a cancelled one, a completed one, or a `ready` one (which is waiting
+ * for the customer, see `isAwaitingPickup`).
  */
 export function nextFulfillmentAction(order: {
   status: OrderStatus;
@@ -60,7 +77,19 @@ export function nextFulfillmentAction(order: {
   if (order.status === 'preparing') {
     return MARK_READY;
   }
+  if (order.status === 'picked_up') {
+    return COMPLETE;
+  }
   return null;
+}
+
+/**
+ * Whether an order on screen is ready and waiting for its customer to collect
+ * it. Such a row offers no button — only the pickup flow can hand it over — and
+ * says so instead of showing an empty cell.
+ */
+export function isAwaitingPickup(order: { status: OrderStatus; paymentStatus: OrderPaymentStatus }): boolean {
+  return order.status === 'ready' && order.paymentStatus === 'paid';
 }
 
 /**
@@ -71,5 +100,16 @@ export function nextFulfillmentAction(order: {
  * request, so a person who tampers with this still cannot change an order.
  */
 export function canFulfillOrders(role: OrganizationMemberRole): boolean {
+  return role === 'owner' || role === 'manager' || role === 'staff';
+}
+
+/**
+ * Whether `role` is offered the pickup controls on `/org/pickup`: the same three
+ * roles as the backend's `ORDER_PICKUP_ROLES`. Its own function, like that
+ * constant, because "may hand an order over" and "may start cooking it" are
+ * different decisions that merely coincide today. Only what is shown — the
+ * backend checks the caller's active membership on every redemption.
+ */
+export function canHandOverOrders(role: OrganizationMemberRole): boolean {
   return role === 'owner' || role === 'manager' || role === 'staff';
 }

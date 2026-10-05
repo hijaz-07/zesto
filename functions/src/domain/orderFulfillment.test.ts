@@ -65,12 +65,14 @@ function httpsErrorOf(fn: () => unknown): HttpsError {
 }
 
 describe("isFulfillmentTarget", () => {
-  it.each(["preparing", "ready"])("accepts %s", (value) => {
+  it.each(["preparing", "ready", "completed"])("accepts %s", (value) => {
     expect(isFulfillmentTarget(value)).toBe(true);
   });
 
+  // `picked_up` is the one state that must never be a generic target: it needs
+  // a pickup credential (domain/orderPickup.ts).
   it.each([
-    "pending_payment", "confirmed", "cancelled", "picked_up", "completed", "bogus", "", "PREPARING",
+    "pending_payment", "confirmed", "cancelled", "picked_up", "bogus", "", "PREPARING", "COMPLETED",
     "__proto__", "constructor", "toString", "hasOwnProperty",
   ])("rejects the string %j", (value) => {
     expect(isFulfillmentTarget(value)).toBe(false);
@@ -96,9 +98,14 @@ describe("decideFulfillmentTransition", () => {
     expect(decideFulfillmentTransition(order({status: "preparing"}), "ready")).toBe("apply");
   });
 
+  it("applies picked_up -> completed for a paid order", () => {
+    expect(decideFulfillmentTransition(order({status: "picked_up"}), "completed")).toBe("apply");
+  });
+
   it.each<[OrderStatus, FulfillmentTarget]>([
     ["preparing", "preparing"],
     ["ready", "ready"],
+    ["completed", "completed"],
   ])("treats %s -> %s as an already-done no-op", (status, to) => {
     expect(decideFulfillmentTransition(order({status}), to)).toBe("noop");
   });
@@ -114,11 +121,42 @@ describe("decideFulfillmentTransition", () => {
     ["cancelled", "preparing"],
     ["cancelled", "ready"],
     ["ready", "preparing"],
+    // Completing is only ever the step after a pickup — never a shortcut around it.
+    ["confirmed", "completed"],
+    ["preparing", "completed"],
+    ["ready", "completed"],
+    ["pending_payment", "completed"],
+    ["cancelled", "completed"],
+    // Nothing moves backwards out of picked_up or completed.
+    ["picked_up", "preparing"],
+    ["picked_up", "ready"],
+    ["completed", "preparing"],
+    ["completed", "ready"],
   ])("refuses %s -> %s with a 409 conflict", (status, to) => {
     const error = httpsErrorOf(() => decideFulfillmentTransition(order({status}), to));
 
     expect(error.code).toBe("aborted");
     expect(error.httpErrorCode.status).toBe(409);
+  });
+
+  it.each<[OrderStatus, string]>([
+    ["confirmed", "This order has not been picked up yet."],
+    ["preparing", "This order has not been picked up yet."],
+    ["ready", "This order has not been picked up yet."],
+    ["pending_payment", "This order has not been paid yet."],
+    ["cancelled", "This order is cancelled, so it can't be moved to completed."],
+  ])("explains why a %s order cannot be completed", (status, message) => {
+    const error = httpsErrorOf(() => decideFulfillmentTransition(
+      order({status, paymentStatus: status === "pending_payment" ? "pending" : "paid"}), "completed",
+    ));
+
+    expect(error.message).toBe(message);
+  });
+
+  it("says 'picked up', not 'picked_up', when a picked-up order is refused", () => {
+    const error = httpsErrorOf(() => decideFulfillmentTransition(order({status: "picked_up"}), "ready"));
+
+    expect(error.message).toBe("This order is picked up, so it can't be moved to ready.");
   });
 
   it("explains that an order awaiting payment has not been paid", () => {
@@ -138,6 +176,7 @@ describe("decideFulfillmentTransition", () => {
   it.each<[OrderStatus, FulfillmentTarget]>([
     ["confirmed", "preparing"],
     ["preparing", "ready"],
+    ["picked_up", "completed"],
   ])("refuses %s -> %s when the order is not paid, even though the status fits", (status, to) => {
     const error = httpsErrorOf(() => decideFulfillmentTransition(order({status, paymentStatus: "pending"}), to));
 
@@ -145,10 +184,10 @@ describe("decideFulfillmentTransition", () => {
     expect(error.message).toBe("This order has not been paid yet.");
   });
 
-  it.each(["confirmed", "pending_payment", "cancelled", "picked_up", "completed", "bogus", "", undefined, null, 7])(
+  it.each(["confirmed", "pending_payment", "cancelled", "picked_up", "bogus", "", undefined, null, 7])(
     "rejects the unsupported target %j as an invalid argument (400), whatever the order's state",
     (to) => {
-      for (const status of ["confirmed", "preparing", "ready"] as const) {
+      for (const status of ["confirmed", "preparing", "ready", "picked_up", "completed"] as const) {
         const error = httpsErrorOf(() => decideFulfillmentTransition(order({status}), to));
 
         expect(error.code).toBe("invalid-argument");
@@ -246,7 +285,7 @@ describe("transitionOrderStatus — a transaction Firestore gives up on", () => 
 describe("Order documents with fulfillment states", () => {
   const stored = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({...order(), ...overrides});
 
-  it.each(["preparing", "ready"])("parses a stored %s order", (status) => {
+  it.each(["preparing", "ready", "picked_up", "completed"])("parses a stored %s order", (status) => {
     expect(parseOrder(stored({status}), ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID).status).toBe(status);
   });
 
@@ -257,6 +296,24 @@ describe("Order documents with fulfillment states", () => {
     expect(parsed.preparingStartedBy).toBeUndefined();
     expect(parsed.readyAt).toBeUndefined();
     expect(parsed.readyBy).toBeUndefined();
+    expect(parsed.pickedUpAt).toBeUndefined();
+    expect(parsed.pickedUpBy).toBeUndefined();
+    expect(parsed.completedAt).toBeUndefined();
+    expect(parsed.completedBy).toBeUndefined();
+  });
+
+  it("round-trips the pickup and completion audit fields", () => {
+    const pickedUpAt = Timestamp.fromDate(new Date("2026-09-27T06:00:00Z"));
+    const completedAt = Timestamp.fromDate(new Date("2026-09-27T06:05:00Z"));
+
+    const parsed = parseOrder(
+      stored({status: "completed", pickedUpAt, pickedUpBy: "U-c", completedAt, completedBy: "U-d"}),
+      ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID,
+    );
+
+    expect(parsed).toMatchObject({pickedUpBy: "U-c", completedBy: "U-d"});
+    expect(parsed.pickedUpAt?.toMillis()).toBe(pickedUpAt.toMillis());
+    expect(parsed.completedAt?.toMillis()).toBe(completedAt.toMillis());
   });
 
   it("round-trips the four audit fields", () => {
@@ -274,28 +331,37 @@ describe("Order documents with fulfillment states", () => {
   });
 
   it.each([
-    [{status: "picked_up"}],
-    [{status: "completed"}],
     [{status: "PREPARING"}],
+    [{status: "pickedup"}],
+    [{status: "picked-up"}],
     [{preparingStartedBy: ""}],
     [{preparingStartedBy: 7}],
     [{preparingStartedAt: "2026-09-27T05:00:00Z"}],
     [{readyAt: 1}],
     [{readyBy: ""}],
+    [{pickedUpBy: ""}],
+    [{pickedUpBy: 7}],
+    [{pickedUpAt: "2026-09-27T06:00:00Z"}],
+    [{completedAt: 1}],
+    [{completedBy: ""}],
   ])("still rejects the malformed document %j", (overrides) => {
     expect(() => parseOrder(stored(overrides), ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID)).toThrow(/Malformed order document/);
   });
 
   it("never puts the audit fields (or the customer's id) into the customer-safe response", () => {
     const response = toOrderResponse(order({
-      status: "ready",
+      status: "completed",
       preparingStartedAt: Timestamp.fromDate(new Date("2026-09-27T05:00:00Z")),
       preparingStartedBy: "U-secret-actor",
       readyAt: Timestamp.fromDate(new Date("2026-09-27T05:30:00Z")),
       readyBy: "U-secret-actor",
+      pickedUpAt: Timestamp.fromDate(new Date("2026-09-27T06:00:00Z")),
+      pickedUpBy: "U-secret-actor",
+      completedAt: Timestamp.fromDate(new Date("2026-09-27T06:05:00Z")),
+      completedBy: "U-secret-actor",
     }));
 
-    expect(response.status).toBe("ready");
+    expect(response.status).toBe("completed");
     expect(Object.keys(response).sort()).toEqual([
       "createdAt", "currency", "id", "items", "menuId", "organizationId", "outletId", "paymentStatus",
       "status", "subtotalInPaise", "totalInPaise", "updatedAt",

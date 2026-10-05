@@ -14,6 +14,7 @@ import {resolveOrderById, type Order, type OrderStatus} from "./orders";
  *
  * ```
  * confirmed --start-preparing--> preparing --mark-ready--> ready
+ *                                       picked_up --complete--> completed
  * ```
  *
  * `transitionOrderStatus` is the ONE place these transitions are decided and
@@ -23,11 +24,15 @@ import {resolveOrderById, type Order, type OrderStatus} from "./orders";
  * from the authoritative order inside the transaction, and the actor is the
  * caller's verified membership.
  *
- * Deliberately NOT here (later features — see root CLAUDE.md): backing out of
- * a state (`ready` -> `preparing`), pickup (`picked_up`/`completed`, which
- * needs its own verification step and so must never be reachable through a
- * generic status change), and cancellation/refunds. `ready` and `cancelled`
- * are terminal as far as this module is concerned.
+ * Deliberately NOT here: `ready` -> `picked_up`. Handing food over needs its
+ * own verification (a pickup credential), so it lives in
+ * `domain/orderPickup.ts` and `picked_up` is not a fulfillment target — it
+ * must never be reachable through a generic status change, and no URL that
+ * merely names an order can reach it. `completed` has no such need: closing out
+ * an order that was already handed over is plain operations, so it is the third
+ * row of the table below. Also not here (later features — see root
+ * CLAUDE.md): backing out of a state, and cancellation/refunds. `completed`
+ * and `cancelled` are terminal.
  *
  * Payment is not re-checked against the provider or the payment document. The
  * order's own `status == "confirmed"` and `paymentStatus == "paid"` are
@@ -38,7 +43,7 @@ import {resolveOrderById, type Order, type OrderStatus} from "./orders";
  */
 
 /** The statuses a fulfillment action can move an order INTO. */
-export type FulfillmentTarget = "preparing" | "ready";
+export type FulfillmentTarget = "preparing" | "ready" | "completed";
 
 /**
  * Roles that may run fulfillment actions: every active member, staff
@@ -71,6 +76,10 @@ const FULFILLMENT_TRANSITIONS: Readonly<Record<FulfillmentTarget, FulfillmentRul
     from: "preparing",
     audit: (actorUserId, at) => ({readyAt: at, readyBy: actorUserId}),
   },
+  completed: {
+    from: "picked_up",
+    audit: (actorUserId, at) => ({completedAt: at, completedBy: actorUserId}),
+  },
 };
 
 /**
@@ -98,9 +107,9 @@ export type FulfillmentDecision = "apply" | "noop";
  * - The order is in the one status `to` may be entered from, and is paid:
  *   `"apply"`.
  * - Anything else — the wrong status (including `pending_payment`,
- *   `cancelled`, and going "backwards"), or a `confirmed`/`preparing` order
- *   whose payment is not `paid` (which no code path can produce; refused
- *   rather than fulfilled) — is a conflict.
+ *   `cancelled`, and going "backwards"), or an order in the right status whose
+ *   payment is not `paid` (which no code path can produce; refused rather than
+ *   fulfilled) — is a conflict.
  *
  * @param {Order} order The order as currently stored.
  * @param {unknown} to The requested target status.
@@ -123,6 +132,9 @@ export function decideFulfillmentTransition(order: Order, to: unknown): Fulfillm
     if (order.status === "pending_payment") {
       throw new HttpsError("aborted", "This order has not been paid yet.");
     }
+    if (to === "completed" && PRE_PICKUP_STATUSES.includes(order.status)) {
+      throw new HttpsError("aborted", "This order has not been picked up yet.");
+    }
     throw new HttpsError(
       "aborted",
       `This order is ${describeStatus(order.status)}, so it can't be moved to ${describeStatus(to)}.`,
@@ -138,12 +150,18 @@ export function decideFulfillmentTransition(order: Order, to: unknown): Fulfillm
   return "apply";
 }
 
+/** The paid statuses an order is in before the customer has collected it. */
+const PRE_PICKUP_STATUSES: readonly OrderStatus[] = ["confirmed", "preparing", "ready"];
+
 /**
  * @param {OrderStatus} status An order status.
  * @return {string} How it reads in an error message.
  */
 function describeStatus(status: OrderStatus): string {
-  return status === "pending_payment" ? "awaiting payment" : status;
+  if (status === "pending_payment") {
+    return "awaiting payment";
+  }
+  return status === "picked_up" ? "picked up" : status;
 }
 
 /** The result of `transitionOrderStatus`. */
@@ -249,11 +267,13 @@ export async function transitionOrderStatus(
 }
 
 /**
+ * Exported so `domain/orderPickup.ts` reports a contended pickup the same way.
+ *
  * @param {unknown} error A thrown value.
  * @return {boolean} Whether it is Firestore reporting that a transaction
  *   could not commit because of contention (gRPC `ABORTED`, code 10).
  */
-function isFirestoreAborted(error: unknown): boolean {
+export function isFirestoreAborted(error: unknown): boolean {
   if (typeof error !== "object" || error === null || !("code" in error)) {
     return false;
   }

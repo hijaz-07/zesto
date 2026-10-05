@@ -9,6 +9,7 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
+import {getPickupCredentialForCustomer} from "../domain/orderPickup";
 import {
   ensureProviderOrder,
   preparePayment,
@@ -16,6 +17,7 @@ import {
   verifyCheckoutPayment,
   verifyCheckoutPaymentBodySchema,
 } from "../domain/payments";
+import {getPickupCredentialSecret} from "../domain/pickupCredential";
 import type {
   ApiResult,
   NormalizedRequest,
@@ -30,6 +32,8 @@ export interface OrdersRouteDeps {
   validator?: SessionValidator;
   /** Injectable for tests; defaults to the shared real Razorpay gateway. */
   paymentProvider?: PaymentProviderGateway;
+  /** Injectable for tests; defaults to the `PICKUP_CREDENTIAL_SECRET` param. */
+  pickupSecret?: () => string;
 }
 
 /**
@@ -61,6 +65,11 @@ export function createOrderRoutes(deps: OrdersRouteDeps): RouteDefinition[] {
       method: "POST",
       path: "/orders/:orderId/payment/verify",
       handler: (ctx) => handlePostOrderPaymentVerify(ctx, deps),
+    },
+    {
+      method: "GET",
+      path: "/orders/:orderId/pickup-credential",
+      handler: (ctx) => handleGetPickupCredential(ctx, deps),
     },
   ];
 }
@@ -328,6 +337,61 @@ async function handlePostOrderPaymentVerify(
     };
   } catch (error) {
     return mapKnownError(error);
+  }
+}
+
+/**
+ * `GET /orders/{orderId}/pickup-credential`: the QR payload and backup code the
+ * CUSTOMER shows at the counter to collect their own ready order (see
+ * `domain/pickupCredential.ts`).
+ *
+ * Authorization is the order's customer and nothing else. The caller is the
+ * verified session's user; `getPickupCredentialForCustomer` reads the
+ * authoritative order and compares its stored `userId` with that user. Knowing
+ * an order ID is not enough — an unrelated customer, and equally the
+ * organization's own owner/manager/staff (who are shown the credential by the
+ * customer and never fetch it), get the same `404` as for an order that does
+ * not exist.
+ *
+ * The response is exactly `{pickup: {qrPayload, code}}`: no customer identity,
+ * Descope ID, payment-provider data, audit field or secret. It is only
+ * available while the order is `ready` and paid (`409 conflict` otherwise),
+ * rides `Cache-Control: private, no-store` like every response here, and is
+ * derived on demand — nothing is stored server-side.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome.
+ */
+async function handleGetPickupCredential(
+  ctx: RouteContext,
+  deps: OrdersRouteDeps,
+): Promise<ApiResult> {
+  let session: VerifiedSession;
+  try {
+    session = await authenticateRequest(
+      {headers: {authorization: authorizationHeader(ctx.request)}},
+      deps.validator,
+    );
+  } catch (error) {
+    return mapKnownError(error);
+  }
+
+  try {
+    const {qrPayload, code} = await getPickupCredentialForCustomer(
+      deps.db, session.userId, ctx.params?.orderId, deps.pickupSecret ?? getPickupCredentialSecret,
+    );
+    return {
+      kind: "success",
+      status: 200,
+      data: {pickup: {qrPayload, code}},
+      userId: session.userId,
+    };
+  } catch (error) {
+    const mapped = mapKnownError(error);
+    // The order exists and is theirs, but cannot be collected right now: a
+    // state conflict, not the "this identifier is taken" this file's 409 means.
+    return mapped.kind === "error" && mapped.status === 409 ? {...mapped, code: "conflict"} : mapped;
   }
 }
 

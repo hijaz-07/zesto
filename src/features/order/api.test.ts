@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { apiFetch } from '../../lib/api/client';
-import { createOrder, getOrder, listOrders } from './api';
+import { ApiError, apiFetch } from '../../lib/api/client';
+import { createOrder, getOrder, getPickupCredential, listOrders } from './api';
 
 const apiFetchMock = vi.hoisted(() => vi.fn());
-vi.mock('../../lib/api/client', () => ({
+vi.mock('../../lib/api/client', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/api/client')>()),
   apiFetch: apiFetchMock,
 }));
 
@@ -187,5 +188,81 @@ describe('listOrders', () => {
     apiFetchMock.mockRejectedValue(error);
 
     await expect(listOrders()).rejects.toBe(error);
+  });
+});
+
+describe('getPickupCredential', () => {
+  const credential = { qrPayload: 'ZP1.order1.AAAAAAAAAAAAAAAAAAAAAA', code: 'K7QX-4M2P' };
+
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('GETs the credential of exactly the named order, with no body and no options', async () => {
+    apiFetchMock.mockResolvedValue({ pickup: credential });
+
+    await getPickupCredential('order-1');
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders/order-1/pickup-credential');
+  });
+
+  it('percent-encodes the order id rather than splicing it into the path', async () => {
+    apiFetchMock.mockResolvedValue({ pickup: credential });
+
+    await getPickupCredential('a/b?c=d');
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/orders/a%2Fb%3Fc%3Dd/pickup-credential');
+  });
+
+  it('resolves with the QR payload and the backup code', async () => {
+    apiFetchMock.mockResolvedValue({ pickup: credential });
+
+    await expect(getPickupCredential('order-1')).resolves.toEqual(credential);
+  });
+
+  it('returns exactly those two fields: anything else a server sends is dropped, never carried along', async () => {
+    apiFetchMock.mockResolvedValue({
+      pickup: { ...credential, userId: 'U-secret', provider: 'razorpay', readyBy: 'U-staff' },
+      order: { id: 'order-1' },
+    });
+
+    const result = await getPickupCredential('order-1');
+
+    expect(Object.keys(result).sort()).toEqual(['code', 'qrPayload']);
+    expect(JSON.stringify(result)).not.toContain('U-secret');
+  });
+
+  it('keeps no copy: every call asks the backend again', async () => {
+    apiFetchMock.mockResolvedValue({ pickup: credential });
+
+    await getPickupCredential('order-1');
+    await getPickupCredential('order-1');
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['no body', undefined],
+    ['no pickup', {}],
+    ['a null pickup', { pickup: null }],
+    ['a missing code', { pickup: { qrPayload: credential.qrPayload } }],
+    ['a missing payload', { pickup: { code: credential.code } }],
+    ['an empty payload', { pickup: { ...credential, qrPayload: '' } }],
+    ['an empty code', { pickup: { ...credential, code: '' } }],
+    ['a non-string code', { pickup: { ...credential, code: 12345678 } }],
+    ['a non-string payload', { pickup: { ...credential, qrPayload: ['ZP1.x.y'] } }],
+    ['an over-long payload', { pickup: { ...credential, qrPayload: 'Z'.repeat(201) } }],
+  ])('rejects a response with %s as an invalid response, never showing a half-credential', async (_label, body) => {
+    apiFetchMock.mockResolvedValue(body);
+
+    await expect(getPickupCredential('order-1')).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+
+  it('propagates the backend refusal as-is (404 for an order that is not theirs, 409 when not ready)', async () => {
+    const refusal = new ApiError(404, 'not_found', 'Order not found.');
+    apiFetchMock.mockRejectedValue(refusal);
+
+    await expect(getPickupCredential('order-1')).rejects.toBe(refusal);
   });
 });

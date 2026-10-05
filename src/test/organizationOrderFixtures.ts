@@ -39,6 +39,22 @@ export const readyOrgOrder: OrganizationOrderSummary = {
   updatedAt: '2026-09-28T10:50:00+05:30',
 };
 
+/** A paid order staff have handed over (they redeemed the customer's pickup credential), as the list/action endpoints return it. */
+export const pickedUpOrgOrder: OrganizationOrderSummary = {
+  ...confirmedOrgOrder,
+  id: 'order-picked-up-7',
+  status: 'picked_up',
+  updatedAt: '2026-09-28T11:00:00+05:30',
+};
+
+/** A paid order staff have closed out after handing it over. */
+export const completedOrgOrder: OrganizationOrderSummary = {
+  ...confirmedOrgOrder,
+  id: 'order-completed-8',
+  status: 'completed',
+  updatedAt: '2026-09-28T11:10:00+05:30',
+};
+
 /** An order still waiting for payment. */
 export const pendingOrgOrder: OrganizationOrderSummary = {
   ...confirmedOrgOrder,

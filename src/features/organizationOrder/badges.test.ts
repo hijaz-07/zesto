@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { orderStatusBadges } from '../order/orderStatusBadges';
-import type { OrderPaymentStatus, OrderStatus } from '../order/types';
+import { ORDER_STATUSES, type OrderPaymentStatus, type OrderStatus } from '../order/types';
 import { organizationOrderPaymentBadge, organizationOrderStatusBadge } from './badges';
 
 describe('organizationOrderStatusBadge', () => {
@@ -9,13 +9,15 @@ describe('organizationOrderStatusBadge', () => {
     ['confirmed', 'paid', 'Confirmed', 'success'],
     ['preparing', 'paid', 'Preparing', 'warning'],
     ['ready', 'paid', 'Ready', 'success'],
+    ['picked_up', 'paid', 'Picked up', 'success'],
+    ['completed', 'paid', 'Completed', 'neutral'],
     ['cancelled', 'pending', 'Cancelled', 'danger'],
   ] as const)('maps %s to "%s" label/tone', (status, paymentStatus, label, tone) => {
     expect(organizationOrderStatusBadge({ status, paymentStatus })).toEqual({ label, tone });
   });
 
   it("is always the label and tone the customer's own list shows for the same order", () => {
-    const statuses: OrderStatus[] = ['pending_payment', 'confirmed', 'preparing', 'ready', 'cancelled'];
+    const statuses: OrderStatus[] = [...ORDER_STATUSES];
     const payments: OrderPaymentStatus[] = ['pending', 'paid'];
     for (const status of statuses) {
       for (const paymentStatus of payments) {
@@ -34,7 +36,7 @@ describe('organizationOrderPaymentBadge', () => {
     });
   });
 
-  it.each(['preparing', 'ready'] as const)('shows Paid (success) for a %s order', (status) => {
+  it.each(['preparing', 'ready', 'picked_up', 'completed'] as const)('shows Paid (success) for a %s order', (status) => {
     expect(organizationOrderPaymentBadge({ status, paymentStatus: 'paid' })).toEqual({
       label: 'Paid',
       tone: 'success',

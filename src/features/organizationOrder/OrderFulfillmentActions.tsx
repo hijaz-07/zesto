@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Button } from '../../components/ui/Button';
-import { nextFulfillmentAction, type FulfillmentAction } from './fulfillment';
+import { isAwaitingPickup, nextFulfillmentAction, type FulfillmentAction } from './fulfillment';
 import type { OrganizationOrderId, OrganizationOrderSummary } from './types';
 
 export interface OrderFulfillmentActionsProps {
@@ -14,11 +14,13 @@ export interface OrderFulfillmentActionsProps {
 
 /**
  * The action cell of one row of the order dashboard: the single next step the
- * order can be offered (`nextFulfillmentAction`), or a dash when there is none.
- * "Start preparing" acts at once; "Mark ready" asks first, inline, because
- * nothing here can take it back. The button is only ever offered from what the
- * backend last reported for the row, and the backend re-checks everything when
- * it is pressed.
+ * order can be offered (`nextFulfillmentAction`), "Awaiting pickup" for a ready
+ * order (only the pickup flow on `/org/pickup` can hand it over, so there is
+ * deliberately no button), or a dash when there is nothing to do. "Start
+ * preparing" and "Mark completed" act at once; "Mark ready" asks first, inline,
+ * because it tells the customer their food is ready and nothing here can take it
+ * back. The button is only ever offered from what the backend last reported for
+ * the row, and the backend re-checks everything when it is pressed.
  */
 export function OrderFulfillmentActions({ order, pending, error, onRun }: OrderFulfillmentActionsProps) {
   const [confirming, setConfirming] = useState(false);
@@ -33,9 +35,13 @@ export function OrderFulfillmentActions({ order, pending, error, onRun }: OrderF
   if (!spec) {
     return (
       <div className="flex flex-col gap-1">
-        <span className="text-muted" aria-hidden="true">
-          —
-        </span>
+        {isAwaitingPickup(order) ? (
+          <span className="text-sm text-muted">Awaiting pickup</span>
+        ) : (
+          <span className="text-muted" aria-hidden="true">
+            —
+          </span>
+        )}
         {errorMessage}
       </div>
     );

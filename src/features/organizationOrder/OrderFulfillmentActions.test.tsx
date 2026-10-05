@@ -2,8 +2,10 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 import {
   cancelledOrgOrder,
+  completedOrgOrder,
   confirmedOrgOrder,
   pendingOrgOrder,
+  pickedUpOrgOrder,
   preparingOrgOrder,
   readyOrgOrder,
 } from '../../test/organizationOrderFixtures';
@@ -84,6 +86,86 @@ describe('OrderFulfillmentActions', () => {
       expect(onRun).not.toHaveBeenCalled();
       expect(screen.queryByRole('group')).not.toBeInTheDocument();
       expect(screen.getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
+    });
+  });
+
+  describe('a ready, paid order', () => {
+    it('says "Awaiting pickup" and offers no button: only the pickup flow can hand it over', () => {
+      renderActions(readyOrgOrder);
+
+      expect(screen.getByText('Awaiting pickup')).toBeInTheDocument();
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+    });
+
+    it('does not say it for a ready order that is not paid', () => {
+      renderActions({ ...readyOrgOrder, paymentStatus: 'pending' });
+
+      expect(screen.queryByText('Awaiting pickup')).not.toBeInTheDocument();
+    });
+
+    it('keeps saying it beside a failure message', () => {
+      renderActions(readyOrgOrder, { error: 'This order has changed since you loaded it. The list has been refreshed.' });
+
+      expect(screen.getByText('Awaiting pickup')).toBeInTheDocument();
+      expect(screen.getByRole('alert')).toHaveTextContent('This order has changed');
+    });
+  });
+
+  describe('a picked-up, paid order', () => {
+    it('offers "Mark completed", and nothing else', () => {
+      renderActions(pickedUpOrgOrder);
+
+      expect(screen.getAllByRole('button')).toHaveLength(1);
+      expect(screen.getByRole('button', { name: /^Mark completed, order order-picked-up-7$/ })).toBeEnabled();
+      expect(screen.queryByText('Awaiting pickup')).not.toBeInTheDocument();
+    });
+
+    it('acts on a single press, with no confirmation step', () => {
+      const onRun = renderActions(pickedUpOrgOrder);
+
+      fireEvent.click(screen.getByRole('button', { name: /Mark completed/ }));
+
+      expect(onRun).toHaveBeenCalledTimes(1);
+      expect(onRun).toHaveBeenCalledWith('order-picked-up-7', 'complete');
+      expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    });
+
+    it('is disabled while the request is in flight, and says what is happening', () => {
+      const onRun = renderActions(pickedUpOrgOrder, { pending: true });
+
+      const button = screen.getByRole('button', { name: /Completing…/ });
+      expect(button).toBeDisabled();
+      expect(button).toHaveAttribute('aria-busy', 'true');
+      fireEvent.click(button);
+      expect(onRun).not.toHaveBeenCalled();
+    });
+
+    it('shows a failure beside the button, which stays available to try again', () => {
+      const onRun = renderActions(pickedUpOrgOrder, { error: 'Zesto is temporarily unavailable.' });
+
+      expect(screen.getByRole('alert')).toHaveTextContent('Zesto is temporarily unavailable.');
+      fireEvent.click(screen.getByRole('button', { name: /Mark completed/ }));
+      expect(onRun).toHaveBeenCalledTimes(1);
+    });
+
+    it('offers nothing once it is completed: no button, and not "Awaiting pickup" either', () => {
+      const { rerender } = render(
+        <OrderFulfillmentActions order={pickedUpOrgOrder} pending={false} error={null} onRun={vi.fn()} />,
+      );
+
+      rerender(<OrderFulfillmentActions order={completedOrgOrder} pending={false} error={null} onRun={vi.fn()} />);
+
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+      expect(screen.queryByText('Awaiting pickup')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('a completed order', () => {
+    it('offers no action at all', () => {
+      renderActions(completedOrgOrder);
+
+      expect(screen.queryByRole('button')).not.toBeInTheDocument();
+      expect(screen.queryByText('Awaiting pickup')).not.toBeInTheDocument();
     });
   });
 

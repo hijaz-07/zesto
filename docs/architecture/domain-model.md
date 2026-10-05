@@ -159,11 +159,14 @@ are never trusted from the frontend — they are validated server-side.
 
 Status today is `pending_payment` → `confirmed` (set only by a verified
 payment) → `preparing` → `ready` (set by an active organization member
-through the explicit fulfillment actions), or `cancelled`. `ready` and
-`cancelled` are terminal for now; collection (`picked_up`) and the
-cancellation workflow are later features. The fulfillment transitions,
-and who may make them, are in
-[http-api.md](./http-api.md#organization-order-fulfillment).
+through the explicit fulfillment actions) → `picked_up` (set only by
+redeeming the customer's pickup credential, see Pickup below) →
+`completed` (set by a member once the order has been handed over), or
+`cancelled`. `completed` and `cancelled` are terminal; the cancellation
+workflow is a later feature. The fulfillment transitions, and who may
+make them, are in
+[http-api.md](./http-api.md#organization-order-fulfillment); pickup is in
+[http-api.md](./http-api.md#organization-order-pickup).
 
 ### OrderItem
 A single line within an `Order`: a reference to the `MenuItem`
@@ -177,10 +180,24 @@ status, and any gateway reference. Payment status is authoritative
 only when confirmed server-side, never from client state.
 
 ### Pickup
-The collection event for an `Order` — when and how a customer
-collected their food (by order ID or QR code), and who marked it
-collected. Pickup completion is a privileged operation validated
-server-side, not a frontend-only state change.
+The collection event for an `Order` — when a customer collected their
+food, and which organization member handed it over. It is not a separate
+document: it is the `ready` → `picked_up` transition of the `Order`, with
+`pickedUpAt`/`pickedUpBy` recorded on it. It is a privileged operation
+validated server-side, never a frontend-only state change, and it is the
+only transition that needs a credential.
+
+The **pickup credential** is what the customer shows: a QR payload
+(`ZP1.<orderId>.<proof>`, 128-bit proof) and a short backup code
+(`K7QX-4M2P`, 40 bits). Both are HMAC-SHA256 values derived on demand from
+the order's ID under a server-only secret (`PICKUP_CREDENTIAL_SECRET`) —
+they are **never stored** (not in Firestore, not in logs, not in a URL, not
+in browser storage) and carry no customer or payment data. Possession of
+the credential proves nothing by itself: the server also requires an
+authenticated, active member of the order's own organization, a `ready` and
+paid order, and decides all of it inside one transaction. Once the order is
+`picked_up` the same credential changes nothing, which is the replay
+protection. See [http-api.md](./http-api.md#organization-order-pickup).
 
 ### Notification
 A message sent to a `User` about their order or account — e.g. "menu

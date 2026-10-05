@@ -17,10 +17,16 @@ import {
   type FulfillmentTarget,
 } from "../domain/orderFulfillment";
 import {
+  ORDER_PICKUP_ROLES,
+  redeemPickup,
+  redeemPickupBodySchema,
+} from "../domain/orderPickup";
+import {
   listOrganizationOrders,
   listOrganizationOrdersQuerySchema,
   loadOrganizationOrderSummary,
 } from "../domain/organizationOrders";
+import {getPickupCredentialSecret} from "../domain/pickupCredential";
 import type {
   ApiResult,
   NormalizedRequest,
@@ -32,6 +38,12 @@ export interface OrganizationOrdersRouteDeps {
   db: Firestore;
   /** Injectable for tests; defaults to the shared Descope client. */
   validator?: SessionValidator;
+  /**
+   * Injectable for tests; defaults to the `PICKUP_CREDENTIAL_SECRET` param.
+   * Called only once a request is authenticated, authorized and well formed,
+   * so an unconfigured secret never shows up in the answer to anyone else.
+   */
+  pickupSecret?: () => string;
 }
 
 /**
@@ -45,19 +57,24 @@ const VIEW_ROLES: readonly OrganizationMemberRole[] =
   ["owner", "manager", "staff"];
 
 /**
- * Builds the routes for `/organizations/{organizationId}/orders` — the
- * organization-side counterpart of the customer's `/orders` (see
- * `routes/orders.ts`): the order list, and the two fulfillment actions. Unlike
- * that identity-scoped API, these are tenant-scoped like `routes/outlets.ts`/
- * `routes/menus.ts`: the organization is named in the path, and what that name
- * is worth is decided by the caller's own active membership, never by the name
- * itself.
+ * Builds the organization-side order routes — the counterpart of the
+ * customer's `/orders` (see `routes/orders.ts`): the order list, the
+ * fulfillment actions, and pickup. Unlike that identity-scoped API, these are
+ * tenant-scoped like `routes/outlets.ts`/`routes/menus.ts`: the organization is
+ * named in the path, and what that name is worth is decided by the caller's own
+ * active membership, never by the name itself.
  *
- * The fulfillment actions are explicit, body-less operations — like a menu's
- * `publish`/`archive` — not a generic "set status": the target comes from the
- * URL, and everything else (the order's current state, whether it is paid,
- * who is acting) is read from the server. Both call the same
- * `transitionOrderStatus`, so the rules exist in exactly one place.
+ * The fulfillment actions (`start-preparing`, `mark-ready`, `complete`) are
+ * explicit, body-less operations — like a menu's `publish`/`archive` — not a
+ * generic "set status": the target comes from the URL, and everything else (the
+ * order's current state, whether it is paid, who is acting) is read from the
+ * server. All call the same `transitionOrderStatus`, so the rules exist in
+ * exactly one place.
+ *
+ * Pickup is deliberately NOT one of them. `ready` -> `picked_up` needs a
+ * credential, and a credential identifies its own order — a typed backup code
+ * does not even carry an order ID — so it is `POST .../pickups`, not a route
+ * under an order's ID. No URL that merely names an order can mark it picked up.
  *
  * @param {OrganizationOrdersRouteDeps} deps The routes' dependencies.
  * @return {RouteDefinition[]} The routes to register with the router.
@@ -80,6 +97,16 @@ export function createOrganizationOrderRoutes(
       method: "POST",
       path: "/organizations/:organizationId/orders/:orderId/mark-ready",
       handler: (ctx) => handleFulfillmentAction(ctx, deps, "ready"),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/orders/:orderId/complete",
+      handler: (ctx) => handleFulfillmentAction(ctx, deps, "completed"),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/pickups",
+      handler: (ctx) => handleRedeemPickup(ctx, deps),
     },
   ];
 }
@@ -178,9 +205,10 @@ async function handleGetOrganizationOrders(
 }
 
 /**
- * `POST /organizations/{organizationId}/orders/{orderId}/start-preparing` and
- * `.../mark-ready`: moves a paid order to `preparing` / `ready`. Any active
- * `owner`/`manager`/`staff` member may do either (`ORDER_FULFILLMENT_ROLES`).
+ * `POST /organizations/{organizationId}/orders/{orderId}/start-preparing`,
+ * `.../mark-ready` and `.../complete`: moves a paid order to `preparing` /
+ * `ready` / `completed`. Any active `owner`/`manager`/`staff` member may do any
+ * of them (`ORDER_FULFILLMENT_ROLES`).
  * Takes no request body, so there is nothing for a caller to assert: a body or
  * query string (an `organizationId`, `outletId`, `status`, `userId`, ...) is
  * never read.
@@ -233,6 +261,79 @@ async function handleFulfillmentAction(
       ...mapKnownError(error),
       userId: session.userId,
       logContext: {to, outcome: "rejected"},
+    };
+  }
+}
+
+/**
+ * `POST /organizations/{organizationId}/pickups`: hands a ready order over to
+ * the customer presenting its credential — body `{credential, outletId?}`,
+ * where `credential` is the scanned QR payload or the typed backup code. Any
+ * active `owner`/`manager`/`staff` member may (`ORDER_PICKUP_ROLES`).
+ *
+ * Authentication, then authorization, then the body: a caller who is not an
+ * authorized member never learns whether their body would have been valid.
+ * Only `credential` (and the optional narrowing `outletId`) is read from it —
+ * a `status`, `userId`, `organizationId` or `orderId` there is ignored. The
+ * credential is never logged, echoed, or part of any response; the log line
+ * carries only the outcome and how it was presented.
+ *
+ * `redeemPickup` verifies the credential and moves the order in one
+ * transaction (see its doc comment), so there is no separate verification
+ * request to race. A `409` is only ever answered to a caller holding a genuine
+ * credential; anything that does not open an order of this organization is the
+ * same `404`. Presenting a credential for an order already handed over is a
+ * `409`, never a repeat `200`.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrganizationOrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with `{order}` — the
+ *   order's row in the same shape the list uses (no customer identity).
+ */
+async function handleRedeemPickup(
+  ctx: RouteContext,
+  deps: OrganizationOrdersRouteDeps,
+): Promise<ApiResult> {
+  let caller: AuthorizedCaller;
+  try {
+    caller = await authenticateAndAuthorize(ctx, deps, ORDER_PICKUP_ROLES);
+  } catch (error) {
+    return mapKnownError(error);
+  }
+  const {session, membership} = caller;
+
+  const parsedBody = redeemPickupBodySchema.safeParse(ctx.request.body);
+  if (!parsedBody.success) {
+    return {
+      kind: "error",
+      status: 400,
+      code: "invalid_argument",
+      message: firstZodIssueMessage(parsedBody.error),
+      userId: session.userId,
+      logContext: {to: "picked_up", outcome: "rejected"},
+    };
+  }
+
+  try {
+    const result = await redeemPickup(deps.db, {
+      membership,
+      credential: parsedBody.data.credential,
+      outletId: parsedBody.data.outletId,
+      getSecret: deps.pickupSecret ?? getPickupCredentialSecret,
+    });
+    const order = await loadOrganizationOrderSummary(deps.db, result.order);
+    return {
+      kind: "success",
+      status: 200,
+      data: {order},
+      userId: session.userId,
+      logContext: {from: "ready", to: "picked_up", outcome: "picked_up", via: result.via},
+    };
+  } catch (error) {
+    return {
+      ...mapKnownError(error),
+      userId: session.userId,
+      logContext: {to: "picked_up", outcome: "rejected"},
     };
   }
 }

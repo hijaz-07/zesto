@@ -32,11 +32,13 @@ const ALL_OUTLETS = '';
  * backend a page at a time (`useOrganizationOrders`). It shows what has been
  * ordered and its payment/status, and lets a member move a paid order along:
  * "Start preparing" on a confirmed order, "Mark ready" (after a confirmation)
- * on a preparing one (`useOrderFulfillment`). Both are requests the backend
- * decides — the row shown afterwards is the server's own answer, and a refused
- * action refreshes the list rather than trusting what was on screen. Orders
- * can't be changed in any other way here, and nothing is shown to customers
- * beyond their order's status.
+ * on a preparing one, and "Mark completed" on a picked-up one
+ * (`useOrderFulfillment`). A ready order reads "Awaiting pickup": handing it over
+ * needs the customer's credential and happens on `/org/pickup`, never from a
+ * row. Every action is a request the backend decides — the row shown afterwards
+ * is the server's own answer, and a refused action refreshes the list rather than
+ * trusting what was on screen. Orders can't be changed in any other way here, and
+ * nothing is shown to customers beyond their order's status.
  *
  * The outlet filter is only a request — the backend checks the chosen outlet
  * really belongs to the organization and that the signed-in member may read its

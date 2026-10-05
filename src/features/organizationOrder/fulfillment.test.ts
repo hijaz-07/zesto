@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { ORDER_STATUSES, type OrderPaymentStatus, type OrderStatus } from '../order/types';
-import { canFulfillOrders, nextFulfillmentAction } from './fulfillment';
+import { canFulfillOrders, canHandOverOrders, isAwaitingPickup, nextFulfillmentAction } from './fulfillment';
 
 describe('nextFulfillmentAction', () => {
   it('offers "Start preparing" (no confirmation) on a paid, confirmed order', () => {
@@ -23,13 +23,31 @@ describe('nextFulfillmentAction', () => {
     });
   });
 
-  it.each(['pending_payment', 'ready', 'cancelled'] as const)('offers nothing on a %s order', (status) => {
+  it('offers "Mark completed" (no confirmation) on a paid, picked-up order', () => {
+    expect(nextFulfillmentAction({ status: 'picked_up', paymentStatus: 'paid' })).toEqual({
+      action: 'complete',
+      label: 'Mark completed',
+      pendingLabel: 'Completing…',
+      confirmation: null,
+    });
+  });
+
+  it.each(['pending_payment', 'ready', 'completed', 'cancelled'] as const)('offers nothing on a %s order', (status) => {
     expect(nextFulfillmentAction({ status, paymentStatus: 'paid' })).toBeNull();
     expect(nextFulfillmentAction({ status, paymentStatus: 'pending' })).toBeNull();
   });
 
-  it.each(['confirmed', 'preparing'] as const)('offers nothing on a %s order that is not paid', (status) => {
+  it.each(['confirmed', 'preparing', 'picked_up'] as const)('offers nothing on a %s order that is not paid', (status) => {
     expect(nextFulfillmentAction({ status, paymentStatus: 'pending' })).toBeNull();
+  });
+
+  it('never offers the handover itself: no status, however paid, gets a pickup button on a row', () => {
+    for (const status of ORDER_STATUSES) {
+      const spec = nextFulfillmentAction({ status, paymentStatus: 'paid' });
+
+      expect(spec?.action as string | undefined).not.toBe('pickup');
+      expect(spec?.action as string | undefined).not.toBe('picked_up');
+    }
   });
 
   it('never offers more than one step, and only ever forward: no status offers going back or sideways', () => {
@@ -39,7 +57,33 @@ describe('nextFulfillmentAction', () => {
       payments.map((paymentStatus) => nextFulfillmentAction({ status, paymentStatus })?.action ?? null),
     );
 
-    expect(offered.filter((action) => action !== null).sort()).toEqual(['mark-ready', 'start-preparing']);
+    expect(offered.filter((action) => action !== null).sort()).toEqual(['complete', 'mark-ready', 'start-preparing']);
+  });
+});
+
+describe('isAwaitingPickup', () => {
+  it('is true only for a ready, paid order', () => {
+    expect(isAwaitingPickup({ status: 'ready', paymentStatus: 'paid' })).toBe(true);
+    expect(isAwaitingPickup({ status: 'ready', paymentStatus: 'pending' })).toBe(false);
+  });
+
+  it.each(['pending_payment', 'confirmed', 'preparing', 'picked_up', 'completed', 'cancelled'] as const)(
+    'is false for a %s order',
+    (status) => {
+      expect(isAwaitingPickup({ status, paymentStatus: 'paid' })).toBe(false);
+    },
+  );
+});
+
+describe('canHandOverOrders', () => {
+  it.each(['owner', 'manager', 'staff'] as const)('is true for an %s', (role) => {
+    expect(canHandOverOrders(role)).toBe(true);
+  });
+
+  it('is false for anything that is not one of the three roles (a tampered or future value)', () => {
+    expect(canHandOverOrders('superadmin' as never)).toBe(false);
+    expect(canHandOverOrders('' as never)).toBe(false);
+    expect(canHandOverOrders(undefined as never)).toBe(false);
   });
 });
 

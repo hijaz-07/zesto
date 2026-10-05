@@ -48,6 +48,20 @@ export const readyOrder: Order = {
   updatedAt: '2026-09-30T08:40:00+05:30',
 };
 
+/** The same paid order once staff have handed it over (they redeemed the customer's pickup credential). */
+export const pickedUpOrder: Order = {
+  ...confirmedOrder,
+  status: 'picked_up',
+  updatedAt: '2026-09-30T08:55:00+05:30',
+};
+
+/** The same paid order once staff have closed it out after the handover. */
+export const completedOrder: Order = {
+  ...confirmedOrder,
+  status: 'completed',
+  updatedAt: '2026-09-30T09:05:00+05:30',
+};
+
 /** Distinct, obviously-fake values, so a test can tell exactly which one reached Checkout. */
 export const preparedPayment: PreparedPayment = {
   paymentId: 'order-1',

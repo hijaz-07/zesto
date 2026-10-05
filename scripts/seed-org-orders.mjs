@@ -4,10 +4,13 @@
  *
  * It writes outlets, menus, orders and members straight into the Firestore
  * EMULATOR so the dashboard can be checked by hand: pagination (more than 50
- * orders), the outlet filter, confirmed / preparing / ready / pending_payment /
- * cancelled orders (so both fulfillment actions, "Start preparing" and "Mark
- * ready", have orders to act on), an inactive outlet with historical orders, and
- * a second, unrelated organization whose orders must never show up.
+ * orders), the outlet filter, confirmed / preparing / ready / picked_up /
+ * completed / pending_payment / cancelled orders (so the fulfillment actions,
+ * "Start preparing", "Mark ready" and "Mark completed", have orders to act on, and
+ * ready orders read "Awaiting pickup"), an inactive outlet with historical orders,
+ * and a second, unrelated organization whose orders must never show up. With
+ * --customer-user-id it also seeds orders for pickup, owned by a real signed-in
+ * customer (see Usage).
  *
  * SAFETY: this refuses to run unless FIRESTORE_EMULATOR_HOST is set to a
  * loopback address. With that variable set the Admin SDK talks only to the
@@ -34,13 +37,34 @@
  *   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-org-orders.mjs --org-slug <slug> --as revoked
  *   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-org-orders.mjs --org-slug <slug> --as owner
  *
+ *   # Check pickup (/org/pickup, and /app/orders/<id> as a customer): also give
+ *   # a signed-in customer a few orders to collect. --customer-user-id is the
+ *   # Descope user id of whoever you sign in as on the customer side (the
+ *   # `userId` that `GET /api/me` shows; it may be the same person as the
+ *   # organization owner). It seeds, under the Main Canteen unless noted:
+ *   #   seed-pickup-ready-main    READY, paid  - shows the QR and backup code
+ *   #   seed-pickup-ready-hostel  READY, paid, Hostel Café - the "wrong outlet" case
+ *   #   seed-pickup-preparing     preparing    - no pickup UI yet
+ *   #   seed-pickup-picked-up     picked up    - no QR; "Mark completed" in /org/orders
+ *   #   seed-pickup-completed     completed    - nothing left to do
+ *   #   seed-pickup-pending       pending payment, and
+ *   #   seed-pickup-cancelled     cancelled    - negative cases: never pick-up-able
+ *   # None of them carries a credential: a credential is derived by the backend
+ *   # from the order's id and PICKUP_CREDENTIAL_SECRET, so open the ready order as
+ *   # the customer, read the code off the page, and type it into /org/pickup.
+ *
+ *   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-org-orders.mjs --org-slug <slug> --customer-user-id <descope-user-id>
+ *
  *   # Remove everything this script created (the second organization, and the
- *   # seeded outlets/menus/orders/members in yours):
+ *   # seeded outlets/menus/orders/members in yours, pickup fixtures included):
  *
  *   FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 node scripts/seed-org-orders.mjs --org-slug <slug> --clean
  *
  * Options:
  *   --org-slug <slug>   The organization to seed (it must already exist).
+ *   --customer-user-id <id>
+ *                       Also seed the pickup fixtures above, owned by this
+ *                       customer (see above). Without it none are written.
  *   --user-id <id>      Whose membership --as changes. Defaults to the
  *                       organization's creator (you, if you onboarded it).
  *   --as <role>         owner | manager | staff (active) or invited | revoked
@@ -90,7 +114,7 @@ if (!['127.0.0.1', 'localhost', '::1'].includes(emulatorHostname)) {
 // -------------------------------------------------------------------------
 // Arguments
 // -------------------------------------------------------------------------
-const VALUE_FLAGS = new Set(['--org-slug', '--user-id', '--as', '--project']);
+const VALUE_FLAGS = new Set(['--org-slug', '--user-id', '--customer-user-id', '--as', '--project']);
 const BOOLEAN_FLAGS = new Set(['--clean']);
 const AS_VALUES = ['owner', 'manager', 'staff', 'invited', 'revoked'];
 
@@ -186,14 +210,35 @@ function lcg(seed) {
 const now = Date.now();
 const minutesAgo = (minutes) => Timestamp.fromMillis(now - minutes * 60_000);
 
-// Of every 20 orders: 8 confirmed (ready to be started), 2 preparing, 2 ready,
-// 5 awaiting payment, 2 cancelled unpaid, 1 cancelled after being paid. The
-// preparing/ready ones carry the same audit fields the fulfillment transition
-// writes (who and when), so the dashboard can be checked against realistic data.
+// Of every 20 orders: 6 confirmed (ready to be started), 1 picked up and 1
+// completed (so "Mark completed" has an order to act on, and a finished one is
+// there to show no action), 2 preparing, 2 ready, 5 awaiting payment, 2 cancelled
+// unpaid, 1 cancelled after being paid. The fulfilled ones carry the same audit
+// fields the backend transitions write (who and when), so the dashboard can be
+// checked against realistic data.
 function statusFor(index, createdAt) {
   const slot = index % 20;
   const later = (minutes) => Timestamp.fromMillis(createdAt.toMillis() + minutes * 60_000);
-  if (slot < 8) return {status: 'confirmed', paymentStatus: 'paid'};
+  if (slot < 6) return {status: 'confirmed', paymentStatus: 'paid'};
+  if (slot === 6) {
+    return {
+      status: 'picked_up', paymentStatus: 'paid',
+      preparingStartedAt: later(5), preparingStartedBy: 'U-seed-staff',
+      readyAt: later(15), readyBy: 'U-seed-staff',
+      pickedUpAt: later(25), pickedUpBy: 'U-seed-staff',
+      updatedAt: later(25),
+    };
+  }
+  if (slot === 7) {
+    return {
+      status: 'completed', paymentStatus: 'paid',
+      preparingStartedAt: later(5), preparingStartedBy: 'U-seed-staff',
+      readyAt: later(15), readyBy: 'U-seed-staff',
+      pickedUpAt: later(25), pickedUpBy: 'U-seed-staff',
+      completedAt: later(30), completedBy: 'U-seed-manager',
+      updatedAt: later(30),
+    };
+  }
   if (slot < 10) {
     return {
       status: 'preparing', paymentStatus: 'paid',
@@ -243,6 +288,60 @@ function buildOrder({organizationId, outlet, index, dishes, customerPool, create
     updatedAt: createdAt,
     // Last, so a fulfilled order's own `updatedAt` replaces the default above.
     ...statusFor(index, createdAt),
+  };
+}
+
+// -------------------------------------------------------------------------
+// Pickup fixtures (only with --customer-user-id): orders owned by a REAL
+// signed-in customer, in the states pickup cares about. Fixed ids, so re-running
+// overwrites. They carry no credential: the backend derives that from the order's
+// id and its secret, so the customer's own page is where it is read.
+// -------------------------------------------------------------------------
+const PICKUP_FIXTURES = [
+  {id: 'seed-pickup-ready-main', outlet: OUTLETS[0], status: 'ready'},
+  {id: 'seed-pickup-ready-hostel', outlet: OUTLETS[1], status: 'ready'},
+  {id: 'seed-pickup-preparing', outlet: OUTLETS[0], status: 'preparing'},
+  {id: 'seed-pickup-picked-up', outlet: OUTLETS[0], status: 'picked_up'},
+  {id: 'seed-pickup-completed', outlet: OUTLETS[0], status: 'completed'},
+  {id: 'seed-pickup-pending', outlet: OUTLETS[0], status: 'pending_payment'},
+  {id: 'seed-pickup-cancelled', outlet: OUTLETS[0], status: 'cancelled'},
+];
+
+function buildPickupFixture({organizationId, fixture, customerId, index}) {
+  // Far enough back that the whole audit timeline (up to later(30)) is in the past.
+  // The customer's page keeps whichever copy of an order has the later `updatedAt`,
+  // so a fixture dated in the future would hide the real update a pickup writes.
+  const createdAt = minutesAgo(40 + index);
+  const later = (minutes) => Timestamp.fromMillis(createdAt.toMillis() + minutes * 60_000);
+  const lines = [
+    {itemId: 'seed-pickup-item-1', name: 'Chicken Biriyani', priceInPaise: 12000, quantity: 2, lineTotalInPaise: 24000},
+    {itemId: 'seed-pickup-item-2', name: 'Veg Meals', priceInPaise: 6000, quantity: 1, lineTotalInPaise: 6000},
+  ];
+  const paid = fixture.status !== 'pending_payment' && fixture.status !== 'cancelled';
+  const audit = {};
+  const reached = (status) => ['preparing', 'ready', 'picked_up', 'completed'].indexOf(fixture.status) >=
+    ['preparing', 'ready', 'picked_up', 'completed'].indexOf(status);
+  if (reached('preparing') && fixture.status !== 'cancelled') {
+    Object.assign(audit, {preparingStartedAt: later(5), preparingStartedBy: 'U-seed-staff', updatedAt: later(5)});
+  }
+  if (reached('ready')) Object.assign(audit, {readyAt: later(15), readyBy: 'U-seed-staff', updatedAt: later(15)});
+  if (reached('picked_up')) Object.assign(audit, {pickedUpAt: later(25), pickedUpBy: 'U-seed-staff', updatedAt: later(25)});
+  if (reached('completed')) Object.assign(audit, {completedAt: later(30), completedBy: 'U-seed-manager', updatedAt: later(30)});
+  return {
+    id: fixture.id,
+    userId: customerId,
+    organizationId,
+    outletId: fixture.outlet.id,
+    menuId: fixture.outlet.menuId,
+    status: fixture.status,
+    paymentStatus: paid ? 'paid' : 'pending',
+    currency: 'INR',
+    subtotalInPaise: 30000,
+    totalInPaise: 30000,
+    items: lines,
+    createdAt,
+    updatedAt: createdAt,
+    ...audit,
   };
 }
 
@@ -345,6 +444,16 @@ async function seed(organization) {
       });
     }
   }
+  if (args['customer-user-id']) {
+    PICKUP_FIXTURES.forEach((fixture, index) => {
+      const order = buildPickupFixture({organizationId, fixture, customerId: args['customer-user-id'], index});
+      operations.push({
+        ref: db.collection('organizations').doc(organizationId).collection('outlets').doc(fixture.outlet.id)
+          .collection('menus').doc(fixture.outlet.menuId).collection('orders').doc(order.id),
+        data: order,
+      });
+    });
+  }
   operations.push(memberOp(organizationId, SEED_USERS.manager, 'manager', 'active'));
   operations.push(memberOp(organizationId, SEED_USERS.staff, 'staff', 'active'));
   operations.push(memberOp(organizationId, SEED_USERS.invited, 'owner', 'invited'));
@@ -433,3 +542,14 @@ Open /org/orders in the app. Try Load more (more than 50 orders), the outlet fil
 "[SEED] Old Annex (inactive)"), and Refresh. To view it as another kind of member, re-run with
 --as staff | manager | invited | revoked (and --as owner to restore your access).
 `);
+
+if (args['customer-user-id']) {
+  console.log(`Pickup fixtures, owned by customer "${args['customer-user-id']}":
+${PICKUP_FIXTURES.map((fixture) => `  - ${fixture.id}: ${fixture.status} (${fixture.outlet.name.replace('[SEED] ', '')})`).join('\n')}
+
+As that customer, open /app/orders/seed-pickup-ready-main: it shows the QR code and the backup code.
+Then, in /org/pickup, type the code (or scan it) to hand the order over, and "Mark completed".
+Try the same code again (already picked up), the Hostel Café order with "Main Canteen" chosen as the
+outlet (wrong outlet), and the preparing / pending / cancelled orders' pages (no pickup section).
+`);
+}

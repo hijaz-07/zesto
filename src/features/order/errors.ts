@@ -36,6 +36,27 @@ export function listOrdersErrorMessage(error: unknown): string {
   return 'Something went wrong. Please check your connection and try again.';
 }
 
+/** Maps a failure from the pickup-credential API to a customer-facing message. */
+export function getPickupCredentialErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.status === 503) {
+    return 'Zesto is temporarily unavailable. Please try again in a moment.';
+  }
+  if (error instanceof ApiError && error.status === 401) {
+    return 'Your session has expired. Please sign in again.';
+  }
+  if (error instanceof ApiError && error.status === 404) {
+    return "We couldn't find this order.";
+  }
+  if (error instanceof ApiError && error.status === 409) {
+    // The order has moved on (picked up, say) since the page last looked.
+    return "This order isn't ready for pickup any more. Refresh to see where it stands.";
+  }
+  if (error instanceof ApiError) {
+    return error.message;
+  }
+  return "Couldn't load your pickup code. Please check your connection and try again.";
+}
+
 /** Maps a failure from the single-order read API to a customer-facing message. */
 export function getOrderErrorMessage(error: unknown): string {
   if (error instanceof ApiError && error.status === 503) {

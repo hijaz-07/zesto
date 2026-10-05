@@ -10,6 +10,7 @@ import { OrganizationMenusPage } from '../pages/organization/OrganizationMenusPa
 import { OrganizationOrdersPage } from '../pages/organization/OrganizationOrdersPage';
 import { OrganizationOutletMenusPage } from '../pages/organization/OrganizationOutletMenusPage';
 import { OrganizationOutletsPage } from '../pages/organization/OrganizationOutletsPage';
+import { OrganizationPickupPage } from '../pages/organization/OrganizationPickupPage';
 import { OrganizationSettingsPage } from '../pages/organization/OrganizationSettingsPage';
 
 export interface OrganizationAppLayoutProps {
@@ -41,6 +42,7 @@ export function OrganizationAppLayout({ organizationId, role }: OrganizationAppL
           />
           <Route path="outlets" element={<OrganizationOutletsPage organizationId={organizationId} />} />
           <Route path="orders" element={<OrganizationOrdersPage organizationId={organizationId} role={role} />} />
+          <Route path="pickup" element={<OrganizationPickupPage organizationId={organizationId} role={role} />} />
           <Route path="analytics" element={<OrganizationAnalyticsPage />} />
           <Route path="settings" element={<OrganizationSettingsPage />} />
           <Route path="*" element={<Navigate to="dashboard" replace />} />
