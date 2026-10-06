@@ -2,10 +2,18 @@ import {createHash} from "node:crypto";
 import {Timestamp, type Firestore} from "firebase-admin/firestore";
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
+import {locatePaymentByProviderField, type LocatedPayment} from "./paymentLookup";
+import {
+  applyRefundWebhookEvent,
+  parseRefundWebhookEvent,
+  SUPPORTED_REFUND_WEBHOOK_EVENT_TYPES,
+  type RefundWebhookEvent,
+  type RefundWebhookEventType,
+  type RefundWebhookOutcome,
+} from "./refundWebhooks";
 import {
   markPaymentFailed,
   markPaymentSucceeded,
-  parsePayment,
   type Payment,
 } from "./payments";
 
@@ -43,11 +51,18 @@ import {
  * customer. Backend-only (see firestore.rules). */
 export const WEBHOOK_EVENTS_COLLECTION = "razorpayWebhookEvents";
 
-/** v1 subscribes to exactly these two. NOT `order.paid`: subscribing to both
+/** v1 subscribes to exactly the payment events here plus the three refund events. NOT `order.paid`: subscribing to both
  * `payment.captured` and `order.paid` would deliver two success events for
  * one payment. */
-export const SUPPORTED_WEBHOOK_EVENT_TYPES = ["payment.captured", "payment.failed"] as const;
-export type SupportedWebhookEventType = (typeof SUPPORTED_WEBHOOK_EVENT_TYPES)[number];
+export const SUPPORTED_PAYMENT_WEBHOOK_EVENT_TYPES = ["payment.captured", "payment.failed"] as const;
+export type SupportedPaymentWebhookEventType = (typeof SUPPORTED_PAYMENT_WEBHOOK_EVENT_TYPES)[number];
+
+/** Payment events plus the three refund events (see `refundWebhooks.ts`). */
+export const SUPPORTED_WEBHOOK_EVENT_TYPES = [
+  ...SUPPORTED_PAYMENT_WEBHOOK_EVENT_TYPES,
+  ...SUPPORTED_REFUND_WEBHOOK_EVENT_TYPES,
+] as const;
+export type SupportedWebhookEventType = SupportedPaymentWebhookEventType | RefundWebhookEventType;
 
 /** How long a claim blocks other deliveries of the same event. Longer than
  * any realistic processing time (a couple of Firestore transactions), short
@@ -76,7 +91,7 @@ const paymentEntitySchema = z.object({
 });
 
 const paymentEventSchema = z.object({
-  event: z.enum(SUPPORTED_WEBHOOK_EVENT_TYPES),
+  event: z.enum(SUPPORTED_PAYMENT_WEBHOOK_EVENT_TYPES),
   payload: z.object({
     payment: z.object({entity: paymentEntitySchema}),
   }),
@@ -86,7 +101,7 @@ const eventEnvelopeSchema = z.object({event: z.string().min(1)});
 
 /** A supported payment event, reduced to what reconciliation uses. */
 export interface PaymentWebhookEvent {
-  type: SupportedWebhookEventType;
+  type: SupportedPaymentWebhookEventType;
   /** Razorpay's payment ID (`pay_...`). */
   providerPaymentId: string;
   /** Razorpay's order ID (`order_...`), or null if the payment isn't tied to an order. */
@@ -100,7 +115,8 @@ export interface PaymentWebhookEvent {
 export type ParsedWebhookBody =
   | {kind: "malformed"}
   | {kind: "unsupported_event"; eventType: string}
-  | {kind: "payment_event"; event: PaymentWebhookEvent};
+  | {kind: "payment_event"; event: PaymentWebhookEvent}
+  | {kind: "refund_event"; event: RefundWebhookEvent};
 
 /**
  * Parses an ALREADY-AUTHENTICATED webhook body. Call this only after
@@ -130,6 +146,11 @@ export function parseWebhookBody(rawBody: Buffer): ParsedWebhookBody {
   const eventType = envelope.data.event;
   if (!(SUPPORTED_WEBHOOK_EVENT_TYPES as readonly string[]).includes(eventType)) {
     return {kind: "unsupported_event", eventType: eventType.slice(0, MAX_EVENT_TYPE_LENGTH)};
+  }
+
+  if ((SUPPORTED_REFUND_WEBHOOK_EVENT_TYPES as readonly string[]).includes(eventType)) {
+    const refundEvent = parseRefundWebhookEvent(json);
+    return refundEvent === null ? {kind: "malformed"} : {kind: "refund_event", event: refundEvent};
   }
 
   const parsed = paymentEventSchema.safeParse(json);
@@ -378,10 +399,11 @@ export type WebhookOutcome =
   | "rejected_currency_mismatch"
   | "rejected_amount_mismatch"
   | "rejected_missing_order"
-  | "rejected_order_not_payable";
+  | "rejected_order_not_payable"
+  | RefundWebhookOutcome;
 
 /** The expected payment-entity status for each supported event type. */
-const EXPECTED_PROVIDER_STATUS: Record<SupportedWebhookEventType, string> = {
+const EXPECTED_PROVIDER_STATUS: Record<SupportedPaymentWebhookEventType, string> = {
   "payment.captured": "captured",
   "payment.failed": "failed",
 };
@@ -416,61 +438,17 @@ export function checkWebhookContext(
   return null;
 }
 
-type LocatedPayment =
-  | {kind: "none"}
-  | {kind: "ambiguous"}
-  | {kind: "found"; payment: Payment};
-
 /**
- * Finds the Zesto payment for a Razorpay order ID with a collection-group
- * query over `payments.providerOrderId` (see firestore.indexes.json). The
- * ID is Razorpay's own, set by `ensureProviderOrder` before the customer
- * could ever pay; nothing customer-supplied takes part in the lookup.
- *
- * Exactly one match is required: none means the event isn't about Zesto (or
- * an order Zesto never persisted), more than one is a data anomaly that must
- * never be guessed at.
+ * Finds the Zesto payment for a Razorpay order ID (see `paymentLookup.ts`). The
+ * ID is Razorpay's own, set by `ensureProviderOrder` before the customer could
+ * ever pay.
  *
  * @param {Firestore} db Admin Firestore instance.
  * @param {string} providerOrderId Razorpay's order ID.
  * @return {Promise<LocatedPayment>} The lookup result.
  */
-async function locatePaymentByProviderOrderId(
-  db: Firestore,
-  providerOrderId: string,
-): Promise<LocatedPayment> {
-  const snapshot = await db
-    .collectionGroup("payments")
-    .where("providerOrderId", "==", providerOrderId)
-    .limit(2)
-    .get();
-  if (snapshot.empty) {
-    return {kind: "none"};
-  }
-  if (snapshot.size > 1) {
-    return {kind: "ambiguous"};
-  }
-
-  const doc = snapshot.docs[0];
-  // organizations/{org}/outlets/{outlet}/menus/{menu}/orders/{order}/payments/{payment}
-  const segments = doc.ref.path.split("/");
-  const isOrderPayment =
-    segments.length === 10 &&
-    segments[0] === "organizations" &&
-    segments[2] === "outlets" &&
-    segments[4] === "menus" &&
-    segments[6] === "orders" &&
-    segments[8] === "payments";
-  if (!isOrderPayment) {
-    return {kind: "none"};
-  }
-
-  // Validates the stored document against the path it was found at; a
-  // malformed stored record throws (-> generic 500), like every other read.
-  const payment = parsePayment(
-    doc.data(), segments[9], segments[7], segments[1], segments[3], segments[5],
-  );
-  return {kind: "found", payment};
+function locatePaymentByProviderOrderId(db: Firestore, providerOrderId: string): Promise<LocatedPayment> {
+  return locatePaymentByProviderField(db, "providerOrderId", providerOrderId);
 }
 
 /**
@@ -607,6 +585,8 @@ export type ReceiveWebhookResult =
     outcome: WebhookOutcome;
     providerOrderId: string | null;
     providerPaymentId: string;
+    /** Set for a refund event. */
+    providerRefundId?: string;
   };
 
 /**
@@ -639,6 +619,7 @@ export async function receiveRazorpayWebhook(
   }
 
   const {event} = parsed;
+  const providerOrderId = parsed.kind === "payment_event" ? parsed.event.providerOrderId : null;
   const identity = deriveWebhookEventIdentity({
     eventIdHeader: input.eventIdHeader,
     rawBody: input.rawBody,
@@ -647,7 +628,7 @@ export async function receiveRazorpayWebhook(
   const claim = await claimWebhookEvent(db, {
     identity,
     eventType: event.type,
-    providerOrderId: event.providerOrderId,
+    providerOrderId,
     providerPaymentId: event.providerPaymentId,
   }, now);
 
@@ -664,7 +645,9 @@ export async function receiveRazorpayWebhook(
 
   let outcome: WebhookOutcome;
   try {
-    outcome = await applyPaymentWebhookEvent(db, event);
+    outcome = parsed.kind === "payment_event" ?
+      await applyPaymentWebhookEvent(db, parsed.event) :
+      await applyRefundWebhookEvent(db, parsed.event, identity.eventKey);
     await completeWebhookEvent(db, identity.eventKey, outcome);
   } catch (error) {
     await releaseWebhookClaim(db, identity.eventKey);
@@ -676,7 +659,8 @@ export async function receiveRazorpayWebhook(
     eventKey: identity.eventKey,
     eventType: event.type,
     outcome,
-    providerOrderId: event.providerOrderId,
+    providerOrderId,
     providerPaymentId: event.providerPaymentId,
+    ...(parsed.kind === "refund_event" ? {providerRefundId: parsed.event.providerRefundId} : {}),
   };
 }

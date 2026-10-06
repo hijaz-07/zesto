@@ -2,6 +2,7 @@
 import {Timestamp} from "firebase-admin/firestore";
 import {describe, expect, it} from "vitest";
 import {parsePayment, toPaymentResponse, type Payment} from "./payments";
+import {assessPaymentRefundability, capturedAmountInPaise, readRefundAggregates} from "./refundAmounts";
 
 const ORG_ID = "org-1";
 const OUTLET_ID = "outlet-1";
@@ -163,5 +164,118 @@ describe("toPaymentResponse", () => {
     const serialized = JSON.stringify(response).toLowerCase();
     expect(serialized).not.toContain("secret");
     expect(serialized).not.toContain("key_secret");
+  });
+});
+
+describe("parsePayment: refund aggregates (legacy compatible)", () => {
+  const parse = (payment: unknown) => parsePayment(payment, ORDER_ID, ORDER_ID, ORG_ID, OUTLET_ID, MENU_ID);
+  const succeeded = (overrides: Partial<Payment> = {}): Payment =>
+    validPayment({provider: "razorpay", status: "succeeded", providerPaymentId: "pay_Test1", ...overrides});
+
+  it("still parses every legacy payment, with no refund fields", () => {
+    for (const status of ["pending", "failed", "succeeded"] as const) {
+      const payment = validPayment({status});
+      expect(parse(payment)).toEqual(payment);
+    }
+  });
+
+  it("does not add refund keys to a payment that has none", () => {
+    const parsed = parse(succeeded());
+    for (const key of ["capturedAmountInPaise", "refundedAmountInPaise", "refundPendingInPaise", "refundSeq", "refundState"]) {
+      expect(parsed).not.toHaveProperty(key);
+    }
+  });
+
+  it("parses an old succeeded payment without capturedAmountInPaise, and reads it as captured in full", () => {
+    const parsed = parse(succeeded());
+    expect(parsed.capturedAmountInPaise).toBeUndefined();
+    expect(capturedAmountInPaise(parsed)).toBe(24000);
+    expect(readRefundAggregates(parsed)).toEqual({capturedInPaise: 24000, refundedInPaise: 0, refundPendingInPaise: 0});
+  });
+
+  it("parses a succeeded payment with a captured amount", () => {
+    const parsed = parse(succeeded({capturedAmountInPaise: 24000}));
+    expect(parsed.capturedAmountInPaise).toBe(24000);
+    expect(capturedAmountInPaise(parsed)).toBe(24000);
+  });
+
+  it("parses a payment mid-refund and a fully refunded one", () => {
+    const midway = parse(succeeded({
+      capturedAmountInPaise: 24000, refundedAmountInPaise: 10000, refundPendingInPaise: 14000, refundSeq: 2, refundState: "in_progress",
+    }));
+    expect(midway).toMatchObject({refundedAmountInPaise: 10000, refundPendingInPaise: 14000, refundSeq: 2});
+
+    const refunded = parse(succeeded({
+      capturedAmountInPaise: 24000, refundedAmountInPaise: 24000, refundPendingInPaise: 0, refundSeq: 1, refundState: "refunded",
+    }));
+    expect(refunded.refundState).toBe("refunded");
+  });
+
+  it("accepts every approved refundState, and rejects any other", () => {
+    for (const refundState of ["none", "in_progress", "partially_refunded", "refunded", "attention_required"] as const) {
+      expect(parse(succeeded({refundState})).refundState).toBe(refundState);
+    }
+    expect(() => parse({...succeeded(), refundState: "refund_pending"})).toThrow();
+  });
+
+  it("accepts refunded + pending exactly equal to captured, and rejects one paisa over", () => {
+    expect(() => parse(succeeded({refundedAmountInPaise: 10000, refundPendingInPaise: 14000}))).not.toThrow();
+    expect(() => parse(succeeded({refundedAmountInPaise: 10000, refundPendingInPaise: 14001}))).toThrow();
+  });
+
+  it("applies that rule to a legacy payment too (captured defaults to the amount)", () => {
+    expect(() => parse(succeeded({refundedAmountInPaise: 24001}))).toThrow();
+  });
+
+  it("rejects a captured amount that differs from the payment amount", () => {
+    expect(() => parse(succeeded({capturedAmountInPaise: 23999}))).toThrow();
+    expect(() => parse(succeeded({capturedAmountInPaise: 24001}))).toThrow();
+  });
+
+  it("rejects negative, fractional and non-numeric amounts", () => {
+    for (const bad of [-1, 0.5, NaN, Infinity, "100", null]) {
+      for (const field of ["capturedAmountInPaise", "refundedAmountInPaise", "refundPendingInPaise", "refundSeq"]) {
+        expect(() => parse({...succeeded(), [field]: bad}), `${field}=${String(bad)}`).toThrow();
+      }
+    }
+  });
+
+  it("rejects refund fields on a payment that did not succeed: nothing was captured", () => {
+    for (const status of ["pending", "failed"] as const) {
+      expect(() => parse(validPayment({status, capturedAmountInPaise: 24000}))).toThrow();
+      expect(() => parse(validPayment({status, refundedAmountInPaise: 1}))).toThrow();
+      expect(() => parse(validPayment({status, refundPendingInPaise: 1}))).toThrow();
+      expect(() => parse(validPayment({status, refundSeq: 1}))).toThrow();
+      expect(() => parse(validPayment({status, refundState: "in_progress"}))).toThrow();
+    }
+  });
+
+  it("treats a failed payment with a missing provider payment ID as readable but not refundable", () => {
+    const parsed = parse(validPayment({status: "failed"}));
+    expect(assessPaymentRefundability(parsed)).toEqual({kind: "not_refundable", reason: "payment_not_succeeded"});
+  });
+
+  it("treats a pending payment as readable but not refundable", () => {
+    expect(assessPaymentRefundability(parse(validPayment()))).toEqual({kind: "not_refundable", reason: "payment_not_succeeded"});
+  });
+
+  it("treats an old succeeded payment with no provider payment ID as readable but not refundable", () => {
+    const parsed = parse(validPayment({status: "succeeded"}));
+    expect(assessPaymentRefundability(parsed)).toEqual({kind: "not_refundable", reason: "missing_provider_payment_id"});
+  });
+
+  it("treats an old succeeded payment WITH a provider payment ID as refundable in full", () => {
+    expect(assessPaymentRefundability(parse(succeeded()))).toMatchObject({
+      kind: "refundable", providerPaymentId: "pay_Test1", remainingInPaise: 24000,
+    });
+  });
+
+  it("never exposes any refund field in the customer response", () => {
+    const response = toPaymentResponse(succeeded({
+      capturedAmountInPaise: 24000, refundedAmountInPaise: 1000, refundPendingInPaise: 2000, refundSeq: 1, refundState: "in_progress",
+    }));
+    for (const key of ["capturedAmountInPaise", "refundedAmountInPaise", "refundPendingInPaise", "refundSeq", "refundState"]) {
+      expect(response).not.toHaveProperty(key);
+    }
   });
 });

@@ -597,6 +597,40 @@ describe('firestore.rules: organizations/{organizationId}/outlets/{outletId}/men
   });
 });
 
+describe('firestore.rules: …/payments/{paymentId}/refunds and its audit/anomaly records', () => {
+  const PAYMENT_PATH = [
+    'organizations', ORG_A, 'outlets', 'outlet-1', 'menus', 'menu-1', 'orders', 'order-1', 'payments', 'order-1',
+  ] as const;
+  // Refund ledger, its transition audit trail and its anomaly records: backend-only,
+  // like the payment itself (the default deny covers every nested path).
+  const PATHS: Array<[string, string[]]> = [
+    ['refund', [...PAYMENT_PATH, 'refunds', 'order-1-r1']],
+    ['transition record', [...PAYMENT_PATH, 'refunds', 'order-1-r1', 'transitions', 'requested_to_pending']],
+    ['refund anomaly record', [...PAYMENT_PATH, 'refunds', 'order-1-r1', 'anomalies', 'x']],
+    ['payment anomaly record', [...PAYMENT_PATH, 'anomalies', 'x']],
+  ];
+
+  it.each(PATHS)('denies every client read, write and delete of a %s', async (_name, path) => {
+    const [first, ...rest] = path;
+    await testEnv.withSecurityRulesDisabled(async (context) => {
+      await setDoc(doc(context.firestore(), first, ...rest), {status: 'pending', amountInPaise: 100});
+    });
+
+    for (const db of Object.values(clients())) {
+      await assertFails(getDoc(doc(db, first, ...rest)));
+      await assertFails(setDoc(doc(db, first, ...rest), {status: 'processed'}));
+      await assertFails(updateDoc(doc(db, first, ...rest), {status: 'processed'}));
+      await assertFails(deleteDoc(doc(db, first, ...rest)));
+    }
+  });
+
+  it('denies listing a payment\'s refunds', async () => {
+    for (const db of Object.values(clients())) {
+      await assertFails(getDocs(collection(db, ...PAYMENT_PATH, 'refunds')));
+    }
+  });
+});
+
 describe('firestore.rules: users/{userId}/orderIdempotencyKeys/{idempotencyKey}', () => {
   const IDEMPOTENCY_KEY = 'idem-key-1';
 

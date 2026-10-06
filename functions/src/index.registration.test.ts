@@ -41,4 +41,22 @@ describe("functions/src/index.ts registers every route module", () => {
     expect(indexSource).toContain('document: "notificationEvents/{eventId}"');
     expect(indexSource).toContain('region: "asia-south1"');
   });
+
+  it("exports the refund submission trigger, on the refunds subcollection, with the Razorpay secret", () => {
+    expect(indexSource).toContain("export const onRefundCreated = onDocumentCreated(");
+    expect(indexSource).toContain("payments/{paymentId}/refunds/{refundId}");
+    expect(indexSource).toContain("handleRefundCreated(");
+    expect(indexSource).toMatch(/onRefundCreated[\s\S]*?secrets: \[razorpayKeySecret\]/);
+  });
+
+  it("exports the scheduled refund reconciliation, in asia-south1, as a single instance", () => {
+    expect(indexSource).toContain("export const reconcileRefunds = onSchedule(");
+    expect(indexSource).toContain("reconcileDueRefunds(");
+    expect(indexSource).toMatch(/reconcileRefunds[\s\S]*?maxInstances: 1/);
+    expect(indexSource).toMatch(/reconcileRefunds[\s\S]*?region: "asia-south1"/);
+  });
+
+  it("serves refund webhooks on the existing api function: no second webhook function exists", () => {
+    expect(indexSource.split("= onRequest(").length - 1).toBe(1);
+  });
 });

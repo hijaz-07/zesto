@@ -7,10 +7,21 @@ import {
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
+import {
+  CANCELLABLE_ORDER_STATUSES,
+  ORDER_CANCELLATION_REASON_VALUES,
+  ORDER_CANCELLED_BY_ROLE_VALUES,
+  isCustomerCancellationReason,
+  isOrganizationCancellationReason,
+  type CancellableOrderStatus,
+  type OrderCancelledByRole,
+  type OrderCancellationReason,
+} from "./cancellation";
 import {computeOrderingState} from "./explore";
 import {parseMenu, type Menu} from "./menus";
 import {parseMenuItem} from "./menuItems";
 import {parseOutlet, type Outlet} from "./outlets";
+import {PAYMENT_REFUND_STATE_VALUES, type PaymentRefundState} from "./refundAmounts";
 
 /**
  * `organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders/{orderId}`
@@ -36,7 +47,9 @@ import {parseOutlet, type Outlet} from "./outlets";
  * (`transitionOrderStatus`); and `ready` -> `picked_up` by
  * `domain/orderPickup.ts` (`redeemPickup`), the only transition that needs a
  * credential. Nothing else writes `status`. `completed` and `cancelled` are
- * terminal (cancellation itself is a later feature).
+ * terminal. `cancelled` is written only by `domain/orderCancellation.ts`'s
+ * `cancelOrder`, which applies the policy `domain/cancellation.ts`'s pure
+ * `decideCancellation` decides.
  */
 export type OrderStatus =
   "pending_payment" | "confirmed" | "preparing" | "ready" | "picked_up" | "completed" | "cancelled";
@@ -110,6 +123,35 @@ export interface Order {
   pickedUpBy?: string;
   completedAt?: Timestamp;
   completedBy?: string;
+  /**
+   * Cancellation audit trail — written together, once, by the transaction that
+   * moves the order into `cancelled`, and never overwritten (a repeated cancel
+   * is a no-op). All five are absent on every order that was not cancelled, so
+   * every order written before cancellation existed stays valid. `cancelledBy`
+   * is the customer's or the organization member's Descope user ID;
+   * `cancellationReason` is absent when a customer gave none (an organization
+   * must). Internal: never part of any API response (see `toOrderResponse`).
+   */
+  cancelledAt?: Timestamp;
+  cancelledBy?: string;
+  cancelledByRole?: OrderCancelledByRole;
+  cancellationReason?: OrderCancellationReason;
+  cancelledFromStatus?: CancellableOrderStatus;
+  /**
+   * The order-level REFUND MIRROR: a denormalized, read-only copy of the figures
+   * the payment document keeps authoritatively (`refundState` and
+   * `refundedAmountInPaise`, see `domain/refundAmounts.ts`), so an order can be
+   * shown with its refund state without reading its payment. It is a mirror,
+   * not a second accounting model: nothing reads it to decide anything, and it
+   * is only ever written in the SAME transaction that changes the payment's
+   * refund figures (`domain/refundCreation.ts`'s `orderRefundMirror`), from the
+   * figures that transaction just computed. Both are written together or not at
+   * all, and are absent on every order that has had no refund activity —
+   * including every order written before refunds existed, which stays valid.
+   * Internal: never part of `OrderResponse`.
+   */
+  refundStatus?: PaymentRefundState;
+  refundedInPaise?: number;
 }
 
 /**
@@ -227,6 +269,43 @@ const orderDocSchema = z.object({
     "completedAt must be a Firestore Timestamp",
   ).optional(),
   completedBy: z.string().min(1).optional(),
+  cancelledAt: z.custom<Timestamp>(
+    (value) => value instanceof Timestamp,
+    "cancelledAt must be a Firestore Timestamp",
+  ).optional(),
+  cancelledBy: z.string().min(1).optional(),
+  cancelledByRole: z.enum(ORDER_CANCELLED_BY_ROLE_VALUES).optional(),
+  cancellationReason: z.enum(ORDER_CANCELLATION_REASON_VALUES).optional(),
+  cancelledFromStatus: z.enum(CANCELLABLE_ORDER_STATUSES).optional(),
+  refundStatus: z.enum(PAYMENT_REFUND_STATE_VALUES).optional(),
+  refundedInPaise: z.number().int().min(0).optional(),
+}).superRefine((value, ctx) => {
+  if ((value.refundStatus === undefined) !== (value.refundedInPaise === undefined)) {
+    ctx.addIssue({code: "custom", message: "Refund mirror fields must be written together.", path: ["refundStatus"]});
+  }
+  // The audit group is written together or not at all, only on a cancelled
+  // order, and the reason must belong to whoever cancelled. None of this
+  // constrains an order without cancellation fields.
+  const group = [value.cancelledAt, value.cancelledBy, value.cancelledByRole, value.cancelledFromStatus];
+  const present = group.filter((field) => field !== undefined).length;
+  const anyCancellationField = present > 0 || value.cancellationReason !== undefined;
+  if (anyCancellationField && value.status !== "cancelled") {
+    ctx.addIssue({code: "custom", message: "Cancellation fields on an order that is not cancelled.", path: ["status"]});
+  }
+  if (present !== 0 && present !== group.length) {
+    ctx.addIssue({code: "custom", message: "Cancellation fields must be written together.", path: ["cancelledAt"]});
+  }
+  if (value.cancellationReason !== undefined && present === 0) {
+    ctx.addIssue({code: "custom", message: "A cancellation reason without a cancellation.", path: ["cancellationReason"]});
+  }
+  if (value.cancelledByRole === "customer" &&
+    value.cancellationReason !== undefined &&
+    !isCustomerCancellationReason(value.cancellationReason)) {
+    ctx.addIssue({code: "custom", message: "Not a customer cancellation reason.", path: ["cancellationReason"]});
+  }
+  if (value.cancelledByRole === "organization" && !isOrganizationCancellationReason(value.cancellationReason)) {
+    ctx.addIssue({code: "custom", message: "An organization cancellation needs an organization reason.", path: ["cancellationReason"]});
+  }
 });
 
 /**

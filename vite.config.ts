@@ -33,8 +33,14 @@ export default defineConfig(({ mode }) => {
       setupFiles: ['./src/test/setup.ts'],
       // Firestore rules tests and functions emulator tests need a running
       // emulator and a node environment; they're run separately via
-      // `npm run test:rules` / `npm run test:functions-emulator`.
-      exclude: [...configDefaults.exclude, 'firestore/**', 'functions/src/**/*.emulator.test.ts'],
+      // `npm run test:rules` / `npm run test:functions-emulator`; the Firestore trigger
+      // tests also need the Functions emulator: `npm run test:functions-trigger`.
+      exclude: [
+        ...configDefaults.exclude,
+        'firestore/**',
+        'functions/src/**/*.emulator.test.ts',
+        'functions/src/**/*.trigger.test.ts',
+      ],
     },
   }
 })

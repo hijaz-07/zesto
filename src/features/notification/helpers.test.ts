@@ -11,6 +11,7 @@ import {
 import { notificationTarget, notificationsPath } from './link';
 import {
   CUSTOMER_NOTIFICATION_TYPES,
+  ORGANIZATION_NOTIFICATION_TYPES,
   NOTIFICATION_TYPES,
   type AppNotification,
   type NotificationScope,
@@ -57,11 +58,22 @@ describe('bellLabel', () => {
 });
 
 describe('the notification types', () => {
-  it('are exactly the four customer ones and new_order — no order_completed', () => {
+  it('are the order, cancellation and refund ones, each once — and no order_completed or refund_requested', () => {
     expect([...NOTIFICATION_TYPES]).toEqual([
-      'order_confirmed', 'order_preparing', 'order_ready', 'order_picked_up', 'new_order',
+      'order_confirmed', 'order_preparing', 'order_ready', 'order_picked_up',
+      'order_cancelled_by_outlet', 'order_cancelled_by_system', 'refund_completed', 'refund_failed',
+      'new_order', 'order_cancelled_by_customer',
     ]);
+    expect(new Set(NOTIFICATION_TYPES).size).toBe(NOTIFICATION_TYPES.length);
     expect([...CUSTOMER_NOTIFICATION_TYPES]).not.toContain('order_completed');
+    expect(NOTIFICATION_TYPES as readonly string[]).not.toContain('refund_requested');
+  });
+
+  it('the customer sees an outlet or system cancellation and not their own; the organization sees the customer cancellation', () => {
+    expect([...CUSTOMER_NOTIFICATION_TYPES]).toContain('order_cancelled_by_outlet');
+    expect([...CUSTOMER_NOTIFICATION_TYPES]).not.toContain('order_cancelled_by_customer');
+    expect([...ORGANIZATION_NOTIFICATION_TYPES]).toContain('order_cancelled_by_customer');
+    expect([...ORGANIZATION_NOTIFICATION_TYPES]).not.toContain('order_cancelled_by_outlet');
   });
 });
 
@@ -70,9 +82,12 @@ describe('deep links', () => {
     expect(notificationTarget(notification({ type, orderId: 'abc123' }), CUSTOMER)).toBe('/app/orders/abc123');
   });
 
-  it('an organization notification opens the existing orders page — there is no per-order organization page', () => {
-    expect(notificationTarget(notification({ type: 'new_order', orderId: 'abc123' }), ORG)).toBe('/org/orders');
-  });
+  it.each(ORGANIZATION_NOTIFICATION_TYPES)(
+    'an organization %s notification opens the existing orders page — there is no per-order organization page',
+    (type) => {
+      expect(notificationTarget(notification({ type, orderId: 'abc123' }), ORG)).toBe('/org/orders');
+    },
+  );
 
   it('builds the path from the order id only, encoded, never from anything else', () => {
     expect(notificationTarget(notification({ orderId: 'a/b?c#d' }), CUSTOMER)).toBe('/app/orders/a%2Fb%3Fc%23d');

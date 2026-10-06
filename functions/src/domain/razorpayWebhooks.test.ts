@@ -50,8 +50,10 @@ function capturedPayload(entity: Record<string, unknown> = {}, event = "payment.
 }
 
 describe("parseWebhookBody", () => {
-  it("subscribes to exactly payment.captured and payment.failed — not order.paid", () => {
-    expect([...SUPPORTED_WEBHOOK_EVENT_TYPES]).toEqual(["payment.captured", "payment.failed"]);
+  it("subscribes to exactly the two payment events and the three refund events — not order.paid", () => {
+    expect([...SUPPORTED_WEBHOOK_EVENT_TYPES]).toEqual([
+      "payment.captured", "payment.failed", "refund.created", "refund.processed", "refund.failed",
+    ]);
   });
 
   it("extracts exactly the fields reconciliation needs from payment.captured", () => {
@@ -107,7 +109,7 @@ describe("parseWebhookBody", () => {
   });
 
   it.each([
-    ["order.paid"], ["payment.authorized"], ["refund.created"], ["payment.dispute.created"], ["settlement.processed"],
+    ["order.paid"], ["payment.authorized"], ["refund.speed_changed"], ["payment.dispute.created"], ["settlement.processed"],
   ])("reports %s as an unsupported event — even when it carries a payment entity", (eventType) => {
     const parsed = parseWebhookBody(body(capturedPayload({}, eventType)));
 

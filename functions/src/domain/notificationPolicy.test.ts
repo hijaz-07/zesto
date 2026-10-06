@@ -1,14 +1,21 @@
 // @vitest-environment node
 import {describe, expect, it} from "vitest";
-import {NOTIFICATION_EVENT_TYPES, type NotificationEventType} from "./notificationEvents";
+import {
+  CANCELLATION_NOTIFICATION_EVENT_TYPES,
+  NOTIFICATION_EVENT_TYPES,
+  REFUND_NOTIFICATION_EVENT_TYPES,
+  type AnyNotificationEventType,
+  type NotificationEventType,
+} from "./notificationEvents";
 import {
   CUSTOMER_NOTIFICATION_TYPES,
   NOTIFICATION_ORG_ROLES,
   NOTIFICATION_TYPES,
   notificationsForEvent,
+  type NotificationCopyContext,
 } from "./notificationPolicy";
 
-const CONTEXT = {outletName: "Main Canteen"};
+const CONTEXT: NotificationCopyContext = {outletName: "Main Canteen"};
 
 function customerDrafts(type: NotificationEventType) {
   return notificationsForEvent(type, CONTEXT).filter((draft) => draft.audience === "customer");
@@ -78,5 +85,151 @@ describe("copy", () => {
 
   it("is a pure function of its inputs", () => {
     expect(notificationsForEvent("order_ready", CONTEXT)).toEqual(notificationsForEvent("order_ready", CONTEXT));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Checkpoint 7.6: cancellation and refund notifications
+// ---------------------------------------------------------------------------
+
+const ALL_EVENT_TYPES: readonly AnyNotificationEventType[] = [
+  ...NOTIFICATION_EVENT_TYPES, ...CANCELLATION_NOTIFICATION_EVENT_TYPES, ...REFUND_NOTIFICATION_EVENT_TYPES,
+];
+
+function draftsFor(type: AnyNotificationEventType, context = CONTEXT) {
+  return notificationsForEvent(type, context);
+}
+
+describe("a customer's cancellation tells the organization only", () => {
+  it("one organization notification, none for the customer who did it", () => {
+    expect(draftsFor("order_cancelled_by_customer")).toEqual([{
+      audience: "org",
+      type: "order_cancelled_by_customer",
+      title: "Order cancelled",
+      body: "An order from Main Canteen was cancelled by the customer.",
+    }]);
+  });
+
+  it("is addressed to every notifying role (no `roles` narrowing), so owners, managers and staff all get it", () => {
+    expect(draftsFor("order_cancelled_by_customer")[0]).not.toHaveProperty("roles");
+  });
+
+  it("does not change with the refund flag: the organization is not told about money here", () => {
+    expect(draftsFor("order_cancelled_by_customer", {...CONTEXT, refundInitiated: true}))
+      .toEqual(draftsFor("order_cancelled_by_customer", {...CONTEXT, refundInitiated: false}));
+  });
+});
+
+describe("an outlet's or the system's cancellation tells the customer only", () => {
+  it("outlet, with no refund", () => {
+    expect(draftsFor("order_cancelled_by_outlet")).toEqual([{
+      audience: "customer",
+      type: "order_cancelled_by_outlet",
+      title: "Order cancelled",
+      body: "Your order from Main Canteen was cancelled by the outlet.",
+    }]);
+  });
+
+  it("outlet, with a refund started: the same copy plus one safe sentence", () => {
+    expect(draftsFor("order_cancelled_by_outlet", {...CONTEXT, refundInitiated: true})[0].body)
+      .toBe("Your order from Main Canteen was cancelled by the outlet. A refund has been initiated.");
+  });
+
+  it("system, with and without a refund", () => {
+    expect(draftsFor("order_cancelled_by_system")).toEqual([{
+      audience: "customer",
+      type: "order_cancelled_by_system",
+      title: "Order cancelled",
+      body: "Your order from Main Canteen was cancelled.",
+    }]);
+    expect(draftsFor("order_cancelled_by_system", {...CONTEXT, refundInitiated: true})[0].body)
+      .toBe("Your order from Main Canteen was cancelled. A refund has been initiated.");
+  });
+
+  it("degrades to complete sentences when the outlet is unknown", () => {
+    expect(draftsFor("order_cancelled_by_outlet", {})[0].body).toBe("Your order was cancelled by the outlet.");
+    expect(draftsFor("order_cancelled_by_customer", {})[0].body).toBe("An order was cancelled by the customer.");
+  });
+
+  it.each(["order_cancelled_by_outlet", "order_cancelled_by_system"] as const)("%s has no organization notification", (type) => {
+    expect(orgDraftsAny(type)).toEqual([]);
+  });
+});
+
+function orgDraftsAny(type: AnyNotificationEventType) {
+  return draftsFor(type).filter((draft) => draft.audience === "org");
+}
+
+describe("refund events", () => {
+  it("refund_requested produces NO visible notification for anyone", () => {
+    expect(draftsFor("refund_requested")).toEqual([]);
+    expect(draftsFor("refund_requested", {...CONTEXT, refundInitiated: true})).toEqual([]);
+  });
+
+  it("refund_completed: the customer only, with safe timing language and no promise of a date", () => {
+    expect(draftsFor("refund_completed")).toEqual([{
+      audience: "customer",
+      type: "refund_completed",
+      title: "Refund processed",
+      body: "Your refund has been processed. It may take a few business days to appear in your account.",
+    }]);
+    expect(orgDraftsAny("refund_completed")).toEqual([]);
+  });
+
+  it("refund_failed: the customer, and the organization's owners and managers — not staff", () => {
+    expect(draftsFor("refund_failed")).toEqual([
+      {
+        audience: "customer",
+        type: "refund_failed",
+        title: "Refund issue",
+        body: "We couldn't complete your refund automatically. We're looking into it. Please contact support with your order ID.",
+      },
+      {
+        audience: "org",
+        type: "refund_failed",
+        title: "Refund failed",
+        body: "A refund failed and needs attention.",
+        roles: ["owner", "manager"],
+      },
+    ]);
+    for (const role of draftsFor("refund_failed")[1].roles ?? []) {
+      expect(NOTIFICATION_ORG_ROLES).toContain(role);
+    }
+    expect(draftsFor("refund_failed")[1].roles).not.toContain("staff");
+  });
+});
+
+describe("the whole policy table", () => {
+  it("has a rule (possibly empty) for every event type, in every family", () => {
+    for (const type of ALL_EVENT_TYPES) {
+      expect(Array.isArray(draftsFor(type))).toBe(true);
+    }
+  });
+
+  it("only ever produces known notification types", () => {
+    for (const type of ALL_EVENT_TYPES) {
+      for (const draft of draftsFor(type, {...CONTEXT, refundInitiated: true})) {
+        expect(NOTIFICATION_TYPES).toContain(draft.type);
+      }
+    }
+    expect(new Set(NOTIFICATION_TYPES).size).toBe(NOTIFICATION_TYPES.length);
+  });
+
+  it("the existing order events produce exactly what they always did, with or without the new context", () => {
+    for (const type of NOTIFICATION_EVENT_TYPES) {
+      expect(draftsFor(type, {...CONTEXT, refundInitiated: true})).toEqual(draftsFor(type));
+      for (const draft of draftsFor(type)) {
+        expect(draft).not.toHaveProperty("roles");
+      }
+    }
+  });
+
+  it("no copy carries a provider ID, an amount, an internal ID, an email or an error", () => {
+    for (const type of [...CANCELLATION_NOTIFICATION_EVENT_TYPES, ...REFUND_NOTIFICATION_EVENT_TYPES]) {
+      for (const draft of draftsFor(type, {...CONTEXT, refundInitiated: true})) {
+        const text = `${draft.title} ${draft.body}`;
+        expect(text).not.toMatch(/@|\d|rfnd|pay_|razorpay|webhook|₹|\bINR\b|\bU-|error|exception/i);
+      }
+    }
   });
 });

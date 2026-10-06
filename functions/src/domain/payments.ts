@@ -4,6 +4,7 @@ import {
   type Firestore,
   type Transaction,
 } from "firebase-admin/firestore";
+import * as logger from "firebase-functions/logger";
 import {HttpsError} from "firebase-functions/v2/https";
 import {z} from "zod";
 import {isValidDocumentId} from "../auth/membership";
@@ -12,8 +13,16 @@ import {
   verifyCheckoutSignature,
   type PaymentProviderGateway,
 } from "../providers/razorpay";
-import {recordNotificationEvent} from "./notificationEvents";
+import {recordNotificationEvent, recordRefundNotificationEvent} from "./notificationEvents";
 import {resolveOrderById, type Order} from "./orders";
+import {
+  PAYMENT_REFUND_STATE_VALUES,
+  capturedAmountInPaise,
+  refundAggregatesProblem,
+  type PaymentRefundState,
+} from "./refundAmounts";
+import {planRefundCreation, readNextRefundSlot} from "./refundCreation";
+import {REFUND_SYSTEM_INITIATOR} from "./refunds";
 
 /**
  * `organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders/{orderId}/payments/{paymentId}`
@@ -87,6 +96,25 @@ export interface Payment {
    * exists. Never fabricated — absent for every payment this checkpoint (or
    * the last) creates or transitions. */
   providerPaymentId?: string;
+  /**
+   * Refund accounting (see `domain/refundAmounts.ts`), all integer paise and all
+   * optional: a payment written before refunds existed has none of them, and
+   * is read as "`succeeded` with no `capturedAmountInPaise` -> captured is
+   * `amountInPaise`; nothing refunded or pending" — no migration needed. They
+   * are only ever non-absent on a `succeeded` payment, are written by a later
+   * checkpoint's transactions together with every refund state change, and are
+   * internal: never part of `PaymentResponse`.
+   * - `capturedAmountInPaise`: what the provider captured (equals `amountInPaise`).
+   * - `refundedAmountInPaise`: the sum of refunds that reached `processed`.
+   * - `refundPendingInPaise`: the sum of refunds that are `requested` or `pending`.
+   * - `refundSeq`: how many refunds have been created (the next refund's number is +1).
+   * - `refundState`: the derived summary; see `deriveRefundState`.
+   */
+  capturedAmountInPaise?: number;
+  refundedAmountInPaise?: number;
+  refundPendingInPaise?: number;
+  refundSeq?: number;
+  refundState?: PaymentRefundState;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -125,6 +153,11 @@ const paymentDocSchema = z.object({
   provider: z.enum(PAYMENT_PROVIDER_VALUES),
   providerOrderId: z.string().min(1).optional(),
   providerPaymentId: z.string().min(1).optional(),
+  capturedAmountInPaise: z.number().int().min(0).optional(),
+  refundedAmountInPaise: z.number().int().min(0).optional(),
+  refundPendingInPaise: z.number().int().min(0).optional(),
+  refundSeq: z.number().int().min(0).optional(),
+  refundState: z.enum(PAYMENT_REFUND_STATE_VALUES).optional(),
   createdAt: z.custom<Timestamp>(
     (value) => value instanceof Timestamp,
     "createdAt must be a Firestore Timestamp",
@@ -133,6 +166,37 @@ const paymentDocSchema = z.object({
     (value) => value instanceof Timestamp,
     "updatedAt must be a Firestore Timestamp",
   ),
+}).superRefine((value, ctx) => {
+  const hasRefundFields =
+    value.capturedAmountInPaise !== undefined ||
+    value.refundedAmountInPaise !== undefined ||
+    value.refundPendingInPaise !== undefined ||
+    (value.refundSeq ?? 0) > 0 ||
+    (value.refundState !== undefined && value.refundState !== "none");
+  if (hasRefundFields && value.status !== "succeeded") {
+    ctx.addIssue({code: "custom", message: "Refund fields on a payment that did not succeed.", path: ["status"]});
+    return;
+  }
+  if (value.capturedAmountInPaise !== undefined && value.capturedAmountInPaise !== value.amountInPaise) {
+    ctx.addIssue({
+      code: "custom",
+      message: "The captured amount must equal the payment amount.",
+      path: ["capturedAmountInPaise"],
+    });
+    return;
+  }
+  // Legacy-safe: a `succeeded` payment with no captured amount counts as
+  // captured in full. Nothing to check on a payment that never succeeded.
+  if (value.status === "succeeded") {
+    const problem = refundAggregatesProblem({
+      capturedInPaise: capturedAmountInPaise(value),
+      refundedInPaise: value.refundedAmountInPaise ?? 0,
+      refundPendingInPaise: value.refundPendingInPaise ?? 0,
+    });
+    if (problem !== null) {
+      ctx.addIssue({code: "custom", message: "Inconsistent refund amounts.", path: ["refundedAmountInPaise"]});
+    }
+  }
 });
 
 /**
@@ -376,6 +440,9 @@ export interface MarkPaymentSucceededInput {
 export interface PaymentTransitionResult {
   payment: Payment;
   order: Order;
+  /** Set only when THIS call captured a payment for an already-cancelled order
+   * and reserved its refund (see `captureAfterCancellation`). */
+  refundId?: string;
 }
 
 /**
@@ -401,13 +468,16 @@ export interface PaymentTransitionResult {
  *   succeed on a later attempt against the SAME order/payment (v1 has no
  *   separate "attempt" concept; see the module doc comment).
  * - `pending` -> `succeeded`: the normal path.
+ * - A non-succeeded payment whose order is `cancelled`: a LATE CAPTURE. The
+ *   success and the captured amount are recorded, the order is NOT reopened or
+ *   confirmed (a cancelled order is never newly confirmed by a payment), and the
+ *   captured money is reserved for a refund — see `captureAfterCancellation`.
  * - Any other status when `order.status` is not `pending_payment` (already
- *   `confirmed`, or `cancelled`): rejected. This is what makes "a cancelled
- *   order cannot later be newly confirmed by a payment-success operation"
- *   true. It's checked only after the `succeeded` -> `succeeded` idempotent
- *   short-circuit above, since an already-succeeded payment's order is, by
- *   construction, already `confirmed` — that combination must return
- *   successfully, not fall into this rejection.
+ *   `confirmed`, `preparing`, ...): rejected. It's checked only after the
+ *   `succeeded` -> `succeeded` idempotent short-circuit above, since an
+ *   already-succeeded payment's order is, by construction, already past
+ *   `pending_payment` — that combination must return successfully, not fall
+ *   into this rejection.
  *
  * Runs entirely inside one Firestore transaction: the payment's `status` and
  * the order's `status`/`paymentStatus` are set together, atomically — two
@@ -438,7 +508,7 @@ export async function markPaymentSucceeded(
     throw new HttpsError("invalid-argument", "Invalid payment ID.");
   }
 
-  return db.runTransaction(async (tx): Promise<PaymentTransitionResult> => {
+  const result = await db.runTransaction(async (tx): Promise<PaymentTransitionResult> => {
     const {order, orderRef, payment, paymentRef} =
       await resolveOrderAndPayment(db, tx, input.orderId, input.paymentId);
 
@@ -446,7 +516,8 @@ export async function markPaymentSucceeded(
       return {payment, order};
     }
 
-    if (order.status !== "pending_payment") {
+    const lateCapture = order.status === "cancelled";
+    if (order.status !== "pending_payment" && !lateCapture) {
       throw new HttpsError(
         "failed-precondition",
         "This order cannot be confirmed by payment.",
@@ -461,9 +532,20 @@ export async function markPaymentSucceeded(
     }
 
     const now = Timestamp.now();
-    const paymentUpdate: Partial<Payment> = {status: "succeeded", updatedAt: now};
+    // `capturedAmountInPaise` is written with EVERY new success, atomically with
+    // the status: what the provider captured, which the check above just proved
+    // equals the stored amount. (A payment that succeeded before this field
+    // existed has none and is read as captured in full — see `refundAmounts.ts`.)
+    const paymentUpdate: Partial<Payment> = {
+      status: "succeeded",
+      capturedAmountInPaise: payment.amountInPaise,
+      updatedAt: now,
+    };
     if (input.providerPaymentId !== undefined) {
       paymentUpdate.providerPaymentId = input.providerPaymentId;
+    }
+    if (lateCapture) {
+      return captureAfterCancellation(tx, {order, orderRef, payment, paymentRef, paymentUpdate, now});
     }
     tx.update(paymentRef, paymentUpdate);
     tx.update(orderRef, {status: "confirmed", paymentStatus: "paid", updatedAt: now});
@@ -481,6 +563,97 @@ export async function markPaymentSucceeded(
       order: confirmedOrder,
     };
   });
+  if (result.refundId !== undefined) {
+    // After the commit, so a retried transaction never logs a refund that was not kept.
+    logger.warn("Payment captured after the order was cancelled; a refund of the full amount is reserved.", {
+      orderId: result.order.id,
+      refundId: result.refundId,
+    });
+  }
+  return result;
+}
+
+/**
+ * LATE CAPTURE: the provider captured a payment for an order that was already
+ * cancelled (the customer paid in one tab while cancelling in another, or a
+ * webhook arrived after the cancellation). The money is real and must go back.
+ *
+ * Inside the caller's `markPaymentSucceeded` transaction, atomically:
+ * - the payment becomes `succeeded` with its captured amount (and provider
+ *   payment ID), exactly as for any capture;
+ * - the order is NOT reopened — it stays `cancelled`, keeps its audit fields and
+ *   gets no `order_confirmed` notification. It records the payment as it now is:
+ *   `paymentStatus` becomes `paid` (the money was captured), together with the
+ *   refund mirror and `updatedAt`, so it reads as cancelled, paid, refund in
+ *   progress. `paymentStatus` only ever moves `pending` -> `paid` here, never back;
+ * - the whole captured amount is reserved for one refund (reason
+ *   `late_capture_after_cancel`, initiated by the system), created `requested`
+ *   — the state a later dispatcher submits to the provider from. Nothing here
+ *   calls the provider.
+ *
+ * Idempotent and race-safe by the same transaction: a repeated capture finds the
+ * payment `succeeded` and returns before reaching here, so a second refund can
+ * never be created; and a cancellation racing the capture serializes on the same
+ * order and payment documents (whichever commits first, the other sees it).
+ *
+ * If the capture cannot be refunded safely (no provider payment ID, ...) the
+ * whole call is refused and nothing is written, as before.
+ *
+ * @param {Transaction} tx The in-progress `markPaymentSucceeded` transaction;
+ *   nothing has been written to it yet.
+ * @param {object} facts What `markPaymentSucceeded` already read and decided.
+ * @return {Promise<PaymentTransitionResult>} The payment and (still cancelled)
+ *   order as they stand after the call, with the reserved refund's ID.
+ * @throws {HttpsError} `failed-precondition` (400) if the capture cannot be refunded.
+ */
+async function captureAfterCancellation(
+  tx: Transaction,
+  facts: {
+    order: Order;
+    orderRef: DocumentReference;
+    payment: Payment;
+    paymentRef: DocumentReference;
+    paymentUpdate: Partial<Payment>;
+    now: Timestamp;
+  },
+): Promise<PaymentTransitionResult> {
+  const {order, orderRef, payment, paymentRef, paymentUpdate, now} = facts;
+  const captured: Payment = {...payment, ...paymentUpdate};
+
+  const slot = await readNextRefundSlot(tx, paymentRef, captured);
+  const plan = planRefundCreation({
+    order,
+    payment: captured,
+    slot,
+    reason: "late_capture_after_cancel",
+    source: "cancellation",
+    initiatedBy: REFUND_SYSTEM_INITIATOR,
+    initiatedByRole: "system",
+    now,
+  });
+  if (plan.kind === "not_refundable") {
+    logger.warn("A payment was captured for a cancelled order and cannot be refunded; refusing it.", {
+      orderId: order.id, reason: plan.reason,
+    });
+    throw new HttpsError("failed-precondition", "This order cannot be confirmed by payment.");
+  }
+
+  const stored: Payment = plan.kind === "create" ? {...captured, ...plan.paymentUpdate} : captured;
+  const orderUpdate: Partial<Order> = {paymentStatus: "paid", ...(plan.mirror ?? {}), updatedAt: now};
+  if (plan.kind === "create") {
+    tx.create(plan.refundRef, plan.refund);
+    recordRefundNotificationEvent(plan.refundRef.firestore, tx, plan.refund, "refund_requested", now);
+    tx.update(paymentRef, {...paymentUpdate, ...plan.paymentUpdate});
+  } else {
+    tx.update(paymentRef, paymentUpdate);
+  }
+  tx.update(orderRef, orderUpdate);
+
+  return {
+    payment: stored,
+    order: {...order, ...orderUpdate},
+    ...(plan.kind === "create" ? {refundId: plan.refund.id} : {}),
+  };
 }
 
 /** Input to `markPaymentFailed`. */
@@ -772,8 +945,9 @@ export type VerifyCheckoutPaymentInput = z.infer<typeof verifyCheckoutPaymentBod
  *    `confirmed`/`paid`. `providerPaymentId` is persisted as
  *    `input.razorpayPaymentId` — Razorpay's own reference for this
  *    completed payment. A payment that previously `failed` is allowed to
- *    succeed here (see `markPaymentSucceeded`'s own state-machine rules); a
- *    cancelled order is not (that function rejects it independently).
+ *    succeed here (see `markPaymentSucceeded`'s own state-machine rules). A
+ *    payment for an already-cancelled order is recorded as a late capture and
+ *    its refund reserved there; the order is never reopened.
  *
  * Deliberately does NOT call the Razorpay API to re-fetch the order/payment
  * (`PaymentProviderGateway.fetchOrder`) as an extra check: the signature

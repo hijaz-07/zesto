@@ -11,6 +11,8 @@ import {
   type SessionValidator,
   type VerifiedSession,
 } from "../auth/session";
+import {ORDER_CANCELLATION_ROLES} from "../domain/cancellation";
+import {cancelOrder, cancelOrderBodySchema, toCancellationResponse} from "../domain/orderCancellation";
 import {
   ORDER_FULFILLMENT_ROLES,
   transitionOrderStatus,
@@ -102,6 +104,11 @@ export function createOrganizationOrderRoutes(
       method: "POST",
       path: "/organizations/:organizationId/orders/:orderId/complete",
       handler: (ctx) => handleFulfillmentAction(ctx, deps, "completed"),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/orders/:orderId/cancel",
+      handler: (ctx) => handleCancelOrder(ctx, deps),
     },
     {
       method: "POST",
@@ -334,6 +341,81 @@ async function handleRedeemPickup(
       ...mapKnownError(error),
       userId: session.userId,
       logContext: {to: "picked_up", outcome: "rejected"},
+    };
+  }
+}
+
+/**
+ * `POST /organizations/{organizationId}/orders/{orderId}/cancel`: the
+ * organization cancels one of its own orders — body `{reason}`, where `reason`
+ * is REQUIRED and one of the organization reasons. Only an active `owner` or
+ * `manager` may (`ORDER_CANCELLATION_ROLES`): cancelling a paid order starts a
+ * refund, which is money, so staff are refused (`403`) — unlike fulfillment.
+ *
+ * Authentication, then authorization, then the body, then the order — like the
+ * other organization order routes. The order is resolved by ID and must belong
+ * to the caller's verified organization: another organization's order is a plain
+ * `404`. Everything else (status, payment consistency, the refund of a paid
+ * order, which is always the full remaining amount) is decided server-side by
+ * `cancelOrder`; the body's other fields are ignored. A refused state is `409
+ * conflict`.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrganizationOrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with `{order,
+ *   cancellation, refund?}` — the order's row in the same shape the list uses,
+ *   the cancellation state, and (when money was captured) a safe refund summary —
+ *   for the cancellation and for a repeat that changed nothing. See
+ *   `CancellationResponseSummary`: no provider, payment or audit identifier.
+ */
+async function handleCancelOrder(
+  ctx: RouteContext,
+  deps: OrganizationOrdersRouteDeps,
+): Promise<ApiResult> {
+  let caller: AuthorizedCaller;
+  try {
+    caller = await authenticateAndAuthorize(ctx, deps, ORDER_CANCELLATION_ROLES);
+  } catch (error) {
+    return mapKnownError(error);
+  }
+  const {session, membership} = caller;
+
+  const parsedBody = cancelOrderBodySchema.safeParse(ctx.request.body ?? {});
+  if (!parsedBody.success) {
+    return {
+      kind: "error",
+      status: 400,
+      code: "invalid_argument",
+      message: firstZodIssueMessage(parsedBody.error),
+      userId: session.userId,
+      logContext: {to: "cancelled", outcome: "rejected"},
+    };
+  }
+
+  try {
+    const result = await cancelOrder(deps.db, {
+      actor: {kind: "organization", membership},
+      orderId: ctx.params?.orderId,
+      reason: parsedBody.data.reason,
+    });
+    const order = await loadOrganizationOrderSummary(deps.db, result.order);
+    return {
+      kind: "success",
+      status: 200,
+      data: {order, ...toCancellationResponse(result)},
+      userId: session.userId,
+      logContext: {
+        from: result.previousStatus,
+        to: "cancelled",
+        outcome: result.changed ? "cancelled" : "unchanged",
+        refund: result.refund ? "reserved" : "none",
+      },
+    };
+  } catch (error) {
+    return {
+      ...mapKnownError(error),
+      userId: session.userId,
+      logContext: {to: "cancelled", outcome: "rejected"},
     };
   }
 }

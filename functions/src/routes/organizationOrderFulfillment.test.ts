@@ -257,9 +257,12 @@ describe.each(ACTIONS)("POST .../orders/:orderId/$name — before any order is r
 describe("there is no generic way to set an order's status", () => {
   // In particular nothing under an order's own ID can hand it over: pickup needs
   // a credential, so it is `POST .../pickups` (organizationOrderPickup.test.ts).
+  // Cancellation is deliberately absent from this list: `POST .../orders/:orderId/cancel`
+  // exists, but as its own money-handling action with its own role set and tests
+  // (orderCancellation.test.ts), not as a way to set a status.
   it.each([
     "status", "fulfillment", "transition", "ready", "preparing", "completed", "picked-up", "picked_up",
-    "pickup", "pickups", "collect", "redeem", "redeem-pickup", "handover", "cancel",
+    "pickup", "pickups", "collect", "redeem", "redeem-pickup", "handover",
   ])(
     "has no POST .../orders/:orderId/%s route",
     async (action) => {

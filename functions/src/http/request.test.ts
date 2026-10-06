@@ -148,7 +148,7 @@ describe("raw body over a real HTTP request", () => {
   // Pretty-printed, unusual key order, escaped non-ASCII, `100.0`, trailing
   // newline: everything JSON.stringify(JSON.parse(x)) would normalize away.
   const sentBody =
-    "{\n  \"event\" : \"refund.processed\",\n  \"created_at\":1567674606,\n" +
+    "{\n  \"event\" : \"settlement.processed\",\n  \"created_at\":1567674606,\n" +
     "  \"payload\":{\"x\":{\"amount\":100.0,\"memo\":\"caf\\u00e9 \\ud83d\\ude00\"}}\n}\n";
 
   it("accepts a delivery whose signature was computed over the exact bytes sent", async () => {

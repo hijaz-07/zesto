@@ -18,16 +18,24 @@ export const CUSTOMER_NOTIFICATION_TYPES = [
   'order_preparing',
   'order_ready',
   'order_picked_up',
+  'order_cancelled_by_outlet',
+  'order_cancelled_by_system',
+  'refund_completed',
+  'refund_failed',
 ] as const;
-export const ORGANIZATION_NOTIFICATION_TYPES = ['new_order'] as const;
+/** `refund_failed` is in both lists: the customer and the organization each get their own copy of it. */
+export const ORGANIZATION_NOTIFICATION_TYPES = [
+  'new_order',
+  'order_cancelled_by_customer',
+  'refund_failed',
+] as const;
 
 export type NotificationType =
   | (typeof CUSTOMER_NOTIFICATION_TYPES)[number]
   | (typeof ORGANIZATION_NOTIFICATION_TYPES)[number];
 
 export const NOTIFICATION_TYPES: readonly NotificationType[] = [
-  ...CUSTOMER_NOTIFICATION_TYPES,
-  ...ORGANIZATION_NOTIFICATION_TYPES,
+  ...new Set<NotificationType>([...CUSTOMER_NOTIFICATION_TYPES, ...ORGANIZATION_NOTIFICATION_TYPES]),
 ];
 
 export type NotificationId = string;

@@ -349,16 +349,20 @@ describe("payment.captured", () => {
     expect(await readState(order)).toEqual(afterFirst);
   });
 
-  it("does not confirm a cancelled order, and leaves the payment pending", async () => {
+  it("does not confirm a cancelled order: the capture is recorded and refunded (late capture)", async () => {
     const {order, providerOrderId, amountInPaise} = await setupRazorpayPayment();
     await orderRef(order).update({status: "cancelled"});
 
     const result = await deliver(eventBody({providerOrderId, amount: amountInPaise}), newEventId());
 
-    expect(processedOutcome(result)).toBe("rejected_order_not_payable");
+    expect(processedOutcome(result)).toBe("payment_succeeded");
     const state = await readState(order);
     expect(state.order.status).toBe("cancelled");
-    expect(state.payment.status).toBe("pending");
+    expect(state.payment).toMatchObject({status: "succeeded", capturedAmountInPaise: amountInPaise});
+    const refunds = await orderRef(order).collection("payments").doc(order.id).collection("refunds").get();
+    expect(refunds.docs.map((doc) => doc.data())).toMatchObject([
+      {amountInPaise, status: "requested", reason: "late_capture_after_cancel"},
+    ]);
   });
 
   it("does not mark a payment successful when its Zesto order is missing", async () => {

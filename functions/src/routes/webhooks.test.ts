@@ -201,7 +201,7 @@ describe("POST /webhooks/razorpay — payload handling (after a valid signature)
     expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
   });
 
-  it.each(["order.paid", "refund.processed", "payment.authorized", "payment.dispute.created", "x"])(
+  it.each(["order.paid", "refund.speed_changed", "payment.authorized", "payment.dispute.created", "x"])(
     "acknowledges a valid but unsupported event (%s) with 200, never mutating anything",
     async (eventType) => {
       const result = await post(JSON.stringify({entity: "event", event: eventType, payload: {}}));
@@ -228,6 +228,44 @@ describe("POST /webhooks/razorpay — payload handling (after a valid signature)
     expect(result.kind).toBe("success");
     const logged = result.logContext?.eventType;
     expect(typeof logged === "string" && logged.length).toBeLessThanOrEqual(64);
+  });
+});
+
+describe("POST /webhooks/razorpay — refund events", () => {
+  const refundBody = JSON.stringify({
+    entity: "event", event: "refund.processed",
+    payload: {refund: {entity: {id: "rfnd_1", payment_id: "pay_1", amount: 100, currency: "INR", status: "processed"}}},
+  });
+
+  it("rejects a refund event with an invalid signature before parsing or touching Firestore", async () => {
+    const result = await post(refundBody, {signWith: "a different body"});
+
+    expect(result).toMatchObject({kind: "error", status: 401, code: "invalid_signature"});
+  });
+
+  it("rejects a refund event with no signature header", async () => {
+    const request: NormalizedRequest = {
+      method: "POST", path: normalizePath("/api/webhooks/razorpay"), headers: {}, query: {}, body: undefined,
+      rawBody: Buffer.from(refundBody),
+    };
+
+    const result = await handleRequest(createWebhookRoutes({db: untouchedDb()}), request, () => {});
+
+    expect(result).toMatchObject({kind: "error", status: 401});
+  });
+
+  it("answers a signed but malformed refund event with 400, without touching Firestore", async () => {
+    const result = await post(JSON.stringify({
+      entity: "event", event: "refund.processed", payload: {refund: {entity: {id: "rfnd_1"}}},
+    }));
+
+    expect(result).toMatchObject({kind: "error", status: 400, code: "invalid_argument"});
+  });
+
+  it("verifies the signature over the raw bytes: a re-serialised body does not pass", async () => {
+    const result = await post(refundBody, {signWith: JSON.stringify(JSON.parse(refundBody), null, 2)});
+
+    expect(result).toMatchObject({kind: "error", status: 401});
   });
 });
 

@@ -2,12 +2,18 @@ import {FieldValue, Timestamp, type DocumentReference, type Firestore} from "fir
 import * as logger from "firebase-functions/logger";
 import {isValidDocumentId} from "../auth/membership";
 import {inAppChannel, type NotificationChannel, type NotificationDelivery} from "./notificationChannels";
+import type {OrganizationMemberRole} from "../auth/membership";
 import {
   NOTIFICATION_EVENT_ERROR_MAX_LENGTH,
   notificationEventRef,
+  isCancellationNotificationEventType,
+  isRefundNotificationEventType,
   parseNotificationEvent,
+  type CancellationNotificationEvent,
   type NotificationEvent,
   type NotificationEventType,
+  type OrderNotificationEvent,
+  type RefundNotificationEvent,
 } from "./notificationEvents";
 import {
   NOTIFICATION_ORG_ROLES,
@@ -27,6 +33,13 @@ import {
  * notifications. Run by the `notificationEvents/{eventId}` Firestore trigger
  * (`onNotificationEventCreated` in `index.ts`) and nothing else; it processes
  * exactly the event it is handed and never looks at any other order.
+ *
+ * Three event families are consumed (see `notificationEvents.ts`): the forward order events, the
+ * cancellation events and the refund events. Each is checked against its own subject before it
+ * notifies anyone (`assertOrderBearsOutEvent`, `assertCancellationBearsOut`,
+ * `assertRefundBearsOut`); only the forward events are measured against the order's status ranking.
+ * An event the policy shows nothing for (`order_completed`, `refund_requested`) is still processed:
+ * it is marked `processed` with no inbox document, so it never sits `pending`.
  *
  * Guarantee: AT-LEAST-ONCE processing with DETERMINISTIC visible notification
  * creation. The trigger (and a retry after a crash) may run this for the same
@@ -79,7 +92,12 @@ export interface ProcessNotificationEventOptions {
   now?: () => Timestamp;
 }
 
-/** How far each status a transition produces has progressed in the order lifecycle. */
+/**
+ * How far each status a FORWARD transition produces has progressed in the order lifecycle.
+ * Only the five forward events are ranked: cancellation and refund events are terminal
+ * business facts, not steps of this progression, and are checked against their own subject
+ * (see `assertCancellationBearsOut` / `assertRefundBearsOut`), never against this table.
+ */
 const EVENT_STATUS_RANK: Readonly<Record<NotificationEventType, number>> = {
   order_confirmed: 1,
   order_preparing: 2,
@@ -193,24 +211,24 @@ async function claimAttempt(db: Firestore, ref: DocumentReference, now: Timestam
 }
 
 /**
- * Confirms the event describes something that really happened to a real order:
- * the order exists where the event says, is that customer's, and has reached
- * (or passed) the status the event is about. The event is written by trusted
- * code in the transition's own transaction, so this never fails in practice;
- * it is the guard that keeps a notification from ever being created for a
- * transition that did not happen.
+ * Reads the order an event is about, where the event says it is, and checks it is that
+ * customer's and that organization's.
  *
  * @param {Firestore} db Admin Firestore instance.
  * @param {NotificationEvent} event The event being processed.
- * @throws {PermanentNotificationError} If the order does not bear it out.
+ * @return {Promise<{order: Record<string, unknown>, orderRef: DocumentReference}>} The order.
+ * @throws {PermanentNotificationError} If it does not exist or does not match the event.
  */
-async function assertOrderBearsOutEvent(db: Firestore, event: NotificationEvent): Promise<void> {
-  const snapshot = await db
+async function readEventOrder(
+  db: Firestore,
+  event: NotificationEvent,
+): Promise<{order: Record<string, unknown>; orderRef: DocumentReference}> {
+  const orderRef = db
     .collection("organizations").doc(event.organizationId)
     .collection("outlets").doc(event.outletId)
     .collection("menus").doc(event.menuId)
-    .collection("orders").doc(event.orderId)
-    .get();
+    .collection("orders").doc(event.orderId);
+  const snapshot = await orderRef.get();
   if (!snapshot.exists) {
     throw new PermanentNotificationError("The order this event is about does not exist.");
   }
@@ -218,14 +236,88 @@ async function assertOrderBearsOutEvent(db: Firestore, event: NotificationEvent)
   if (order.userId !== event.customerUserId || order.organizationId !== event.organizationId) {
     throw new PermanentNotificationError("The order does not match the event it produced.");
   }
-  // A cancelled order has, by definition, been through confirmation (and, once
-  // cancellation exists, may have been cancelled from any earlier status).
+  return {order, orderRef};
+}
+
+/**
+ * Confirms a FORWARD order event describes something that really happened to a real order: the
+ * order exists where the event says, is that customer's, and has reached (or passed) the status
+ * the event is about. The event is written by trusted code in the transition's own transaction,
+ * so this never fails in practice; it is the guard that keeps a notification from ever being
+ * created for a transition that did not happen.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {OrderNotificationEvent} event The event being processed.
+ * @throws {PermanentNotificationError} If the order does not bear it out.
+ */
+async function assertOrderBearsOutEvent(db: Firestore, event: OrderNotificationEvent): Promise<void> {
+  const {order} = await readEventOrder(db, event);
+  // A cancelled order has, by definition, been through confirmation (and may have been
+  // cancelled from any earlier status), so a late forward event is still genuine.
   if (order.status === "cancelled") {
     return;
   }
   const reached = typeof order.status === "string" ? ORDER_STATUS_RANK[order.status] : undefined;
   if (reached === undefined || reached < EVENT_STATUS_RANK[event.type]) {
     throw new PermanentNotificationError("The order has not reached the status this event reports.");
+  }
+}
+
+/** Which order `cancelledByRole` each cancellation event reports (the system has none yet). */
+const CANCELLATION_EVENT_ROLE: Readonly<Record<CancellationNotificationEvent["type"], string | undefined>> = {
+  order_cancelled_by_customer: "customer",
+  order_cancelled_by_outlet: "organization",
+  order_cancelled_by_system: undefined,
+};
+
+/**
+ * Confirms a CANCELLATION event describes a real cancellation: the order is `cancelled` and — for
+ * a customer or outlet event — was cancelled by that kind of actor. Cancellation is terminal, so
+ * this is deliberately NOT measured against the forward status ranking.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {CancellationNotificationEvent} event The event being processed.
+ * @throws {PermanentNotificationError} If the order does not bear it out.
+ */
+async function assertCancellationBearsOut(db: Firestore, event: CancellationNotificationEvent): Promise<void> {
+  const {order} = await readEventOrder(db, event);
+  if (order.status !== "cancelled") {
+    throw new PermanentNotificationError("The order this cancellation event is about is not cancelled.");
+  }
+  const expectedRole = CANCELLATION_EVENT_ROLE[event.type];
+  if (expectedRole !== undefined && order.cancelledByRole !== expectedRole) {
+    throw new PermanentNotificationError("The order was not cancelled by the actor this event reports.");
+  }
+}
+
+/**
+ * Confirms a user-visible REFUND event (`refund_completed` / `refund_failed`) describes a real
+ * refund of this order's own payment, in the state the event reports. The order's own status is
+ * irrelevant to a refund (it is normally `cancelled`, but never ranked), so it is not checked.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {RefundNotificationEvent} event The event being processed.
+ * @throws {PermanentNotificationError} If the refund does not bear it out.
+ */
+async function assertRefundBearsOut(db: Firestore, event: RefundNotificationEvent): Promise<void> {
+  const {orderRef} = await readEventOrder(db, event);
+  const snapshot = await orderRef.collection("payments").doc(event.paymentId)
+    .collection("refunds").doc(event.refundId)
+    .get();
+  if (!snapshot.exists) {
+    throw new PermanentNotificationError("The refund this event is about does not exist.");
+  }
+  const refund = snapshot.data() ?? {};
+  if (
+    refund.userId !== event.customerUserId ||
+    refund.orderId !== event.orderId ||
+    refund.organizationId !== event.organizationId
+  ) {
+    throw new PermanentNotificationError("The refund does not match the event it produced.");
+  }
+  const expectedStatus = event.type === "refund_completed" ? "processed" : event.type === "refund_failed" ? "failed" : undefined;
+  if (expectedStatus !== undefined && refund.status !== expectedStatus) {
+    throw new PermanentNotificationError("The refund has not reached the state this event reports.");
   }
 }
 
@@ -258,12 +350,16 @@ interface OrganizationRecipients {
  *
  * @param {Firestore} db Admin Firestore instance.
  * @param {string} organizationId The event's organization.
+ * @param {readonly OrganizationMemberRole[]} [roles] The roles to notify (only those that may
+ *   ever be notified count); every notifying role by default.
  * @return {Promise<OrganizationRecipients>} The recipients, at most the cap.
  */
 export async function findOrganizationRecipients(
   db: Firestore,
   organizationId: string,
+  roles: readonly OrganizationMemberRole[] = NOTIFICATION_ORG_ROLES,
 ): Promise<OrganizationRecipients> {
+  const eligibleRoles = roles.filter((role) => NOTIFICATION_ORG_ROLES.includes(role));
   const snapshot = await db
     .collection("organizations").doc(organizationId)
     .collection("members")
@@ -277,7 +373,7 @@ export async function findOrganizationRecipients(
     .filter((doc) => {
       const role: unknown = doc.data().role;
       return isValidDocumentId(doc.id) &&
-        (NOTIFICATION_ORG_ROLES as readonly unknown[]).includes(role);
+        (eligibleRoles as readonly unknown[]).includes(role);
     })
     .map((doc) => doc.id);
   return {userIds, capExceeded};
@@ -320,13 +416,23 @@ async function deliverEvent(
   event: NotificationEvent,
   channels: readonly NotificationChannel[],
 ): Promise<number> {
-  // An event the policy shows nothing for (`order_completed`) needs no reads at all.
+  // An event the policy shows nothing for (`order_completed`, `refund_requested`) needs no
+  // reads at all: it is consumed (the caller marks it processed) without an inbox document.
   if (notificationsForEvent(event.type, {}).length === 0) {
     return 0;
   }
 
-  await assertOrderBearsOutEvent(db, event);
-  const drafts = notificationsForEvent(event.type, {outletName: await readOutletName(db, event)});
+  if (isRefundNotificationEventType(event.type)) {
+    await assertRefundBearsOut(db, event as RefundNotificationEvent);
+  } else if (isCancellationNotificationEventType(event.type)) {
+    await assertCancellationBearsOut(db, event as CancellationNotificationEvent);
+  } else {
+    await assertOrderBearsOutEvent(db, event as OrderNotificationEvent);
+  }
+  const drafts = notificationsForEvent(event.type, {
+    outletName: await readOutletName(db, event),
+    ...(event.refundInitiated !== undefined ? {refundInitiated: event.refundInitiated} : {}),
+  });
 
   const deliveries: NotificationDelivery[] = [];
   let capExceeded = false;
@@ -336,7 +442,7 @@ async function deliverEvent(
     if (draft.audience === "customer") {
       recipients = [event.customerUserId];
     } else {
-      const found = await findOrganizationRecipients(db, event.organizationId);
+      const found = await findOrganizationRecipients(db, event.organizationId, draft.roles);
       capExceeded = capExceeded || found.capExceeded;
       recipients = found.userIds;
     }

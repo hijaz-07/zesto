@@ -9,6 +9,7 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
+import {cancelOrder, cancelOrderBodySchema, toCancellationResponse} from "../domain/orderCancellation";
 import {getPickupCredentialForCustomer} from "../domain/orderPickup";
 import {
   ensureProviderOrder,
@@ -70,6 +71,11 @@ export function createOrderRoutes(deps: OrdersRouteDeps): RouteDefinition[] {
       method: "GET",
       path: "/orders/:orderId/pickup-credential",
       handler: (ctx) => handleGetPickupCredential(ctx, deps),
+    },
+    {
+      method: "POST",
+      path: "/orders/:orderId/cancel",
+      handler: (ctx) => handlePostOrderCancel(ctx, deps),
     },
   ];
 }
@@ -392,6 +398,86 @@ async function handleGetPickupCredential(
     // The order exists and is theirs, but cannot be collected right now: a
     // state conflict, not the "this identifier is taken" this file's 409 means.
     return mapped.kind === "error" && mapped.status === 409 ? {...mapped, code: "conflict"} : mapped;
+  }
+}
+
+/**
+ * `POST /orders/{orderId}/cancel`: the customer cancels their own order — body
+ * `{reason?}`, where `reason` is one of the customer reasons and may be omitted.
+ * Whether the order may be cancelled now (status, the menu's ordering
+ * deadline, payment consistency) and what that costs (the refund of a paid
+ * order) are decided server-side from Firestore inside one transaction (see
+ * `domain/orderCancellation.ts`); the request carries no amount, deadline,
+ * status, user or organization, and anything else in the body is ignored.
+ *
+ * Authenticates before the body is read, like every route here. The customer is
+ * the verified session's user and must own the order: anyone else's order is
+ * indistinguishable from a missing one (`404`), and that is decided before a
+ * repeat of an already-cancelled order is answered. A refused state is `409
+ * conflict` (an order already being prepared, the deadline passed, ...); an
+ * invalid reason is `400`.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with `{order,
+ *   cancellation, refund?}` — the order in the customer shape, the cancellation
+ *   state, and (when money was captured) a safe refund summary — both for the
+ *   cancellation and for a repeat that changed nothing. See
+ *   `CancellationResponseSummary`: no provider, payment or audit identifier.
+ */
+async function handlePostOrderCancel(
+  ctx: RouteContext,
+  deps: OrdersRouteDeps,
+): Promise<ApiResult> {
+  let session: VerifiedSession;
+  try {
+    session = await authenticateRequest(
+      {headers: {authorization: authorizationHeader(ctx.request)}},
+      deps.validator,
+    );
+  } catch (error) {
+    return mapKnownError(error);
+  }
+
+  const parsedBody = cancelOrderBodySchema.safeParse(ctx.request.body ?? {});
+  if (!parsedBody.success) {
+    return {
+      kind: "error",
+      status: 400,
+      code: "invalid_argument",
+      message: firstZodIssueMessage(parsedBody.error),
+      userId: session.userId,
+      logContext: {to: "cancelled", outcome: "rejected"},
+    };
+  }
+
+  try {
+    const result = await cancelOrder(deps.db, {
+      actor: {kind: "customer", userId: session.userId},
+      orderId: ctx.params?.orderId,
+      reason: parsedBody.data.reason,
+    });
+    return {
+      kind: "success",
+      status: 200,
+      data: {order: toOrderResponse(result.order), ...toCancellationResponse(result)},
+      userId: session.userId,
+      logContext: {
+        from: result.previousStatus,
+        to: "cancelled",
+        outcome: result.changed ? "cancelled" : "unchanged",
+        refund: result.refund ? "reserved" : "none",
+      },
+    };
+  } catch (error) {
+    const mapped = mapKnownError(error);
+    // The order is theirs but is not in a state that can be cancelled: a state
+    // conflict, not the "this identifier is taken" this file's 409 means.
+    return {
+      ...(mapped.kind === "error" && mapped.status === 409 ? {...mapped, code: "conflict"} : mapped),
+      userId: session.userId,
+      logContext: {to: "cancelled", outcome: "rejected"},
+    };
   }
 }
 

@@ -1,3 +1,4 @@
+import {createHash} from "node:crypto";
 import {
   FieldPath,
   Timestamp,
@@ -57,7 +58,7 @@ const CURSOR_MAX_LENGTH = 512;
 const MAX_TIMESTAMP_SECONDS = 253_402_300_799;
 
 export interface Notification {
-  /** `${eventId}.${audience}` — equals the document ID. */
+  /** `notificationId(eventId, audience)` — equals the document ID. */
   id: string;
   type: NotificationType;
   /** `"customer"` or `"org:<organizationId>"`. */
@@ -95,12 +96,22 @@ export interface NotificationsPageResponse {
   nextCursor: string | null;
 }
 
+/** A refund event's ID: `${refundId}_${type}`. The refund ID is internal and must not reach a client. */
+const REFUND_EVENT_ID_PATTERN = /_refund_(?:requested|completed|failed)$/;
+
 /**
  * @param {string} eventId The notification event's ID.
  * @param {NotificationAudience} audience Which inbox it is for.
- * @return {string} The notification's deterministic document ID.
+ * @return {string} The notification's deterministic document ID — which is also the ID a client
+ *   sees and sends back to mark it read. For an order or cancellation event it is
+ *   `${eventId}.${audience}`; for a REFUND event it is an opaque, equally deterministic
+ *   `refund-<hash>.${audience}`, so the internal refund ID (`${orderId}-r${seq}`) never appears
+ *   in anything a client can read.
  */
 export function notificationId(eventId: string, audience: NotificationAudience): string {
+  if (REFUND_EVENT_ID_PATTERN.test(eventId)) {
+    return `refund-${createHash("sha256").update(eventId).digest("hex").slice(0, 24)}.${audience}`;
+  }
   return `${eventId}.${audience}`;
 }
 

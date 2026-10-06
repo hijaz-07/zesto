@@ -125,6 +125,31 @@ describe('listNotifications', () => {
   });
 
   it.each([
+    'order_cancelled_by_outlet', 'order_cancelled_by_system', 'order_cancelled_by_customer', 'refund_completed', 'refund_failed',
+  ])('parses the cancellation/refund type %s, keeping only the approved fields', async (type) => {
+    mockedApiFetch.mockResolvedValue({
+      notifications: [{ ...wire, id: 'x', type, internal: 'refund-secret', refundId: 'ord-r1' }],
+      nextCursor: null,
+    });
+
+    const page = await listNotifications(CUSTOMER);
+
+    expect(page.notifications.map((notification) => notification.type)).toEqual([type]);
+    expect(Object.keys(page.notifications[0]).sort()).toEqual(
+      ['body', 'createdAt', 'id', 'orderId', 'readAt', 'title', 'type'],
+    );
+  });
+
+  it('still skips refund_requested: it is consumed by the backend and never shown', async () => {
+    mockedApiFetch.mockResolvedValue({
+      notifications: [{ ...wire, id: 'r', type: 'refund_requested' }],
+      nextCursor: null,
+    });
+
+    expect((await listNotifications(CUSTOMER)).notifications).toEqual([]);
+  });
+
+  it.each([
     ['not an object', 'nope'],
     ['no notifications array', { nextCursor: null }],
     ['a bad cursor', { notifications: [], nextCursor: 5 }],

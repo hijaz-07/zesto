@@ -113,7 +113,7 @@ no cacheable, non-personal responses yet. A 401 response additionally gets
 | 404    | `not_found`            | No route registered for the path, or (e.g. `PATCH .../outlets/{outletId}`) the specific resource doesn't exist. |
 | 405    | `method_not_allowed`   | The path exists, but not for this method (`Allow` header lists what does). |
 | 409    | `already_exists`       | `POST /organizations` or `POST .../outlets` with a `slug` that is already taken. |
-| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`, `.../complete`) or a pickup (`POST .../pickups`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order, an order already picked up), a pickup at the wrong outlet, and `GET /orders/{orderId}/pickup-credential` for an order that cannot be collected right now. A client should re-read the resource, not retry the same request. Only the organization order routes and the pickup credential route use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
+| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`, `.../complete`), a cancellation (`POST /orders/{orderId}/cancel`, `.../orders/{orderId}/cancel`) of an order that is past cancelling, or a pickup (`POST .../pickups`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order, an order already picked up), a pickup at the wrong outlet, and `GET /orders/{orderId}/pickup-credential` for an order that cannot be collected right now. A client should re-read the resource, not retry the same request. Only the organization order routes and the pickup credential route use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
 | 500    | `internal`             | An unhandled exception in a route handler (e.g. a malformed stored Firestore document). The client never sees the underlying detail. |
 | 503    | `unavailable`          | An infrastructure failure while validating the session (see below) — **not** the caller's fault. |
 
@@ -826,8 +826,9 @@ with an organization's outlets, newest first, one page at a time
 outlet/menu routes, not identity-scoped like `GET /orders`. This route only
 reads; an order is moved along by the fulfillment actions
 [below](#organization-order-fulfillment) and handed over by
-[pickup](#organization-order-pickup). Cancellation is a later feature and is
-not part of any of them.
+[pickup](#organization-order-pickup). Cancellation is its own money-handling
+action with its own role set (owners and managers only), described under
+[Order cancellation](#order-cancellation); it is not one of them.
 
 **Authorization.** In this order, each step stopping the request if it fails:
 
@@ -934,7 +935,7 @@ confirmed --start-preparing--> preparing --mark-ready--> ready
 
 That is the whole state machine. `completed` and `cancelled` are terminal;
 there is no way back (`ready` -> `preparing`, `picked_up` -> `ready` and the
-like are refused), and no cancellation transition — that is a later feature.
+like are refused). Cancelling is its own operation, [below](#order-cancellation).
 Like a menu's `publish`/`archive`, these are explicit operations and not a
 generic "set status": the target is fixed by the URL, nothing in the request
 body or query is read (a `status`, `userId`, `organizationId`, `outletId` there
@@ -1019,6 +1020,109 @@ this organization), `409 conflict` (see the table above), `503 unavailable`.
 An order from a since-deactivated outlet can still be fulfilled — its customers
 have already paid. No Firestore index is added: the order is resolved with the
 existing `orders.id` collection-group lookup.
+
+## Order cancellation
+
+Two explicit routes cancel an order — the customer's own, and the organization's
+(`functions/src/routes/orders.ts`, `functions/src/routes/organizationOrders.ts`):
+
+```
+POST /orders/{orderId}/cancel                                  body {reason?}
+POST /organizations/{organizationId}/orders/{orderId}/cancel   body {reason}
+```
+
+Both call the single `cancelOrder` (`functions/src/domain/orderCancellation.ts`),
+which wraps the pure policy `decideCancellation` (`domain/cancellation.ts`) in one
+Firestore transaction. Nothing in the request chooses the order's status, the
+deadline, the actor, the organization, or an amount: only the order ID (path) and
+a `reason` are read; any other body field is ignored.
+
+**Who and when.**
+
+| Order is…         | Customer (own order)                            | Owner / manager | Staff |
+| ----------------- | ----------------------------------------------- | --------------- | ----- |
+| `pending_payment` | yes, any time                                   | yes             | `403` |
+| `confirmed`       | yes, strictly before the menu's `orderingClosesAt` | yes             | `403` |
+| `preparing`/`ready` | `409`                                         | yes             | `403` |
+| `picked_up`/`completed` | `409`                                     | `409`           | `403` |
+| `cancelled`       | `200`, nothing changed (once authorized)        | `200`, nothing changed | `403` |
+
+The deadline is read from the order's **own menu** inside the transaction; the
+instant itself is closed. A missing or unreadable menu fails closed (`409`) for
+a customer. An organization is not bound by the deadline.
+
+**Authorization comes first.** Authentication, then (organization route) an
+active `owner`/`manager` membership of the path's organization (`403` otherwise,
+staff included — cancelling a paid order starts a refund, which is money), then
+inside the transaction the order must be the caller's: another customer's order,
+another organization's order and a missing order are the same `404`. Only after
+that is the reason checked (`400`; a customer's is optional, an organization's is
+required and from its own set), and only after that is an already-`cancelled`
+order answered with an idempotent `200` — so a repeat is never an authorization
+bypass. The first cancellation's audit fields (who, when, from which status,
+why) stay; a repeat never overwrites them.
+
+**Money.** A paid order (`confirmed`/`preparing`/`ready`, payment `succeeded`) gets
+exactly one refund of the **entire remaining refundable amount**
+(`captured - refunded - pending`), computed server-side from the payment read in
+the same transaction. The refund (`requested`, `submitAttempts: 0`; it is submitted
+to the provider afterwards by the [refund orchestration](#refund-orchestration) —
+the cancellation transaction itself never calls Razorpay), the payment's refund
+aggregates and `refundSeq`, the order's cancellation and its refund mirror all
+commit as one write set. An unpaid (`pending_payment`) cancellation creates no
+refund. If the payment cannot be refunded safely — missing, still pending,
+failed, in another currency, with no provider payment ID, or with inconsistent
+amounts — the cancellation is **refused** (`409`), never completed on a guess.
+A payment whose money is already fully refunded or reserved still cancels the
+order, with no second refund. The refund ID is `{orderId}-r{seq}` and is also the
+provider idempotency key.
+
+**Order refund mirror.** `refundStatus` and `refundedInPaise` on the order are a
+denormalized read copy of the payment's `refundState` and
+`refundedAmountInPaise`. They are only ever written in the same transaction that
+changes the payment's refund figures, from the figures that transaction just
+computed; the payment stays authoritative and an order without them (any order
+written before refunds) is valid. They are not part of any API response.
+
+**Late capture.** If a payment succeeds after its order was cancelled (paid in
+one tab, cancelled in another; a webhook after the cancellation),
+`markPaymentSucceeded` records the capture (`status`, `capturedAmountInPaise`)
+and reserves a `late_capture_after_cancel` refund of the whole amount in the same
+transaction. The final state is: order `status: cancelled` (never reopened or
+confirmed, no `order_confirmed` event, its cancellation audit fields untouched)
+and `paymentStatus: paid` (the money was captured); payment `succeeded` with
+`capturedAmountInPaise`; one refund, `requested`, reason
+`late_capture_after_cancel`. A repeated capture finds the payment `succeeded` and
+does nothing, so there is never a second refund, and a late `payment.failed`
+never moves a succeeded payment back. Every new success also writes
+`capturedAmountInPaise`.
+
+**Concurrency.** Cancelling, capturing a payment and moving an order through
+fulfillment all read and write the same order (and payment) documents in
+transactions, so they serialize: two cancellations produce one write and one
+refund; a cancellation racing a capture ends cancelled, captured and refunded
+exactly once, in full, whichever commits first; a cancellation racing
+`start-preparing` is either a refunded cancellation or a `409`, never both.
+
+**Response.** `200`, for the cancellation and for a safe repeat alike, with the
+same three blocks on both routes:
+
+```json
+{"data": {
+  "order": { "…": "the customer's order shape on /orders/…/cancel; the organization list row on the organization route" },
+  "cancellation": {"state": "cancelled", "canCancel": false},
+  "refund": {"status": "requested", "amountInPaise": 25000, "currency": "INR",
+             "initiatedAt": "2026-09-24T10:00:00.000Z", "completedAt": "…only once processed"}
+}}
+```
+
+`refund` is the order's latest refund and is **absent** when no money was captured
+(an unpaid cancellation). `status` is the refund's local status
+(`requested`/`pending`/`processed`/`failed`); `completedAt` appears only when it is
+`processed`. Nothing else is exposed: no provider refund or payment ID, webhook
+data, audit field (who cancelled, why), idempotency key, or secret. There is no
+separate refund endpoint. A refused state is `409 conflict`. Errors: `401`, `403`, `400 invalid_argument`, `404 not_found`,
+`409 conflict`, `503`. No Firestore index is added.
 
 ## Organization order pickup
 
@@ -1212,6 +1316,42 @@ policy → recipients → channels (in_app) → users/{userId}/notifications/{ev
   no notification. The organization's active owners, managers and staff get one `new_order`
   notification on `order_confirmed`, and nothing else. Copy names the outlet; it carries no
   order number, contact detail, payment data or credential.
+
+### Cancellation and refund notifications
+
+A cancellation and a refund are separate lifecycle facts with separate events, written in the
+transaction that commits each (never collapsed into one):
+
+```
+cancelOrder  ──► order_cancelled_by_customer | order_cancelled_by_outlet   (`{orderId}_{type}`, always)
+             └─► refund_requested                                          (`{refundId}_{type}`, only if money was captured)
+refund settles ─► refund_completed | refund_failed                         (in the refund transition's transaction)
+```
+
+An unpaid cancellation therefore has the cancellation event only. `order_cancelled_by_system` is
+supported by the policy but has no producer (no automatic cancellation exists yet). The cancellation
+event carries `refundInitiated` (whether that transaction reserved a refund) so the copy can say so.
+
+| Event | Customer | Organization |
+| --- | --- | --- |
+| `order_cancelled_by_customer` | — (they did it) | owners, managers, staff: "Order cancelled" |
+| `order_cancelled_by_outlet` | "Order cancelled" (+ "A refund has been initiated." if one was started) | — |
+| `order_cancelled_by_system` | "Order cancelled" (+ the refund sentence) | — |
+| `refund_requested` | — consumed, no inbox document | — |
+| `refund_completed` | "Refund processed … may take a few business days" | — |
+| `refund_failed` | "Refund issue … contact support with your order ID" | owners and managers only: "Refund failed" |
+
+Cancellation and refund events are not steps of the forward order progression and are never ranked
+against it; the processor checks each against its own subject (the order is `cancelled` by that kind
+of actor; the refund is the order's own, owned by that customer, and in the state the event reports).
+A refund notification's ID is an opaque hash of its event ID, so the internal refund ID never reaches
+a client. No copy carries an amount, a provider ID or error, or an internal identifier.
+
+**Backlog sweep.** Refund events written by Checkpoint 7.5 before the processor consumed them stay
+`pending` (the trigger fires only on creation). `domain/notificationBackfill.ts`
+(`scripts/backfill-refund-notifications.mjs`) hands exactly those — refund event types, `status ==
+pending`, document-ID order, bounded per page — to the same processor. It is idempotent, dry-run by
+default, excludes the two protected production orders, and is not scheduled.
 
 ### Routes
 
@@ -1434,6 +1574,49 @@ No Firestore rules changed: these endpoints read exclusively through the
 Admin SDK, which bypasses `firestore.rules` entirely, exactly like every
 other route in this codebase (see `firestore.rules`'s own header comment).
 
+## Refund orchestration
+
+Internal only — **no route** exposes any of this (no refund-status or retry endpoint exists yet). A refund is created `requested` by a cancellation or a late capture (see [Order cancellation](#order-cancellation)); `functions/src/domain/refundSubmission.ts`'s `submitRefund` is the ONE driver that moves it on with the provider, whoever calls it: the `onRefundCreated` Firestore trigger, the scheduled `reconcileRefunds` sweep, or a later route.
+
+**Shape (a provider call is never inside a Firestore transaction).**
+
+1. *Claim* (transaction): the refund must be live (`requested`/`pending`), not `attentionRequired`, due, and not leased. It takes a lease (`submitLeaseExpiresAt`, 2 minutes), counts the attempt (`submitAttempts`, `lastSubmitAt`) and sets `nextAttemptAt` to the lease's end, so a worker that dies leaves the refund findable. A second worker finds the lease and is turned away. An expired lease says nothing about the provider: the refund stays `requested`.
+2. *Provider call* (no transaction): a first submission creates the refund with the deterministic idempotency key (`{orderId}-r{seq}`), receipt and notes carrying Zesto's IDs, speed `normal`. Any later attempt LOOKS UP FIRST (`listPaymentRefunds` + the 7.4 matcher: provider refund ID, then Zesto's refund ID in receipt/notes; never the amount alone) and only sends a create — with the same key — if the provider holds none of Zesto's. A `pending` refund is fetched by its provider ID instead.
+3. *Result* (a separate transaction, `refundTransitions.ts`'s `applyRefundEvidence`): the refund, the payment's refund aggregates and the order's mirror move together, and one record is written under `refunds/{id}/transitions/{from}_to_{to}` (from, to, source `submit`/`lookup`/`webhook`/`reconciliation`/`adoption`, actor, time, webhook event key, provider status, failure code — IDs and codes only, never a provider payload). Valid moves: `requested → pending|processed|failed`, `pending → processed|failed`. Evidence for a state already held is a no-op, an older event after a terminal state is a stale no-op, and evidence that CONTRADICTS a terminal state is refused and recorded as an anomaly. Money: `pending` keeps the reservation, `processed` moves it from `refundPendingInPaise` to `refundedAmountInPaise`, `failed` releases it; `refunded + pending ≤ captured` always.
+
+**Provider outcomes.**
+
+| Outcome | Result |
+|---|---|
+| refund returned (`pending`/`processed`/`failed`) | applied as above |
+| definitive rejection (`DEFINITIVE_FAILURE`) | `requested → failed`, reservation released, the provider's code kept as `failureCode` |
+| `invalid_input` / `idempotency_key_conflict` | Zesto's own request was wrong: `attentionRequired`, **not** `failed` |
+| timeout, dropped connection, unreadable answer, duplicate receipt, 5xx on the create (`AMBIGUOUS`) | stays `requested`; lease released; next attempt after 1m, 2m, 4m… (cap 1h), and it LOOKS UP first |
+| 429 / other retryable | same backoff; never `failed` |
+| missing or rejected credentials (`AUTH_CONFIGURATION`) | stays `requested`; retried every 15 minutes; never flagged or failed |
+| a failed lookup | stays recoverable; no create is sent |
+| lookup finds two refunds carrying Zesto's ID, or a same-amount refund with no Zesto identifier | `attentionRequired`; nothing adopted, nothing sent |
+
+After 8 inconclusive attempts automatic work stops (`attentionRequired`, `nextAttemptAt` removed) — the refund is still not `failed`. A `failed` refund also sets `attentionRequired` (the customer's money has not come back); the payment's `refundState` and the order's `refundStatus` then read `attention_required` until a person clears it (clearing is a later checkpoint; creating a retry clears the flag when no other live refund is flagged).
+
+**Reconciliation** (`reconcileRefunds`, every 15 minutes, `maxInstances: 1`; code only — enabling it needs the Cloud Scheduler API on the project and a deploy, which this checkpoint does not do). One bounded collection-group query: `status in (requested, pending)` and `nextAttemptAt <= now`, oldest first, at most 25. A new refund carries `nextAttemptAt = createdAt + 5 min` as a safety net for a lost trigger; a `pending` refund is rechecked every 6 hours as a backup to its webhook; a terminal or `attentionRequired` refund has no `nextAttemptAt` and is never selected. Each document's path is validated against `organizations/{o}/outlets/{ou}/menus/{m}/orders/{ord}/payments/{p}/refunds/{r}` (the refund ID must encode its order) and then its stored documents against that path; a malformed one is skipped and logged. It never creates a refund or chooses an amount. Two sweeps at once are safe (leases). A wall-clock budget (4 minutes) ends a run early.
+
+**Refund events (the producer boundary for notifications).** Refund lifecycle facts are written to the SAME `notificationEvents` outbox the order lifecycle uses (same conventions: backend-only, deterministic ID, one buffered `set` inside the transition's own transaction, `status: pending`), keyed by the refund: `notificationEvents/{refundId}_{type}`.
+
+| Type | Written when |
+|---|---|
+| `refund_requested` | a refund is created: a cancellation of a paid order, a payment captured after cancellation, or a retry of a failed refund |
+| `refund_completed` | the refund reaches `processed` (by the submit driver, a lookup, a webhook or the reconciler) |
+| `refund_failed` | the refund reaches `failed` (definitive rejection, or the provider reports it failed) |
+
+Each carries `refundId`, `orderId`, `paymentId`, `organizationId`, `outletId`, `menuId`, `customerUserId`, `occurredAt` (the transition's own timestamp, equal to the refund's `createdAt`/`processedAt`/`failedAt`), `providerPaymentId`, `amountInPaise`, and `providerRefundId` once the provider has given one. Nothing about the customer beyond their user ID, no idempotency key, reason, failure message or audit data. A move to `pending`, a no-op repeat, a stale or contradictory event, an anomaly, an inconclusive attempt and an adopted external refund (provenance uncertain, flagged for a person) write no event. A transition and its event commit together or not at all, and because a refund reaches each state once, a duplicate webhook, a retry or a re-run transaction can never produce a second logical event. Consumers read these events, never the `transitions`/`anomalies` audit records. The notification processor consumes them (checkpoint 7.6): `notificationPolicy.ts` decides who is told what, and `refund_requested` is processed without any inbox document — see [Cancellation and refund notifications](#cancellation-and-refund-notifications).
+
+**External / manual refunds.** A signed refund event (or a lookup) for a Zesto payment with no local refund document, and no Zesto identifier, is ADOPTED: a refund with reason `external`, source `reconciliation`, `attentionRequired: true`, its money booked like a refund of that status. It never cancels the order. If booking it would break `refunded + pending ≤ captured`, or the payment is not safely refundable, nothing is adopted: the payment is flagged and an `anomalies` record is written under it.
+
+**Retry.** `refundRetry.ts`'s `createRefundRetry` (a system capability, no route yet) creates the next refund (`{orderId}-r{seq+1}`, source `retry`) only when the LATEST refund is `failed` and not external, for the whole remaining refundable amount, in one transaction; the failed attempt is never reopened.
+
+**Required before this runs in production (not done in 7.5):** deploy the functions `onRefundCreated` and `reconcileRefunds` (the latter needs Cloud Scheduler), deploy the new Firestore indexes (`refunds`: `status`+`nextAttemptAt` composite; collection-group overrides on `refunds.providerRefundId` and `payments.providerPaymentId`), and add the three refund events to the Razorpay webhook subscription.
+
 ## Razorpay webhook
 
 `POST /api/webhooks/razorpay` receives Razorpay's asynchronous payment
@@ -1502,6 +1685,9 @@ Subscribe to **only**:
 
 - `payment.captured`
 - `payment.failed`
+- `refund.created`, `refund.processed` and `refund.failed` (from checkpoint 7.5; see
+  [Refund webhooks](#refund-webhooks). Adding them to the Razorpay Dashboard subscription
+  is a deployment step, not something the code does.)
 
 Not `order.paid`: subscribing to both `payment.captured` and `order.paid` would
 deliver two success events for one payment. Any other (valid, signed) event type
@@ -1565,6 +1751,7 @@ nothing created.
 | Event | Payment now | Result |
 |---|---|---|
 | `payment.captured` | `pending` / `failed` | `markPaymentSucceeded`: payment `succeeded` + `providerPaymentId`, order `confirmed`/`paid`, atomically |
+| `payment.captured` | `pending` / `failed`, order `cancelled` | **late capture**: payment `succeeded` + captured amount, the order stays `cancelled` (never reopened or confirmed), and the whole amount is reserved for a `requested` refund (`late_capture_after_cancel`), atomically — see [Order cancellation](#order-cancellation) |
 | `payment.captured` | `succeeded` | idempotent no-op (e.g. browser verification got there first); a *different* Razorpay payment ID is reported, never overwritten |
 | `payment.failed` | `pending` | `markPaymentFailed`: payment `failed` + `providerPaymentId`; the **order stays `pending_payment`** and payable |
 | `payment.failed` | `failed` | idempotent no-op |
@@ -1594,13 +1781,21 @@ The normal `api request` line (with `requestId`, route, status, duration) gains 
 `providerOrderId`, `providerPaymentId`. The webhook secret, API key secret,
 `Authorization` header, signature, and webhook body are never logged.
 
+### Refund webhooks
+
+`refund.created`, `refund.processed` and `refund.failed` ride this same route, signature check and event-claim machinery; nothing about the steps above changes (HMAC over the raw bytes, claim/lease, body-fingerprint conflict). Any other event type, including `refund.speed_changed`, is acknowledged and ignored. Only the refund entity's `id`, `payment_id`, `amount`, `currency`, `status`, `receipt` and Zesto's two notes (`zestoRefundId`, `zestoOrderId`) are read; every other field is dropped by the schema.
+
+The local refund is found by the provider refund ID first (a collection-group lookup on `refunds.providerRefundId`; two matches are `rejected_ambiguous_refund`), else — for a webhook that beats the create response — by Zesto's refund ID in the receipt/notes under the payment the event names. The refund, payment and order then move in one transaction (see [Refund orchestration](#refund-orchestration)). Outcomes: `refund_pending`, `refund_processed`, `refund_failed`, `refund_noop_already_in_state`, `refund_noop_stale_event`, `refund_adopted_external`, `refund_external_already_known`, `ignored_unrecognized_refund`, `ignored_refund_status_mismatch`, and the anomalies (logged at error severity) `rejected_refund_payment_mismatch`, `rejected_refund_amount_mismatch`, `rejected_refund_currency_mismatch`, `rejected_refund_id_mismatch`, `rejected_refund_contradicts_terminal_state`, `rejected_ambiguous_refund`, `rejected_ambiguous_payment`, `rejected_external_refund_not_applicable`. All are acknowledged with `200`.
+
+A refund event whose `payment_id`, amount or currency differs from the stored refund, or whose status contradicts a terminal refund (`processed` after `failed`, `failed` after `processed`), is never applied: the refund and its payment are flagged `attentionRequired` and an `anomalies` record is written. A stale event (an older `pending` after a terminal state) is a no-op.
+
 ### Razorpay Dashboard configuration (Test Mode)
 
 After this is deployed: Accounts & Settings → Webhooks → add
 
 - URL: `https://zesto-dev-2026.web.app/api/webhooks/razorpay`
 - Secret: a **new** value, entered directly into Secret Manager (never pasted into chat or source), different from the API key secret
-- Active events: **`payment.captured`** and **`payment.failed`** only
+- Active events: **`payment.captured`**, **`payment.failed`**, and (from checkpoint 7.5) **`refund.created`**, **`refund.processed`** and **`refund.failed`** — see [Refund webhooks](#refund-webhooks) and [Refund orchestration](#refund-orchestration)
 
 Create `RAZORPAY_WEBHOOK_SECRET` in Secret Manager **before** deploying the `api`
 function: the function now declares the secret binding, so a deploy without it

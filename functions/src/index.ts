@@ -1,7 +1,9 @@
 import {randomUUID} from "node:crypto";
 import {setGlobalOptions} from "firebase-functions";
+import * as logger from "firebase-functions/logger";
 import {onDocumentCreated} from "firebase-functions/v2/firestore";
 import {onRequest} from "firebase-functions/v2/https";
+import {onSchedule} from "firebase-functions/v2/scheduler";
 import type {Response} from "express";
 import {getAdminFirestore} from "./firebaseAdmin";
 import {toResponseBody} from "./http/envelope";
@@ -21,7 +23,9 @@ import {createOutletRoutes} from "./routes/outlets";
 import {createWebhookRoutes} from "./routes/webhooks";
 import {handleNotificationEventCreated} from "./domain/notificationEventTrigger";
 import {pickupCredentialSecret} from "./domain/pickupCredential";
+import {handleRefundCreated, reconcileDueRefunds} from "./domain/refundReconciliation";
 import {razorpayKeySecret, razorpayWebhookSecret} from "./providers/razorpay";
+import {getRazorpayRefundGateway} from "./providers/razorpayRefunds";
 
 // For cost control, you can set the maximum number of containers that can be
 // running at the same time. This helps mitigate the impact of unexpected
@@ -129,5 +133,50 @@ export const onNotificationEventCreated = onDocumentCreated(
   {document: "notificationEvents/{eventId}", region: "asia-south1", retry: true},
   async (event) => {
     await handleNotificationEventCreated(getAdminFirestore(), event.params.eventId);
+  },
+);
+
+/**
+ * Submits a refund to the provider as soon as it is created (by a cancellation, or
+ * by a payment captured after one). Fires once per document created under any
+ * payment's `refunds`, and runs `submitRefund` — the one submission driver — for
+ * exactly that document (see `domain/refundSubmission.ts`). Provider failures are
+ * recorded on the refund, never thrown, so `retry: true` only redelivers an
+ * unexpected local failure; the scheduled sweep below recovers anything else.
+ * Needs the Razorpay API secret, so it declares it.
+ */
+export const onRefundCreated = onDocumentCreated(
+  {
+    document: "organizations/{organizationId}/outlets/{outletId}/menus/{menuId}/orders/{orderId}/payments/{paymentId}/refunds/{refundId}",
+    region: "asia-south1",
+    retry: true,
+    secrets: [razorpayKeySecret],
+  },
+  async (event) => {
+    if (!event.data) {
+      return;
+    }
+    await handleRefundCreated(getAdminFirestore(), getRazorpayRefundGateway(), event.data.ref.path);
+  },
+);
+
+/**
+ * The refund safety net: every 15 minutes, advances a bounded batch of refunds
+ * that are due (lost responses, dead workers, pending refunds with no webhook, retries
+ * now due) through the same `submitRefund` driver (see
+ * `domain/refundReconciliation.ts`). Safe if two runs overlap. Deploying it needs the
+ * Cloud Scheduler API enabled on the project.
+ */
+export const reconcileRefunds = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    region: "asia-south1",
+    timeoutSeconds: 540,
+    maxInstances: 1,
+    secrets: [razorpayKeySecret],
+  },
+  async () => {
+    const summary = await reconcileDueRefunds(getAdminFirestore(), getRazorpayRefundGateway());
+    logger.info("Refund reconciliation finished.", summary);
   },
 );

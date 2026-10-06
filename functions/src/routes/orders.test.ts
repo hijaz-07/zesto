@@ -118,13 +118,14 @@ function validCreateBody(overrides: Record<string, unknown> = {}) {
 }
 
 describe("createOrderRoutes", () => {
-  it("registers exactly the 6 documented routes", () => {
+  it("registers exactly the 7 documented routes", () => {
     const routes = createOrderRoutes({db: {} as Firestore});
     expect(routes.map((r) => `${r.method} ${r.path}`).sort()).toEqual([
       "GET /orders",
       "GET /orders/:orderId",
       "GET /orders/:orderId/pickup-credential",
       "POST /orders",
+      "POST /orders/:orderId/cancel",
       "POST /orders/:orderId/payment",
       "POST /orders/:orderId/payment/verify",
     ]);

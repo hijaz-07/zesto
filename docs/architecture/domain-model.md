@@ -162,9 +162,16 @@ payment) → `preparing` → `ready` (set by an active organization member
 through the explicit fulfillment actions) → `picked_up` (set only by
 redeeming the customer's pickup credential, see Pickup below) →
 `completed` (set by a member once the order has been handed over), or
-`cancelled`. `completed` and `cancelled` are terminal; the cancellation
-workflow is a later feature. The fulfillment transitions, and who may
-make them, are in
+`cancelled`. `completed` and `cancelled` are terminal. Cancellation (by the
+customer or by an owner/manager), the refund it reserves for a paid order, the
+order's `refundStatus`/`refundedInPaise` mirror of the payment's refund
+figures, and a payment captured after the cancellation are in
+[http-api.md](./http-api.md#order-cancellation). How a refund is then
+submitted to the provider, settled by webhook, recovered after a lost response and
+reconciled is in [http-api.md](./http-api.md#refund-orchestration); a refund has
+its own lifecycle (`requested` → `pending` → `processed`, or `failed`), independent
+of the order's. The
+fulfillment transitions, and who may make them, are in
 [http-api.md](./http-api.md#organization-order-fulfillment); pickup is in
 [http-api.md](./http-api.md#organization-order-pickup).
 
@@ -209,6 +216,8 @@ an `org:{organizationId}` scope. Always created by the backend from a
 browser push, email and mobile push later) are pluggable behind one interface.
 
 ### NotificationEvent
+The outbox record for one fact. Order facts are keyed by the order (`{orderId}_{type}`): the forward lifecycle (`order_confirmed` … `order_completed`) and the cancellation (`order_cancelled_by_customer`, `order_cancelled_by_outlet`, `order_cancelled_by_system`). Refund lifecycle facts (`refund_requested`, `refund_completed`, `refund_failed`) are keyed by the refund (`{refundId}_{type}`) — see [http-api.md](./http-api.md#refund-orchestration). All are consumed by the same processor; `refund_requested` is consumed without producing any visible notification, because the cancellation notification already says a refund was started.
+
 The outbox record of one order lifecycle transition
 (`notificationEvents/{orderId}_{eventType}`: `order_confirmed`, `order_preparing`,
 `order_ready`, `order_picked_up`, `order_completed`). Written in the same

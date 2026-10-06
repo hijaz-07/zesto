@@ -396,7 +396,7 @@ describe("markPaymentSucceeded", () => {
     expect(result.order.status).toBe("confirmed");
   });
 
-  it("never confirms an already-cancelled order", async () => {
+  it("never confirms an already-cancelled order: the capture is recorded as a late capture and refunded", async () => {
     const {order, payment} = await preparedPayment();
     await db
       .collectionGroup("orders")
@@ -404,13 +404,23 @@ describe("markPaymentSucceeded", () => {
       .get()
       .then((snapshot) => snapshot.docs[0].ref.update({status: "cancelled"}));
 
-    await expect(markPaymentSucceeded(db, {
+    const result = await markPaymentSucceeded(db, {
       orderId: order.id, paymentId: payment.id,
       amountInPaise: payment.amountInPaise, currency: payment.currency,
-    })).rejects.toMatchObject({code: "failed-precondition"});
+      providerPaymentId: "pay_late_capture_1",
+    });
 
+    // The order is not reopened, and the money that arrived is being refunded.
+    expect(result.order.status).toBe("cancelled");
+    expect(result.payment).toMatchObject({status: "succeeded", capturedAmountInPaise: payment.amountInPaise});
+    expect(result.refundId).toBe(`${order.id}-r1`);
     const reread = await getOwnedOrder(db, order.userId, order.id);
     expect(reread.status).toBe("cancelled");
+    expect(reread.refundStatus).toBe("in_progress");
+    const refunds = await db.collectionGroup("refunds").where("orderId", "==", order.id).get();
+    expect(refunds.docs.map((doc) => doc.data())).toMatchObject([
+      {amountInPaise: payment.amountInPaise, status: "requested", reason: "late_capture_after_cancel"},
+    ]);
   });
 
   it("two concurrent success calls for the same payment produce exactly one confirmed order", async () => {
@@ -719,17 +729,24 @@ describe("verifyCheckoutPayment", () => {
     expect(result.order.status).toBe("confirmed");
   });
 
-  it("never confirms an already-cancelled order even with a valid signature", async () => {
+  it("never confirms an already-cancelled order even with a valid signature: it is a late capture, refunded", async () => {
     const {order, providerOrderId, customerId} = await preparedPaymentWithProviderOrder();
     await db.collectionGroup("orders").where("id", "==", order.id).get()
       .then((snapshot) => snapshot.docs[0].ref.update({status: "cancelled"}));
     const razorpayPaymentId = `pay_test_${randomUUID()}`;
 
-    await expect(verifyCheckoutPayment(db, customerId, order.id, {
+    const result = await verifyCheckoutPayment(db, customerId, order.id, {
       razorpayOrderId: providerOrderId,
       razorpayPaymentId,
       razorpaySignature: computeCheckoutSignature(providerOrderId, razorpayPaymentId),
-    })).rejects.toMatchObject({code: "failed-precondition"});
+    });
+
+    expect(result.order.status).toBe("cancelled");
+    expect(result.payment).toMatchObject({status: "succeeded", providerPaymentId: razorpayPaymentId});
+    const refunds = await db.collectionGroup("refunds").where("orderId", "==", order.id).get();
+    expect(refunds.docs.map((doc) => doc.data())).toMatchObject([
+      {status: "requested", reason: "late_capture_after_cancel", providerPaymentId: razorpayPaymentId},
+    ]);
   });
 
   it("rejects a different customer's verification attempt (not-found), never leaking payment existence", async () => {

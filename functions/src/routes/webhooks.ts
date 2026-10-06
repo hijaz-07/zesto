@@ -12,6 +12,7 @@ import type {
   RouteContext,
   RouteDefinition,
 } from "../http/types";
+import {ANOMALOUS_REFUND_OUTCOMES} from "../domain/refundWebhooks";
 import {verifyWebhookSignature} from "../providers/razorpay";
 
 export interface WebhookRouteDeps {
@@ -181,7 +182,10 @@ function toApiResult(result: ReceiveWebhookResult): ApiResult {
     if (result.providerOrderId) {
       context.providerOrderId = result.providerOrderId;
     }
-    if (ANOMALOUS_OUTCOMES.has(result.outcome)) {
+    if (result.providerRefundId) {
+      context.providerRefundId = result.providerRefundId;
+    }
+    if (ANOMALOUS_OUTCOMES.has(result.outcome) || ANOMALOUS_REFUND_OUTCOMES.has(result.outcome)) {
       logger.error("razorpay webhook reconciliation anomaly", context);
     }
     return {kind: "success", status: 200, data: {received: true, outcome: result.outcome}, logContext: context};

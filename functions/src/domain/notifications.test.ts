@@ -61,6 +61,33 @@ describe("deterministic notification identity", () => {
     expect(notificationId("e", "customer")).not.toBe(notificationId("e", "org"));
   });
 
+  it("keeps cancellation event IDs readable, like the order events'", () => {
+    expect(notificationId("order-1_order_cancelled_by_outlet", "customer")).toBe("order-1_order_cancelled_by_outlet.customer");
+  });
+
+  it("is OPAQUE for a refund event, so the internal refund ID never reaches a client", () => {
+    for (const type of ["refund_requested", "refund_completed", "refund_failed"]) {
+      const id = notificationId(`order-1-r2_${type}`, "customer");
+      expect(id).toMatch(/^refund-[0-9a-f]{24}\.customer$/);
+      expect(id).not.toContain("order-1");
+      expect(id).not.toContain("r2");
+    }
+  });
+
+  it("is still deterministic and distinct for refund events, per event, per type and per audience", () => {
+    const ids = new Set<string>();
+    for (const refund of ["order-1-r1", "order-1-r2", "order-2-r1"]) {
+      for (const type of ["refund_completed", "refund_failed"]) {
+        for (const audience of ["customer", "org"] as const) {
+          const id = notificationId(`${refund}_${type}`, audience);
+          expect(notificationId(`${refund}_${type}`, audience)).toBe(id);
+          ids.add(id);
+        }
+      }
+    }
+    expect(ids.size).toBe(3 * 2 * 2);
+  });
+
   it("scopes are `customer` and `org:<organizationId>`", () => {
     expect(customerScope()).toBe("customer");
     expect(organizationScope("org-1")).toBe("org:org-1");

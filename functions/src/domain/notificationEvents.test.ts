@@ -50,7 +50,7 @@ describe("notificationEventId", () => {
 });
 
 describe("NOTIFICATION_EVENT_TYPES", () => {
-  it("is exactly the five order lifecycle events — no cancellation/refund types yet", () => {
+  it("is exactly the five FORWARD order lifecycle events (cancellation and refund events are their own families)", () => {
     expect([...NOTIFICATION_EVENT_TYPES]).toEqual([
       "order_confirmed", "order_preparing", "order_ready", "order_picked_up", "order_completed",
     ]);
