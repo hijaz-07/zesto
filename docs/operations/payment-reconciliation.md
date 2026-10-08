@@ -203,11 +203,11 @@ for that one payment from an approved, supervised script; it will create a prope
 
 Not done; each needs an explicit instruction. Order matters (see [deployment-runbook.md](./deployment-runbook.md)):
 
-1. `firebase deploy --only firestore:indexes` — adds the `payments.reconciliation.nextAttemptAt`
+1. `npm run deploy:production -- --only firestore:indexes --confirm-production zesto-dev-2026` — adds the `payments.reconciliation.nextAttemptAt`
    collection-group field override. **Wait until it is READY**: the sweep's query fails with
    `FAILED_PRECONDITION` until then (the emulator does not enforce indexes).
 2. Cloud Scheduler API enabled (already required by `reconcileRefunds`).
-3. `firebase deploy --only functions:reconcilePayments` — then `functions:api` (the new `api` revision is what
+3. `npm run deploy:production -- --only functions:reconcilePayments --confirm-production zesto-dev-2026` — then `functions:api` (the new `api` revision is what
    starts scheduling payments, via `ensureProviderOrder`). Deploying the sweep first is harmless: it finds nothing.
 4. Check one scheduled tick logs `Payment reconciliation finished.` with `examined: 0` on an idle project.
 
@@ -219,4 +219,60 @@ Not done; each needs an explicit instruction. Order matters (see [deployment-run
 | `providers/razorpayPayments.test.ts` | The adapter: read-only GET, normalised fields only, whole-listing failure on one bad item, every HTTP failure typed, no credential or customer data in logs, unsafe order ids never sent |
 | `domain/paymentReconciliation.emulator.test.ts` | Against a real Firestore emulator: captured-but-webhook-missed, captured-but-verify-missed, failed-but-webhook-missed, provider pending/authorized, timeout/5xx/rate limit/auth, retry and backoff, duplicate and concurrent reconciliation, overlapping sweeps, conflicting ids, wrong-order payments, malformed provider results, already-succeeded, late capture, the window, bounds, and the order/payment consistency invariant |
 | `domain/payments.emulator.test.ts` (additions) | `ensureProviderOrder` schedules once; success removes the schedule in the same transaction |
+| `domain/paymentReconciliation.emulator.test.ts` (4.7 block "the real Razorpay adapter feeding the driver") | The REAL `razorpayPayments` adapter over Razorpay-shaped JSON (extra raw fields included) into the driver and a Firestore emulator: one read-only GET to `/v1/orders/{id}/payments`, adoption, `authorized`/`created` never paid, a payment of another provider order or a different amount rejected, a late capture reserving one refund and a second run changing nothing, no customer fields stored |
 | `index.registration.test.ts`, `firestoreIndexes.test.ts` | The function is exported with its secret and single instance; the index override is in the real `fieldOverrides` array |
+
+## Checkpoint 4.7 validation
+
+Goal: check the reconciliation provider path against **real Razorpay Test Mode**, without touching production, the two
+protected orders, or Live Mode. What was real and what was not:
+
+### Real Razorpay Test Mode (script: `scripts/validate-razorpay-lookup.mjs`)
+
+Run with the Test key already in `functions/.env.zesto-dev-2026` / `functions/.secret.local` (it refuses any key that is
+not `rzp_test_`; it prints no secret). It creates **one disposable order** (Rs 1, receipt `zesto-lookup-validation-<time>`;
+order `order_TlNWKoTBTkpCDm`, left `created`, never paid) and drives the compiled production gateway against `api.razorpay.com`:
+
+| # | Check | Result |
+| - | ----- | ------ |
+| 1 | Create a Test Mode order | HTTP 200, `status: created` |
+| 2 | **Provider payment lookup**: `GET /v1/orders/{id}/payments` through `createRazorpayPaymentLookupGateway` | parsed; `0` payments (the real endpoint, and the `{entity:"collection", items:[]}` shape the adapter relies on) |
+| 3 | The matching rules on that real answer | `open / no_payments` — an unpaid order is never captured |
+| 4 | Lookup of an order Razorpay does not know | HTTP 404 → typed `DEFINITIVE_FAILURE` / `provider_error`. The driver treats every non-auth provider failure as *inconclusive* (retry with backoff), never as "not paid" |
+| 5 | Rejected credentials | HTTP 401 → typed `AUTH_CONFIGURATION` / `provider_auth_rejected` (quiet 15-minute retry) |
+| 6 | A malformed id (`order_x/../../refunds`) | refused locally before any request |
+
+### Deliberately NOT done against Razorpay, and why
+
+A real **captured** Test payment needs Razorpay Checkout. Production's Test Mode webhook is account-wide, so a
+`payment.captured`/`payment.failed` for any order in this account is delivered to the production `/api/webhooks/razorpay`
+route, which **writes a webhook-event record to production Firestore** even for an unknown order. That would violate the
+no-production-writes rule, so no Checkout payment was made. The real captured / authorized payment shapes are therefore
+still **unverified against the live API**: the adapter parses them from Razorpay's documented format. Closing this needs
+staging's own Razorpay key pair and webhook (`environments.md` §4); then repeat with a Checkout Test payment
+(Razorpay's published test card), once for a pending order and once for an order cancelled before the payment.
+
+### Deterministic (fakes + Firestore emulator) — clearly not provider evidence
+
+| Required scenario | Where it is proven |
+| ----------------- | ------------------ |
+| Captured payment adoption, only into the right Zesto order | emulator: "captured but the webhook was missed", the "matching" block, and the 4.7 Razorpay-shaped block (adapter → driver) |
+| An already-succeeded payment is never overwritten by a different provider ID | emulator: "a payment that succeeded with one provider payment while the lookup ran…", "the same provider payment arriving by two routes…" |
+| `created`/`authorized` never becomes paid | pure matching tests; emulator "provider pending/authorized"; 4.7 block |
+| Wrong/mismatched evidence rejected (other order, amount mismatch, two captures, captured-then-refunded, ID already owned by another payment) | emulator "matching" block; 4.7 block |
+| Cancelled-order late capture → one automatic refund reservation | emulator "an order cancelled meanwhile is a late capture"; 4.7 block (run twice) |
+| Idempotency: reconcile twice, concurrently, and with overlapping sweeps | emulator "duplicate and concurrent reconciliation" |
+| Scheduler | `index.registration.test.ts` pins `reconcilePayments` (`every 15 minutes`, `asia-south1`, `maxInstances: 1`, its secret). **It is not deployed anywhere**: not to production (forbidden) and not to staging (staging does not exist). A deployed Scheduler tick is therefore still unverified |
+
+### Review of the 4.6 implementation (before external validation)
+
+Read against the checklist; no code change was needed. The index override is in `firestore.indexes.json` and pinned by a test;
+the sweep is one collection-group query on `reconciliation.nextAttemptAt` with `limit` ≤ 100, a time budget and no tenant
+scan; a claim takes a lease inside a transaction and every later write re-checks that it still holds it; success deletes
+`nextAttemptAt`/`leaseExpiresAt` in the SAME transaction as `succeeded` (`markPaymentSucceeded`); a failed lookup records
+a deferral and schedules a retry; `window_closed_unverified` is an attention flag with `resolution: window_closed` and never
+touches payment or order status; a cancelled order's capture goes through `captureAfterCancellation` (the existing refund
+logic, one refund document); a provider payment is adopted only from its own provider order's listing, so another order's
+payment cannot be adopted, and amount is compared only *after* the order matches; the outcome is decided server-side
+from the provider's answer (no client input reaches the driver); and webhook, Checkout verify and reconciliation all end in
+`markPaymentSucceeded`.

@@ -1,7 +1,8 @@
-# Environments: current state and the staging plan (Checkpoint 4.6)
+# Environments: current state and the staging plan (Checkpoints 4.6–4.7)
 
-Status: **audit + plan. No Firebase, Descope or Razorpay resource was created or changed.** A real staging
-environment does **not** exist. This document says exactly what it needs.
+Status (updated in 4.7): **audit + plan + deployment guard. No Firebase, Descope or Razorpay resource was created or changed.**
+A real staging environment does **not** exist (re-assessed in 4.7: see §3). This document says exactly what it needs.
+What 4.7 *did* change is the repository: a deploy can no longer reach production by accident (§1, "Deployment guard").
 
 Read-only tooling added: `npm run check:env -- --env <production|staging>` ([`scripts/check-environment.mjs`](../../scripts/check-environment.mjs))
 states which environment the local config describes and refuses unsafe combinations. It prints only variable
@@ -31,7 +32,7 @@ names, payment-mode words and shortened public ids.
 | -------- | ------- |
 | Can the emulators point at production? | **No, by construction.** (1) Every test script uses a `demo-*` project id: demo projects cannot contact Google. (2) `getAdminFirestore()` throws if the Functions emulator runs without `FIRESTORE_EMULATOR_HOST` — the one path that would silently use real Firestore. (3) The trigger test runs behind a network guard that refuses non-loopback connections and fails the run if anything but CLI telemetry was blocked |
 | Can a script write to production by accident? | `seed-org-orders.mjs` refuses unless `FIRESTORE_EMULATOR_HOST` is loopback. `backfill-refund-notifications.mjs` is a dry run by default and needs `--project`, `--execute` **and** `--i-understand-this-writes-to-production`. `check-environment.mjs` is read-only |
-| **Remaining foot-gun** | `.firebaserc`'s `default` is production, so **`firebase deploy` without `--project` deploys to production.** Every command in the runbook passes `--project`; keep it that way. A `production` alias now exists so commands can say `--project production` explicitly. When staging exists, make `default` point at **staging**, so a forgotten flag lands on the safe side |
+| **Foot-gun (fixed in 4.7)** | `.firebaserc`'s `default` is production **and** the Firebase CLI remembers `zesto-dev-2026` as this directory's *active project* (`~/.config/configstore/firebase-tools.json`), so a bare `firebase deploy` used to deploy to production. Now every deployable target in `firebase.json` runs `scripts/deploy-guard.mjs --predeploy` first and aborts unless `npm run deploy:<env>` approved that exact project. See [the runbook](./deployment-runbook.md#safe-deployment-commands-checkpoint-47) |
 | Are production secrets in local test files? | No. Searched tracked files and the committed diff for key-shaped strings: only obviously fake literals in tests. `.env*.local`, `functions/.env.*` and `functions/.secret.local` are gitignored. Test suites stub their own secrets (`vi.stubEnv`) |
 | Can staging credentials point at production? | Today nothing is staging. `check:env --env staging` is the guard that will refuse: staging sharing production's Firebase project, Descope project or Razorpay key, a staging bundle built for the production project, any Live key in staging |
 | Does the dev server proxy hit production? | `vite.config.ts` proxies `/api` to **`127.0.0.1:5001`** (the local Functions emulator) using the project id from `.env.local`; it never targets the hosted API |
@@ -92,7 +93,7 @@ Replace `STG` with the staging project id, e.g. `zesto-staging-2026`.
 **B. Project resources (CLI, after A)**
 
 ```bash
-firebase use --add            # alias it "staging" -> STG  (then .firebaserc has a "staging" alias)
+firebase use --add            # alias it "staging" -> STG  (then .firebaserc has a "staging" alias; `deploy:staging` reads it)
 gcloud services enable cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com \
   artifactregistry.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com \
   eventarc.googleapis.com firestore.googleapis.com --project STG
@@ -117,13 +118,13 @@ functions/.env.STG        DESCOPE_PROJECT_ID=<staging Descope id>
 
 ```bash
 npm run check:env -- --env staging     # must print OK; fails on any shared id/key or a Live key
-npm run build -- --mode staging        # note: `tsc -b && vite build --mode staging`
-firebase deploy --only firestore:indexes --project staging     # then wait for READY, then rules, functions, hosting
+# `npm run deploy:staging -- --only hosting` builds with `--mode staging` itself and refuses a bundle that names production
+npm run deploy:staging -- --only firestore:indexes     # then wait for READY, then rules, functions, hosting
 ```
 
 **E. After staging works**
 
-1. Point `.firebaserc`'s `default` at `staging` so a forgotten `--project` is safe.
+1. Point `.firebaserc`'s `default` at `staging` (read-only commands then default to the safe side; deploys are already guarded).
 2. Run the [production E2E plan](./production-e2e-plan.md) against staging first.
 3. Add a GitHub Actions workflow with two **environments** (`staging`, `production`), each with its own
    secrets, `production` requiring a reviewer, and `npm run check:env` as the first step of each deploy job.
@@ -144,3 +145,30 @@ Live Mode is a later, separate step. Before it: staging exists and has passed th
 **separate Live webhook** (own secret) are created in the Dashboard; production's `functions/.env.zesto-dev-2026`
 gets the `rzp_live_` key id and the secrets are replaced in Secret Manager; `check:env --env production --allow-live`
 is the only command that will accept it.
+
+## 6. Checkpoint 4.7 findings
+
+**Staging was not created.** Re-checked with the CLI: the logged-in Google account sees eight Firebase projects, one of which is
+`zesto-dev-2026`; there is no staging project. Creating one needs (a) a billing account linked for Blaze — console only,
+(b) a second Descope project and (c) a second Razorpay Test key pair and webhook in the Dashboard. Two of the three cannot
+be done with any tool available here, and a Firebase project without them would look like staging while still sharing
+Descope users and Razorpay's account with production. Nothing was half-created.
+
+**The shared Razorpay Test account cannot safely take a real Checkout payment.** Production's Test Mode webhook is
+account-wide: any `payment.captured` / `payment.failed` for *any* order in the account is delivered to
+`https://zesto-dev-2026.web.app/api/webhooks/razorpay`. That route, after verifying the signature, **writes a webhook-event
+record to production Firestore** (`razorpayWebhooks.ts`, `tx.create`) even for an order Zesto has never heard of. So
+capturing a disposable Test payment here would mutate production data. Real captured-payment validation therefore waits for
+the staging key pair and webhook (§4). Order creation and the read-only order-payments lookup fire no subscribed event and
+were exercised for real — see [payment-reconciliation.md](./payment-reconciliation.md#checkpoint-47-validation).
+
+**`vite build --mode staging` inherits `.env.local`.** Vite loads `.env.local` in every mode and only *overrides* it with
+`.env.staging.local`, so a `VITE_*` variable staging forgot to define would silently take the legacy (production) value.
+`check:env --env staging` now fails when `.env.local` defines a `VITE_*` name that `.env.staging.local` does not.
+When staging exists, also rename `.env.local` to `.env.production.local` (both are accepted today) to remove the overlap.
+
+**Descope separation.** Staging users, sessions and allowed domains are separate only if staging has its own Descope project.
+The backend verifies the session token's audience against `DESCOPE_PROJECT_ID`; with different projects a production token is
+rejected by staging and vice versa. `check:env` fails if staging reuses production's Descope project id, Razorpay key id or
+Firebase project, or holds a Live key. No production user or customer data is to be copied into staging; seed it with
+`scripts/seed-org-orders.mjs`-style synthetic data against staging's own project.

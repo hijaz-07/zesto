@@ -2,13 +2,50 @@
 
 Status: **plan only — nothing in this document has been executed.** It is written for the
 future deployment of the cancellation/refund work (7.x) plus the 4.5 hardening on top of what
-checkpoint 6 already deployed. Do not run any step without an explicit instruction naming it.
+checkpoint 6 already deployed. Do not run any step without an explicit instruction naming it. The `firebase deploy …` lines below are now
+written as the guarded `npm run deploy:production …` wrapper; see [Safe deployment commands](#safe-deployment-commands-checkpoint-47).
 
 Project `zesto-dev-2026` · Hosting `https://zesto-dev-2026.web.app` · Functions region
 `asia-south1` · Node 24 · Razorpay **Test Mode** · Descope only.
 
 Protected production orders `OpSIkzpFFP7kcGrNE75F` and `e60n23hMaxQo9FLYhCmt` must never be
 modified, cancelled, refunded, reused or tested against — in any step below.
+
+## Safe deployment commands (checkpoint 4.7)
+
+Deploy **only** through the project's wrapper. It always passes the Firebase project explicitly (never the CLI's
+"active project" or the `default` alias — the active project is remembered per machine in `~/.config/configstore`
+and on this machine it **is** production), runs `npm run check:env` first, builds the frontend for the right
+environment when hosting is deployed, and refuses on any doubt.
+
+```bash
+npm run deploy:staging    -- --only functions,hosting
+npm run deploy:production -- --only functions:api --confirm-production zesto-dev-2026
+npm run deploy:production -- --only hosting --confirm-production zesto-dev-2026 --dry-run   # checks + prints, changes nothing
+```
+
+| Rule | Enforced by |
+| ---- | ----------- |
+| `--only` is mandatory (no "deploy everything"; the order below matters) | `scripts/deploy-guard.mjs` `requireOnly` |
+| Production needs the project id typed out: `--confirm-production zesto-dev-2026` | `resolveDeployTarget` |
+| Staging uses the `staging` alias in `.firebaserc`; it is refused if missing, or equal to production; a staging deploy never accepts the production flag | `resolveDeployTarget` |
+| The Firebase project is passed as `--project <id>` explicitly | `scripts/deploy.mjs` `buildPlan` |
+| `check:env` must print OK before anything is built or deployed | `scripts/deploy.mjs` |
+| A staging bundle that mentions the production project id is never deployed | `filesMentioningProduction` |
+| **A bare `firebase deploy` (any project) is blocked by the CLI itself**: every deployable target in `firebase.json` (`firestore`, `functions`, `hosting`, `storage`) has `node scripts/deploy-guard.mjs --predeploy` as its FIRST `predeploy` hook, which aborts unless the wrapper approved exactly the project the CLI is about to use | `assertPredeployAllowed` |
+
+Verified against the real Firebase CLI (in a throwaway directory whose Hosting folder does not exist, so nothing could
+upload): a bare `firebase deploy --only hosting --project zesto-dev-2026` prints *"Direct `firebase deploy` is blocked…"*
+and exits non-zero; the same with approval for a different project, or approval for production without the production
+confirmation, is also refused; with the full approval the guard passes and the deploy proceeds to the next step. On
+Windows, the CLI's hook runner then prints a harmless `spawn … ENOENT` stack trace after a refused hook — the deploy is
+still aborted with `hosting predeploy error: Command terminated with non-zero exit code 1`.
+
+This is an **accident guard, not access control**: someone who exports `ZESTO_DEPLOY_APPROVED_PROJECT` by hand can still
+deploy. The real control is who holds IAM on the Firebase project. `.firebaserc` keeps its `default` and `production`
+aliases for read-only commands (`firebase functions:log`, …). `functions/package.json`'s old `deploy` script was removed.
+Other `firebase` commands that change a project (`firestore:delete`, `functions:secrets:set`, `hosting:disable`, …) are
+**not** covered by the hook: always add `--project` to them and read the project the CLI prints first.
 
 ## What production holds today (from project history — confirm in preflight)
 
@@ -34,15 +71,15 @@ modified, cancelled, refunded, reused or tested against — in any step below.
 | Step | Action | Depends on | Why this position |
 | ---- | ------ | ---------- | ----------------- |
 | 0 | Preflight | — | Never deploy blind |
-| 1 | `firebase deploy --only firestore:indexes` | 0 | Queries fail with `FAILED_PRECONDITION` until an index is **READY**; the refund trigger/reconciler and the webhook lookups use the new ones. Wait for every index to read READY before step 3. Additive; never needs `--force` |
-| 2 | `firebase deploy --only firestore:rules` | 0 | Independent of the Admin SDK paths, but cheap and must precede Hosting. Byte-identical to what 6A shipped unless `git diff` says otherwise |
+| 1 | `deploy:production --only firestore:indexes` | 0 | Queries fail with `FAILED_PRECONDITION` until an index is **READY**; the refund trigger/reconciler and the webhook lookups use the new ones. Wait for every index to read READY before step 3. Additive; never needs `--force` |
+| 2 | `deploy:production --only firestore:rules` | 0 | Independent of the Admin SDK paths, but cheap and must precede Hosting. Byte-identical to what 6A shipped unless `git diff` says otherwise |
 | 3a | `functions:onRefundCreated` | 1 (READY) | Create the consumer *before* any producer exists. Creates the Eventarc trigger |
 | 3b | `functions:reconcileRefunds`, `functions:reconcilePayments` | 1 (READY — incl. the `payments.reconciliation.nextAttemptAt` override), Cloud Scheduler API enabled | Creates the scheduler jobs. The payment sweep finds nothing until `api` (3d) starts scheduling payments, so deploying it earlier is harmless |
 | 3c | `functions:onNotificationEventCreated` | 1 | The updated processor must understand refund events **before** the API starts writing them; an old processor receiving an unknown event type would fail it permanently |
 | 3d | `functions:api` | 3a–3c | Last: this is what makes cancellation/refund-retry routes (the producers) and the refund webhook handlers live |
 | 4 | Verify Eventarc triggers | 3a, 3c | See checks below |
 | 5 | Verify Cloud Scheduler job | 3b | See checks below |
-| 6 | `firebase deploy --only hosting` | 3d healthy | The new frontend calls routes that exist only after 3d |
+| 6 | `deploy:production --only hosting` | 3d healthy | The new frontend calls routes that exist only after 3d |
 | 8 | Add `refund.created`, `refund.processed`, `refund.failed` to the Razorpay Test Mode webhook (Dashboard → Webhooks) | 3d | **Strictly after 3d.** Before it, the old `api` acknowledges unknown events with `200`, so Razorpay would stop redelivering and the events would be lost for good. The URL (`…/api/webhooks/razorpay`) and the signing secret do not change |
 | 9 | Smoke checks | all | See below |
 
@@ -52,8 +89,8 @@ Razorpay webhook, smoke checks); 7 is the go/no-go gate between Hosting and the 
 ### 0. Preflight (read-only)
 
 1. Work from a clean checkout of the exact commit to release; record `git rev-parse HEAD`. 7.7–7.9 and 4.5
-   are committed locally as `24eb4ff`; the 4.6 payment-reconciliation work is on top of it, uncommitted at the
-   time of writing. Nothing is pushed — **pushing needs its own instruction**.
+   are committed locally as `24eb4ff`; the 4.6 payment-reconciliation work is `b00b00a` on top of it, and the 4.7
+   deployment guard follows it. Nothing is pushed — **pushing needs its own instruction**.
 2. Run the gates: root `npm run lint`, `npm run typecheck`, `npm --prefix functions run typecheck`,
    `npx vitest run`, `npm run test:functions-emulator`, `npm run test:functions-trigger`,
    `npm run test:rules`, `npm run build`.
@@ -79,9 +116,9 @@ Razorpay webhook, smoke checks); 7 is the go/no-go gate between Hosting and the 
 ### 1–2. Indexes and rules
 
 ```bash
-firebase deploy --only firestore:indexes --project zesto-dev-2026
+npm run deploy:production -- --only firestore:indexes --confirm-production zesto-dev-2026
 # wait: every index READY (Console → Firestore → Indexes, or the Admin API)
-firebase deploy --only firestore:rules --project zesto-dev-2026
+npm run deploy:production -- --only firestore:rules --confirm-production zesto-dev-2026
 ```
 
 If the CLI offers to delete indexes that exist live but not in the file, answer **no** (and never pass
@@ -90,11 +127,11 @@ If the CLI offers to delete indexes that exist live but not in the file, answer 
 ### 3. Functions
 
 ```bash
-firebase deploy --only functions:onRefundCreated --project zesto-dev-2026
-firebase deploy --only functions:reconcileRefunds --project zesto-dev-2026
-firebase deploy --only functions:reconcilePayments --project zesto-dev-2026
-firebase deploy --only functions:onNotificationEventCreated --project zesto-dev-2026
-firebase deploy --only functions:api --project zesto-dev-2026
+npm run deploy:production -- --only functions:onRefundCreated --confirm-production zesto-dev-2026
+npm run deploy:production -- --only functions:reconcileRefunds --confirm-production zesto-dev-2026
+npm run deploy:production -- --only functions:reconcilePayments --confirm-production zesto-dev-2026
+npm run deploy:production -- --only functions:onNotificationEventCreated --confirm-production zesto-dev-2026
+npm run deploy:production -- --only functions:api --confirm-production zesto-dev-2026
 ```
 
 Known behaviour from checkpoint 6: the first Firestore-trigger create can fail once with an Eventarc
@@ -117,8 +154,8 @@ region `asia-south1`. After the first scheduled tick, their logs should show `Re
 ### 6. Hosting
 
 ```bash
-npm run build          # from the release commit, on the machine from step 0.3
-firebase deploy --only hosting --project zesto-dev-2026
+# the wrapper builds the frontend itself (production mode) before it deploys hosting
+npm run deploy:production -- --only hosting --confirm-production zesto-dev-2026
 ```
 
 Confirm `dist/` contains no `127.0.0.1` emulator host, then check the response headers on `/`.

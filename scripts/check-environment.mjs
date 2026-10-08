@@ -87,11 +87,12 @@ export function shorten(value) {
  * @param {Record<string, string> | null} input.backend The environment's backend variables.
  * @param {Record<string, string> | null} input.otherFrontend The OTHER environment's frontend variables, if readable.
  * @param {Record<string, string> | null} input.otherBackend The OTHER environment's backend variables, if readable.
+ * @param {Record<string, string> | null} [input.legacyFrontend] The shared `.env.local`, which Vite loads in EVERY mode.
  * @param {boolean} [input.allowLive] Whether Live Mode is explicitly permitted.
  * @return {{errors: string[], notes: string[], summary: Record<string, string>}} What was found.
  */
 export function checkEnvironment(input) {
-  const {env, frontend, backend, otherFrontend, otherBackend, allowLive = false} = input;
+  const {env, frontend, backend, otherFrontend, otherBackend, legacyFrontend = null, allowLive = false} = input;
   const errors = [];
   const notes = [];
   const expectedProject = env === 'production' ? PRODUCTION_PROJECT_ID : input.stagingProjectId;
@@ -150,6 +151,16 @@ export function checkEnvironment(input) {
     }
     if (frontend?.VITE_FIREBASE_PROJECT_ID === PRODUCTION_PROJECT_ID) {
       errors.push('The staging frontend points at the production Firebase project.');
+    }
+    // `vite build --mode staging` still loads `.env.local` (every mode does) and only OVERRIDES it with
+    // `.env.staging.local`. A variable staging forgot to define would silently take the legacy
+    // (production) value.
+    if (frontend !== null && legacyFrontend !== null) {
+      for (const name of Object.keys(legacyFrontend)) {
+        if (name.startsWith('VITE_') && !(name in frontend)) {
+          errors.push(`.env.staging.local does not define ${name}, so a staging build would inherit it from .env.local (the production file).`);
+        }
+      }
     }
   }
 
@@ -228,6 +239,7 @@ export function main(argv) {
     backend: backendFile(env === 'production' ? PRODUCTION_PROJECT_ID : stagingProjectId),
     otherFrontend: frontendFile(env === 'production' ? 'staging' : 'production'),
     otherBackend: backendFile(env === 'production' ? stagingProjectId : PRODUCTION_PROJECT_ID),
+    legacyFrontend: readEnvFile(resolve(root, '.env.local')),
     allowLive: argv.includes('--allow-live'),
   });
 

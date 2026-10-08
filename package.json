@@ -9,6 +9,8 @@
     "lint": "eslint .",
     "typecheck": "tsc -b --noEmit",
     "check:env": "node scripts/check-environment.mjs",
+    "deploy:staging": "node scripts/deploy.mjs staging",
+    "deploy:production": "node scripts/deploy.mjs production",
     "test": "vitest",
     "test:run": "vitest run",
     "test:rules": "firebase emulators:exec --project demo-zesto-rules --only firestore \"vitest run --config firestore/vitest.config.ts\"",

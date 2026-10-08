@@ -99,4 +99,16 @@ describe('staging', () => {
   ])('refuses staging that uses %s', (_name, over, pattern) => {
     expect(staging(over).errors.join()).toMatch(pattern);
   });
+
+  it('refuses a staging build that would inherit a variable from the shared .env.local (production) file', () => {
+    const legacyFrontend = { ...PROD_FRONT, VITE_FIREBASE_API_KEY: 'fake-production-api-key' };
+    const result = staging({ legacyFrontend });
+    expect(result.errors.join()).toMatch(/does not define VITE_FIREBASE_API_KEY/);
+    expect(result.errors.join()).not.toContain('fake-production-api-key');
+    expect(staging({ legacyFrontend, frontend: { ...STAGE_FRONT, VITE_FIREBASE_API_KEY: 'fake-staging-api-key' } }).errors).toEqual([]);
+  });
+
+  it('does not apply the inheritance rule when there is no shared .env.local', () => {
+    expect(staging({ legacyFrontend: null }).errors).toEqual([]);
+  });
 });

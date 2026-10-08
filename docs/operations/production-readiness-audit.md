@@ -186,12 +186,20 @@ there is no enforcing `Content-Security-Policy`). Built from what the shipped bu
 headers (the Firebase Hosting emulator does **not** apply custom headers at all — neither the existing security headers
 nor this one — so the served header can only be confirmed after a real deploy; runbook smoke check 4). Loading `/login`
 (no sign-in, nothing submitted) produced exactly one report: *"Evaluating a string as JavaScript violates … 'unsafe-eval'"*.
-The app's own bundle contains no `eval`/`new Function`; **`@descope/web-components-ui@3.20.4`, which the Descope SDK injects
-from `descopecdn.com`, contains one `new Function(`** — the likely source. Its allowed origin was loaded without any
-other violation. **Consequence:** enforcing this policy as written might degrade the Descope sign-in UI; whether it
-actually does cannot be known without a real sign-in. Do **not** add `'unsafe-eval'` pre-emptively (it weakens
-`script-src` for the whole app); test an enforced policy on staging first, and add it only if sign-in breaks and
-Descope offers no alternative. Razorpay Checkout has not been exercised, so its origins are unverified.
+4.6 attributed it to Descope's injected `@descope/web-components-ui`. **That attribution was wrong (corrected in 4.7).**
+
+**4.7 finding — the `unsafe-eval` report is Zod's own probe, in Zesto's bundle.** The report fires on *every* page, including
+`/privacy`, which has no Descope UI. The bundle contains a `try { Function(""); return true } catch { return false }` probe (minified): Zod 4's
+`allowsEval` check (`zod/v4/core/util.js`), which runs `new Function("")` at start-up and swallows the failure. Under an
+enforcing CSP the call would simply throw into that `catch` and Zod would use its non-JIT path, so enforcement would not have
+broken anything — but the browser still *reports* the attempt. Fix: `src/lib/zodConfig.ts` sets `z.config({jitless: true})`
+(Zod's documented switch, which skips the probe) and `main.tsx` imports it first, so it runs before any schema is built. After
+rebuilding, `/` and `/login` (the Descope sign-in flow rendered completely: phone field, Continue, Google) produced **zero**
+CSP reports. `'unsafe-eval'` was not added and is not needed for what was exercised.
+
+**Still unmeasured:** Razorpay Checkout (needs a real order and Checkout session, so a staging Razorpay account); Descope's
+other screens (OTP, Google redirect, passkeys); the header as actually served by Hosting; the Capacitor shells. Enforcement
+therefore stays off.
 
 **Not enforced, and not fully measured.** There is deliberately **no report endpoint**: it would be a new unauthenticated write
 surface. Violations show in the browser console as `[Report Only] Refused to …`. **Next step:** run the

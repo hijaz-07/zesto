@@ -8,6 +8,8 @@ import {
   providerOrderPayment,
   type FakePaymentLookupGateway,
 } from "../providers/paymentLookupGateway.fake";
+import {createRazorpayPaymentLookupGateway} from "../providers/razorpayPayments";
+import type {FetchLike} from "../providers/razorpayRefunds";
 import {NOTIFICATION_EVENTS_COLLECTION} from "./notificationEvents";
 import {
   RECONCILE_WINDOW_MS,
@@ -825,5 +827,103 @@ describe("accounting invariants across a mixed batch", () => {
     expect(result).toEqual({kind: "flagged", code: "inconsistent_documents"});
     expect(gateway.calls).toEqual([]);
     expect((await loadPaymentState(s)).payment.status).toBe("pending");
+  });
+});
+
+describe("the real Razorpay adapter feeding the driver (Razorpay-shaped JSON over a faked transport)", () => {
+  /** A Razorpay payment object as the API returns it, including fields the adapter must drop. */
+  const razorpayPayment = (s: PaymentScenario, over: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "pay_RealShape000001", entity: "payment", amount: s.amount, currency: "INR", status: "captured",
+    order_id: s.providerOrderId, method: "card", captured: true, amount_refunded: 0, refund_status: null,
+    email: "customer@example.com", contact: "+910000000000", created_at: 1790000000, card_id: "card_x", notes: [], ...over,
+  });
+
+  function adapterFor(items: Record<string, unknown>[]): {gateway: ReturnType<typeof createRazorpayPaymentLookupGateway>; urls: string[]; methods: string[]} {
+    const urls: string[] = [];
+    const methods: string[] = [];
+    const fetchFn: FetchLike = async (url, init) => {
+      urls.push(url);
+      methods.push(init.method);
+      return {status: 200, text: async () => JSON.stringify({entity: "collection", count: items.length, items})};
+    };
+    const gateway = createRazorpayPaymentLookupGateway({
+      getCredentials: () => ({keyId: "rzp_test_FakeKeyForTests", keySecret: "fake-secret-for-tests"}), fetchFn,
+    });
+    return {gateway, urls, methods};
+  }
+
+  it("a captured payment in Razorpay's own shape is adopted through one read-only GET", async () => {
+    const clock = clockAt();
+    const s = await seedUnresolvedPayment(db);
+    const {gateway, urls, methods} = adapterFor([razorpayPayment(s)]);
+
+    const result = await reconcilePayment(db, gateway, s.loc, {now: clock.now});
+
+    expect(result).toEqual({kind: "recovered", providerPaymentId: "pay_RealShape000001", lateCapture: false});
+    expect(methods).toEqual(["GET"]);
+    expect(urls).toEqual([`https://api.razorpay.com/v1/orders/${s.providerOrderId}/payments`]);
+    const state = await expectPaymentConsistency(s);
+    expect(state.order).toMatchObject({status: "confirmed", paymentStatus: "paid"});
+    // Nothing from the provider's raw object (contact, e-mail, card) reaches Zesto's documents.
+    const stored = JSON.stringify(state.payment);
+    for (const leaked of ["customer@example.com", "+910000000000", "card_x"]) {
+      expect(stored).not.toContain(leaked);
+    }
+  });
+
+  it("authorized or created in Razorpay's shape is never paid", async () => {
+    const clock = clockAt();
+    const authorized = await seedUnresolvedPayment(db);
+    const created = await seedUnresolvedPayment(db);
+
+    expect(await reconcilePayment(db, adapterFor([razorpayPayment(authorized, {status: "authorized", captured: false})]).gateway, authorized.loc, {now: clock.now}))
+      .toMatchObject({kind: "pending", state: "authorized"});
+    expect(await reconcilePayment(db, adapterFor([razorpayPayment(created, {status: "created", captured: false})]).gateway, created.loc, {now: clock.now}))
+      .toMatchObject({kind: "pending", state: "created"});
+
+    for (const s of [authorized, created]) {
+      const state = await expectPaymentConsistency(s);
+      expect(state.payment.status).toBe("pending");
+      expect(state.order).toMatchObject({status: "pending_payment", paymentStatus: "pending"});
+    }
+  });
+
+  it("evidence for a different provider order, or a different amount, is rejected", async () => {
+    const clock = clockAt();
+    const wrongOrder = await seedUnresolvedPayment(db);
+    const wrongAmount = await seedUnresolvedPayment(db);
+
+    const foreign = await reconcilePayment(
+      db, adapterFor([razorpayPayment(wrongOrder, {order_id: "order_SomebodyElse0001"})]).gateway, wrongOrder.loc, {now: clock.now},
+    );
+    const mismatched = await reconcilePayment(
+      db, adapterFor([razorpayPayment(wrongAmount, {amount: wrongAmount.amount - 100})]).gateway, wrongAmount.loc, {now: clock.now},
+    );
+
+    expect(foreign).toMatchObject({kind: "pending", state: "no_payments"});
+    expect(mismatched).toEqual({kind: "flagged", code: "captured_amount_mismatch"});
+    for (const s of [wrongOrder, wrongAmount]) {
+      const state = await expectPaymentConsistency(s);
+      expect(state.payment.status).toBe("pending");
+      expect(state.order).toMatchObject({status: "pending_payment", paymentStatus: "pending"});
+    }
+  });
+
+  it("a late capture on a cancelled order reserves exactly one refund, and a second run creates nothing more", async () => {
+    const clock = clockAt();
+    const s = await seedUnresolvedPayment(db, {orderStatus: "cancelled"});
+    const {gateway, urls} = adapterFor([razorpayPayment(s)]);
+
+    expect(await reconcilePayment(db, gateway, s.loc, {now: clock.now}))
+      .toEqual({kind: "recovered", providerPaymentId: "pay_RealShape000001", lateCapture: true});
+    const first = await expectPaymentConsistency(s);
+    expect(Object.keys(first.refunds)).toHaveLength(1);
+
+    expect(await reconcilePayment(db, gateway, s.loc, {now: clock.now})).toEqual({kind: "already_resolved"});
+    expect((await reconcileDuePayments(db, gateway, {now: clock.now})).examined).toBe(0);
+    const second = await expectPaymentConsistency(s);
+    expect(Object.keys(second.refunds)).toEqual(Object.keys(first.refunds));
+    expect(second.payment).toEqual(first.payment);
+    expect(urls).toHaveLength(1);
   });
 });

@@ -2,6 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/firebase/firebase-tools/master/schema/firebase-config.json",
 
   "firestore": {
+    "predeploy": ["node scripts/deploy-guard.mjs --predeploy"],
     "rules": "firestore.rules",
     "indexes": "firestore.indexes.json"
   },
@@ -9,11 +10,13 @@
   "functions": {
     "source": "functions",
     "predeploy": [
+      "node scripts/deploy-guard.mjs --predeploy",
       "npm --prefix \"$RESOURCE_DIR\" run build"
     ]
   },
 
   "hosting": {
+    "predeploy": ["node scripts/deploy-guard.mjs --predeploy"],
     "public": "dist",
     "ignore": [
       "firebase.json",
@@ -57,6 +60,7 @@
   },
 
   "storage": {
+    "predeploy": ["node scripts/deploy-guard.mjs --predeploy"],
     "rules": "storage.rules"
   },
 
