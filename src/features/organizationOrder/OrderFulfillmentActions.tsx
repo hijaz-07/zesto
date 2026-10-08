@@ -10,6 +10,11 @@ export interface OrderFulfillmentActionsProps {
   /** Why this order's last action failed, if it did. */
   error: string | null;
   onRun: (orderId: OrganizationOrderId, action: FulfillmentAction) => void;
+  /**
+   * Whether a row with nothing to offer shows a dash. A caller that puts other
+   * controls beside this one turns it off, so a lone dash never sits above them.
+   */
+  showEmptyPlaceholder?: boolean;
 }
 
 /**
@@ -22,7 +27,13 @@ export interface OrderFulfillmentActionsProps {
  * back. The button is only ever offered from what the backend last reported for
  * the row, and the backend re-checks everything when it is pressed.
  */
-export function OrderFulfillmentActions({ order, pending, error, onRun }: OrderFulfillmentActionsProps) {
+export function OrderFulfillmentActions({
+  order,
+  pending,
+  error,
+  onRun,
+  showEmptyPlaceholder = true,
+}: OrderFulfillmentActionsProps) {
   const [confirming, setConfirming] = useState(false);
   const spec = nextFulfillmentAction(order);
 
@@ -33,15 +44,18 @@ export function OrderFulfillmentActions({ order, pending, error, onRun }: OrderF
   );
 
   if (!spec) {
+    if (!showEmptyPlaceholder && !isAwaitingPickup(order) && !errorMessage) {
+      return null;
+    }
     return (
       <div className="flex flex-col gap-1">
         {isAwaitingPickup(order) ? (
           <span className="text-sm text-muted">Awaiting pickup</span>
-        ) : (
+        ) : showEmptyPlaceholder ? (
           <span className="text-muted" aria-hidden="true">
             —
           </span>
-        )}
+        ) : null}
         {errorMessage}
       </div>
     );

@@ -15,8 +15,10 @@ import {
   type OrderSummaryItem,
 } from "./orderHistory";
 import type {Menu} from "./menus";
+import type {OrderCancelledByRole} from "./cancellation";
 import type {Order, OrderCurrency, OrderPaymentStatus, OrderStatus} from "./orders";
 import {getOutlet, type Outlet} from "./outlets";
+import type {PaymentRefundState} from "./refundAmounts";
 
 /**
  * `GET /organizations/{organizationId}/orders` — the read-only order list for
@@ -100,6 +102,33 @@ export interface OrganizationOrderSummaryResponse {
   moreItemLines: number;
   createdAt: string;
   updatedAt: string;
+  /** Present on a cancelled order whose cancellation was recorded; see `OrganizationOrderCancellationInfo`. */
+  cancellation?: OrganizationOrderCancellationInfo;
+  /** Present on an order that has had refund activity; see `OrganizationOrderRefundInfo`. */
+  refund?: OrganizationOrderRefundInfo;
+}
+
+/**
+ * What an operator may see of a cancellation: who it came from (the customer or
+ * the organization — a role, never an identity) and when. Not the reason, the
+ * actor's ID, or the status it was cancelled from: those stay audit-only.
+ */
+export interface OrganizationOrderCancellationInfo {
+  cancelledBy: OrderCancelledByRole;
+  cancelledAt: string;
+}
+
+/**
+ * The order's refund as the order document itself mirrors it
+ * (`Order.refundStatus` / `refundedInPaise`, see `domain/orders.ts`): the
+ * payment-level state and the amount already refunded. A display summary only —
+ * no refund, payment or provider identifier, no amount in flight — read from
+ * the order document the list already has, so it costs no extra read. Absent
+ * when the order has had no refund activity.
+ */
+export interface OrganizationOrderRefundInfo {
+  state: Exclude<PaymentRefundState, "none">;
+  refundedInPaise: number;
 }
 
 export interface OrganizationOrdersPageResponse {
@@ -138,7 +167,34 @@ export function toOrganizationOrderSummary(
     moreItemLines: Math.max(0, order.items.length - ORGANIZATION_ORDER_MAX_ITEM_LINES),
     createdAt: order.createdAt.toDate().toISOString(),
     updatedAt: order.updatedAt.toDate().toISOString(),
+    ...cancellationInfoOf(order),
+    ...refundInfoOf(order),
   };
+}
+
+/**
+ * @param {Order} order A stored order.
+ * @return {{cancellation: OrganizationOrderCancellationInfo} | {}} The
+ *   cancellation block for a cancelled order whose audit was recorded; nothing
+ *   for any other order (including one cancelled before the audit existed).
+ */
+function cancellationInfoOf(order: Order): {cancellation?: OrganizationOrderCancellationInfo} {
+  if (order.status !== "cancelled" || order.cancelledAt === undefined || order.cancelledByRole === undefined) {
+    return {};
+  }
+  return {cancellation: {cancelledBy: order.cancelledByRole, cancelledAt: order.cancelledAt.toDate().toISOString()}};
+}
+
+/**
+ * @param {Order} order A stored order.
+ * @return {{refund: OrganizationOrderRefundInfo} | {}} The refund block for an
+ *   order that has had refund activity; nothing otherwise.
+ */
+function refundInfoOf(order: Order): {refund?: OrganizationOrderRefundInfo} {
+  if (order.refundStatus === undefined || order.refundStatus === "none" || order.refundedInPaise === undefined) {
+    return {};
+  }
+  return {refund: {state: order.refundStatus, refundedInPaise: order.refundedInPaise}};
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   transitionOrderStatus,
   type FulfillmentTarget,
 } from "../domain/orderFulfillment";
+import {REFUND_RETRY_ROLES, retryOrderRefund} from "../domain/orderRefundRetry";
 import {
   ORDER_PICKUP_ROLES,
   redeemPickup,
@@ -109,6 +110,11 @@ export function createOrganizationOrderRoutes(
       method: "POST",
       path: "/organizations/:organizationId/orders/:orderId/cancel",
       handler: (ctx) => handleCancelOrder(ctx, deps),
+    },
+    {
+      method: "POST",
+      path: "/organizations/:organizationId/orders/:orderId/retry-refund",
+      handler: (ctx) => handleRetryRefund(ctx, deps),
     },
     {
       method: "POST",
@@ -416,6 +422,55 @@ async function handleCancelOrder(
       ...mapKnownError(error),
       userId: session.userId,
       logContext: {to: "cancelled", outcome: "rejected"},
+    };
+  }
+}
+
+/**
+ * `POST /organizations/{organizationId}/orders/{orderId}/retry-refund`: an owner or
+ * manager starts a new refund attempt for a cancelled order whose latest refund
+ * FAILED. There is no body — nothing the caller sends is read — and the amount is
+ * always whatever is still refundable on the payment, decided by
+ * `createRefundRetry` (see `retryOrderRefund`).
+ *
+ * Authentication, then authorization (staff are refused), then the order, which
+ * must belong to the caller's organization (another's is a plain `404`). A latest
+ * refund that has not failed — including one a racing request just retried — is a
+ * `409`, never a second refund.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {OrganizationOrdersRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} `200` with `{order, refund}`: the order's row in the
+ *   list shape and the new refund in the safe cancellation-refund shape (no
+ *   provider, payment or audit identifier).
+ */
+async function handleRetryRefund(
+  ctx: RouteContext,
+  deps: OrganizationOrdersRouteDeps,
+): Promise<ApiResult> {
+  let caller: AuthorizedCaller;
+  try {
+    caller = await authenticateAndAuthorize(ctx, deps, REFUND_RETRY_ROLES);
+  } catch (error) {
+    return mapKnownError(error);
+  }
+  const {session, membership} = caller;
+
+  try {
+    const result = await retryOrderRefund(deps.db, {membership, orderId: ctx.params?.orderId});
+    const order = await loadOrganizationOrderSummary(deps.db, result.order);
+    return {
+      kind: "success",
+      status: 200,
+      data: {order, ...(result.refund !== null ? {refund: result.refund} : {})},
+      userId: session.userId,
+      logContext: {outcome: "refund_retried"},
+    };
+  } catch (error) {
+    return {
+      ...mapKnownError(error),
+      userId: session.userId,
+      logContext: {outcome: "rejected"},
     };
   }
 }

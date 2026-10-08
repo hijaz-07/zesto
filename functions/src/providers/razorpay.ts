@@ -313,6 +313,42 @@ function safeErrorFields(error: unknown): {code?: string; description?: string; 
 }
 
 /**
+ * How long an order create/fetch may take before it is given up on. The `razorpay` SDK
+ * sets no request timeout of its own (see `razorpayRefunds.ts`'s file header), so
+ * without this a hung connection would hold a customer's request until the function's
+ * own 60 s timeout. Giving up is safe here: an order is created once per payment and a
+ * retry simply creates a fresh, unpaid provider order (`ensureProviderOrder`).
+ */
+export const ORDER_REQUEST_TIMEOUT_MS = 15_000;
+
+/**
+ * @param {Promise<T>} promise A provider call.
+ * @param {number} timeoutMs How long to wait for it.
+ * @return {Promise<T>} The call's result, or a rejection if it takes longer than
+ *   `timeoutMs`. The abandoned call is not cancelled (the SDK offers no way to).
+ */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error("Razorpay request timed out.")), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * @param {string} keyId A Razorpay `key_id`.
+ * @return {"test" | "live" | "unknown"} The mode its public prefix names (`rzp_test_` /
+ *   `rzp_live_`). Razorpay keys are mode-scoped, so this is the one reliable signal of
+ *   which environment the deployed credentials belong to.
+ */
+export function razorpayModeOf(keyId: string): "test" | "live" | "unknown" {
+  if (keyId.startsWith("rzp_test_")) {
+    return "test";
+  }
+  return keyId.startsWith("rzp_live_") ? "live" : "unknown";
+}
+
+/**
  * Wraps an already-constructed Razorpay-SDK-shaped client into the
  * `PaymentProviderGateway` abstraction. A pure factory — no config reading,
  * no memoization — so tests can pass a fake client directly (see this
@@ -322,15 +358,18 @@ function safeErrorFields(error: unknown): {code?: string; description?: string; 
  *   double structurally matching it).
  * @return {PaymentProviderGateway} The gateway.
  */
-export function createRazorpayGateway(client: RazorpayClientLike): PaymentProviderGateway {
+export function createRazorpayGateway(
+  client: RazorpayClientLike,
+  timeoutMs: number = ORDER_REQUEST_TIMEOUT_MS,
+): PaymentProviderGateway {
   return {
     async createOrder(input) {
       try {
-        const order = await client.orders.create({
+        const order = await withTimeout(client.orders.create({
           amount: input.amountInPaise,
           currency: input.currency,
           receipt: input.receipt,
-        });
+        }), timeoutMs);
         return toProviderOrder(order);
       } catch (error) {
         logger.error("razorpay order creation failed", safeErrorFields(error));
@@ -339,7 +378,7 @@ export function createRazorpayGateway(client: RazorpayClientLike): PaymentProvid
     },
     async fetchOrder(providerOrderId) {
       try {
-        const order = await client.orders.fetch(providerOrderId);
+        const order = await withTimeout(client.orders.fetch(providerOrderId), timeoutMs);
         return toProviderOrder(order);
       } catch (error) {
         logger.error("razorpay order fetch failed", safeErrorFields(error));
@@ -360,10 +399,14 @@ let razorpayClient: RazorpayClientLike | undefined;
  */
 function getRazorpayClient(): RazorpayClientLike {
   if (!razorpayClient) {
+    const keyId = getRazorpayKeyId();
     razorpayClient = new RazorpaySdk({
-      key_id: getRazorpayKeyId(),
+      key_id: keyId,
       key_secret: getRazorpayKeySecret(),
     });
+    // The mode only (a public prefix), never a key: lets an operator confirm from the logs
+    // which Razorpay environment a deployment is talking to.
+    logger.info("razorpay client initialised", {mode: razorpayModeOf(keyId)});
   }
   return razorpayClient;
 }

@@ -13,12 +13,12 @@ export function RefundCancellationPage() {
           <>
             <p>
               Zesto customers pre-order food from outlets for an upcoming menu, with a defined ordering
-              deadline and pickup window. This page explains what happens when an order is not completed,
-              cancelled, or paid for incorrectly.
+              deadline and pickup window. This page explains what happens when an order is cancelled, is not
+              completed, or is paid for incorrectly.
             </p>
             <p>
-              Online payments are being integrated into the Zesto ordering experience and are not yet enabled
-              for live orders. This policy describes how cancellations and refunds are handled.
+              You can cancel an eligible order yourself from its order page. When a paid order is cancelled,
+              the full amount you paid is refunded to your original payment method.
             </p>
           </>
         }
@@ -26,30 +26,48 @@ export function RefundCancellationPage() {
         <LegalSection heading="Before payment is completed">
           <p>
             When you place an order it is created as awaiting payment. It is not confirmed, and the outlet is
-            not asked to prepare it, until payment has been successfully completed. If you leave without
-            paying, or payment does not go through, you have not been charged for a confirmed order and no
-            cancellation is needed.
+            not asked to prepare it, until payment has been successfully completed. While it is awaiting
+            payment you can cancel it from its order page; nothing has been charged for it. If you simply
+            leave without paying, or payment does not go through, no cancellation is needed.
           </p>
         </LegalSection>
 
-        <LegalSection heading="Cancelling after payment">
+        <LegalSection heading="Cancelling an order yourself">
           <p>
-            A paid order can be cancelled only under specific conditions:
+            You can cancel an order from its order page in Zesto:
           </p>
           <LegalList
             items={[
-              'Cancellation requests may be made before the applicable ordering deadline.',
-              'Once ordering has closed or food preparation has begun, cancellation may not be available.',
-              'Self-service cancellation is not yet available in Zesto. Cancellation requests are currently handled through support: email us with your order ID.',
+              'While it is awaiting payment.',
+              'After payment, while the order is confirmed and before the ordering deadline of its menu.',
+              'Once ordering has closed, or the outlet has started preparing your order, you can no longer cancel it yourself.',
+              'You may tell us why you are cancelling, but you do not have to.',
+              'Cancelling is final. A cancelled order cannot be reinstated; if you still want the food, place a new order while ordering is open.',
             ]}
           />
+          <p>
+            If you need to cancel an order that is no longer eligible, contact the outlet or our support team
+            with your order ID.
+          </p>
         </LegalSection>
 
         <LegalSection heading="If an outlet cancels or cannot fulfil your order">
           <p>
-            If an outlet cancels your paid order or is unable to fulfil it, you will receive a full refund of
-            the affected paid order or items.
+            An outlet can cancel your order if, for example, an item is unavailable, the outlet is closed, or
+            it cannot fulfil the order in time. It can do so until the order has been picked up. If the
+            outlet cancels a paid order you will receive a full refund of the amount you paid, and you will be
+            notified of the cancellation and the refund.
           </p>
+        </LegalSection>
+
+        <LegalSection heading="How much is refunded">
+          <LegalList
+            items={[
+              'A cancelled paid order is refunded in full: the whole amount you paid, with no cancellation fee and no deduction for payment-provider charges.',
+              'A payment that failed is not refunded, because the order was never confirmed.',
+              'If your payment reaches us only after the order was cancelled, it is refunded in full automatically.',
+            ]}
+          />
         </LegalSection>
 
         <LegalSection heading="Payment failures">
@@ -72,8 +90,9 @@ export function RefundCancellationPage() {
         <LegalSection heading="How refunds are paid, and how long they take">
           <LegalList
             items={[
-              'Approved refunds are intended to go back to the original payment method.',
-              'Approved refunds will be initiated within 5 business days.',
+              'Refunds go back to the original payment method.',
+              'When a paid order is cancelled, the refund is started automatically; you do not need to ask for it. Its progress is shown on the order page.',
+              'A refund that needs to be handled manually will be initiated within 5 business days.',
               'After a refund is initiated, the actual time for the amount to be credited depends on the payment provider or your bank.',
             ]}
           />

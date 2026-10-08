@@ -1,7 +1,73 @@
 import type { OrganizationId, OutletId } from '../../domain/types';
 import { ApiError, apiFetch } from '../../lib/api/client';
+import { ORGANIZATION_CANCELLATION_REASONS, type OrganizationCancellationReason } from './cancellation';
 import type { FulfillmentAction } from './fulfillment';
-import type { OrganizationOrdersPage, OrganizationOrderSummary } from './types';
+import {
+  ORGANIZATION_REFUND_STATES,
+  type OrganizationOrderCancellation,
+  type OrganizationOrderRefund,
+  type OrganizationOrdersPage,
+  type OrganizationOrderSummary,
+} from './types';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+/** The cancellation block, only if it is exactly the approved shape; otherwise none. Only the two approved fields are copied. */
+function readCancellation(raw: unknown): OrganizationOrderCancellation | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const { cancelledBy, cancelledAt } = raw;
+  if (
+    (cancelledBy !== 'customer' && cancelledBy !== 'organization') ||
+    typeof cancelledAt !== 'string' ||
+    Number.isNaN(Date.parse(cancelledAt))
+  ) {
+    return undefined;
+  }
+  return { cancelledBy, cancelledAt };
+}
+
+/**
+ * The refund block, only if it is a well-formed one; anything else is treated as
+ * no refund information (so the row says the status is unavailable rather than a
+ * wrong one). Only the two approved fields are copied, so nothing else a server
+ * might one day add — a provider or refund identifier, say — is carried along.
+ */
+function readRefund(raw: unknown): OrganizationOrderRefund | undefined {
+  if (!isRecord(raw)) {
+    return undefined;
+  }
+  const { state, refundedInPaise } = raw;
+  if (
+    typeof state !== 'string' ||
+    !(ORGANIZATION_REFUND_STATES as readonly string[]).includes(state) ||
+    typeof refundedInPaise !== 'number' ||
+    !Number.isInteger(refundedInPaise) ||
+    refundedInPaise < 0
+  ) {
+    return undefined;
+  }
+  return { state: state as OrganizationOrderRefund['state'], refundedInPaise };
+}
+
+/**
+ * One row of an organization order response, with its cancellation and refund
+ * blocks re-read through the validators above: a malformed block is dropped,
+ * never repaired or guessed, and no unapproved field survives inside either.
+ */
+function readOrder(row: OrganizationOrderSummary): OrganizationOrderSummary {
+  if (!isRecord(row) || (!('cancellation' in row) && !('refund' in row))) {
+    // Nothing to re-read: the row is handed on as it came.
+    return row;
+  }
+  const { cancellation: rawCancellation, refund: rawRefund, ...rest } = row;
+  const cancellation = readCancellation(rawCancellation);
+  const refund = readRefund(rawRefund);
+  return { ...rest, ...(cancellation ? { cancellation } : {}), ...(refund ? { refund } : {}) };
+}
 
 export interface ListOrganizationOrdersParams {
   /** Narrows the list to one outlet. A requested filter only: the backend verifies it belongs to the organization. */
@@ -35,7 +101,13 @@ export function listOrganizationOrders(
   }
   const queryString = query.toString();
   const path = `/organizations/${organizationId}/orders`;
-  return apiFetch<OrganizationOrdersPage>(queryString ? `${path}?${queryString}` : path);
+  return apiFetch<OrganizationOrdersPage>(queryString ? `${path}?${queryString}` : path).then((page) => {
+    if (!Array.isArray(page?.orders)) {
+      return page;
+    }
+    const orders = page.orders.map(readOrder);
+    return orders.every((order, index) => order === page.orders[index]) ? page : { ...page, orders };
+  });
 }
 
 export interface RedeemPickupInput {
@@ -79,7 +151,7 @@ export async function redeemPickup(
   if (!data?.order || typeof data.order.id !== 'string' || data.order.status !== 'picked_up') {
     throw new ApiError(200, 'invalid_response', 'The server returned a response in an unexpected shape.');
   }
-  return data.order;
+  return readOrder(data.order);
 }
 
 /**
@@ -106,5 +178,68 @@ export async function runFulfillmentAction(
   if (!data?.order || data.order.id !== orderId) {
     throw new ApiError(200, 'invalid_response', 'The server returned a response in an unexpected shape.');
   }
-  return data.order;
+  return readOrder(data.order);
+}
+
+/**
+ * Cancels one of the organization's orders
+ * (`POST /organizations/{organizationId}/orders/{orderId}/cancel`). The body is
+ * only ever `{ reason }`, one of the approved reasons: whether the order may be
+ * cancelled, who may cancel it, whether and how much to refund are decided by the
+ * backend from its own records, so no amount, status, role, user or provider
+ * detail is sent. Safe to repeat (a second call on an already-cancelled order
+ * answers the same way), but callers send one request per operator decision.
+ *
+ * Resolves with the order's row as it stands afterwards (the same shape the list
+ * returns, now with its cancellation and refund blocks) — but only if that row is
+ * this order and really says `cancelled`: anything else is an unexpected
+ * response, so a stale or confused answer is never shown as a cancellation. A
+ * refusal rejects with the `ApiError`: 400 (reason), 403 (no access, or staff),
+ * 404 (no such order here), 409 (the order can no longer be cancelled), 503.
+ */
+export async function cancelOrganizationOrder(
+  organizationId: OrganizationId,
+  orderId: string,
+  reason: OrganizationCancellationReason,
+): Promise<OrganizationOrderSummary> {
+  if (!(ORGANIZATION_CANCELLATION_REASONS as readonly string[]).includes(reason)) {
+    throw new ApiError(400, 'invalid_argument', 'Choose a reason for cancelling this order.');
+  }
+  const data = await apiFetch<{ order?: OrganizationOrderSummary } | undefined>(
+    `/organizations/${encodeURIComponent(organizationId)}/orders/${encodeURIComponent(orderId)}/cancel`,
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reason }) },
+  );
+  if (!data?.order || data.order.id !== orderId || data.order.status !== 'cancelled') {
+    throw new ApiError(200, 'invalid_response', 'The server returned a response in an unexpected shape.');
+  }
+  return readOrder(data.order);
+}
+
+/**
+ * Asks the backend to start a new refund attempt for a cancelled order whose latest
+ * refund failed
+ * (`POST /organizations/{organizationId}/orders/{orderId}/retry-refund`). Sends NO
+ * body: which refund, how much and whether it may be retried are decided by the
+ * backend from its own records, so no amount, refund, payment or provider detail
+ * is ever sent. Not meant to be repeated blindly — a repeat while the new refund
+ * is still in progress is answered 409.
+ *
+ * Resolves with the order's row as it stands afterwards (the same shape the list
+ * returns, now showing the refund as in progress) — but only if that row is this
+ * order and still says `cancelled`. A refusal rejects with the `ApiError`: 403
+ * (no access, or staff), 404 (no such order here), 409 (there is no failed refund
+ * to retry), 503.
+ */
+export async function retryOrganizationRefund(
+  organizationId: OrganizationId,
+  orderId: string,
+): Promise<OrganizationOrderSummary> {
+  const data = await apiFetch<{ order?: OrganizationOrderSummary } | undefined>(
+    `/organizations/${encodeURIComponent(organizationId)}/orders/${encodeURIComponent(orderId)}/retry-refund`,
+    { method: 'POST' },
+  );
+  if (!data?.order || data.order.id !== orderId || data.order.status !== 'cancelled') {
+    throw new ApiError(200, 'invalid_response', 'The server returned a response in an unexpected shape.');
+  }
+  return readOrder(data.order);
 }

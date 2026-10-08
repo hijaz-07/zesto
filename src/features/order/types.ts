@@ -75,6 +75,54 @@ export interface OrderItemSnapshot {
   lineTotalInPaise: number;
 }
 
+/**
+ * Why a customer cancels, exactly the backend's `CUSTOMER_CANCELLATION_REASONS`
+ * (functions/src/domain/cancellation.ts). Optional on a cancellation; no free text.
+ */
+export const CUSTOMER_CANCELLATION_REASONS = [
+  'changed_my_mind',
+  'ordered_by_mistake',
+  'wrong_items_or_quantity',
+  'wrong_pickup_time',
+  'other',
+] as const;
+
+export type CustomerCancellationReason = (typeof CUSTOMER_CANCELLATION_REASONS)[number];
+
+/**
+ * The server's own answer to "can this customer cancel this order right now?"
+ * (`GET /orders/{orderId}`, `POST /orders/{orderId}/cancel`). `canCancel` is a
+ * hint for the screen only: the cancel route decides again and may still refuse.
+ */
+export interface OrderCancellation {
+  state: 'cancellable' | 'not_cancellable' | 'cancelled';
+  canCancel: boolean;
+}
+
+/** A refund's own status, exactly the backend's `REFUND_STATUS_VALUES`. */
+export const REFUND_STATUSES = ['requested', 'pending', 'processed', 'failed'] as const;
+
+export type RefundStatus = (typeof REFUND_STATUSES)[number];
+
+/** Whether a refund has settled one way or the other; nothing more will change on it. */
+export function isTerminalRefundStatus(status: RefundStatus): boolean {
+  return status === 'processed' || status === 'failed';
+}
+
+/**
+ * The safe refund summary the backend gives the customer: how much, in what
+ * state, and when it started and finished — never a provider, payment or refund
+ * identifier (functions/src/domain/orderCancellation.ts's `CancellationRefundSummary`).
+ */
+export interface OrderRefund {
+  status: RefundStatus;
+  amountInPaise: number;
+  currency: OrderCurrency;
+  initiatedAt: ISODateString;
+  /** Present only once the refund is `processed`. */
+  completedAt?: ISODateString;
+}
+
 export interface Order {
   id: OrderId;
   organizationId: string;
@@ -88,6 +136,14 @@ export interface Order {
   items: OrderItemSnapshot[];
   createdAt: ISODateString;
   updatedAt: ISODateString;
+  /**
+   * The server's cancellation hint. Absent where the order did not come from a
+   * read that carries it (e.g. the payment-verification response), in which case
+   * the screen offers no cancel action until it has re-read the order.
+   */
+  cancellation?: OrderCancellation;
+  /** The order's refund, if it has one. Absent for an order that has none. */
+  refund?: OrderRefund;
 }
 
 /** One line of an order as summarized in the history list: name and quantity only. */

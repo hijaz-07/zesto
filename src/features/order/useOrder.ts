@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getOrder } from './api';
 import type { Order, OrderId } from './types';
 
@@ -13,6 +13,12 @@ export interface UseOrderResult {
   order: Order | null;
   error: unknown;
   retry: () => void;
+  /**
+   * Re-reads the order WITHOUT showing the loading state, and without replacing
+   * what is on screen if the read fails: for after something changed it (a
+   * payment verified, a cancellation refused).
+   */
+  refresh: () => void;
 }
 
 /**
@@ -28,6 +34,8 @@ export interface UseOrderResult {
 export function useOrder(orderId: OrderId | undefined): UseOrderResult {
   const [state, setState] = useState<OrderState>(orderId ? { status: 'loading' } : { status: 'idle' });
   const [reloadToken, setReloadToken] = useState(0);
+  // Whether the read now in flight is a quiet refresh (a failure of which must not blank the page).
+  const quiet = useRef(false);
 
   useEffect(() => {
     if (!orderId) {
@@ -44,7 +52,7 @@ export function useOrder(orderId: OrderId | undefined): UseOrderResult {
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setState({ status: 'error', error });
+          setState((current) => (quiet.current && current.status === 'ready' ? current : { status: 'error', error }));
         }
       });
 
@@ -59,7 +67,16 @@ export function useOrder(orderId: OrderId | undefined): UseOrderResult {
     if (!orderId) {
       return;
     }
+    quiet.current = false;
     setState({ status: 'loading' });
+    setReloadToken((token) => token + 1);
+  }, [orderId]);
+
+  const refresh = useCallback(() => {
+    if (!orderId) {
+      return;
+    }
+    quiet.current = true;
     setReloadToken((token) => token + 1);
   }, [orderId]);
 
@@ -68,5 +85,6 @@ export function useOrder(orderId: OrderId | undefined): UseOrderResult {
     order: derivedState.status === 'ready' ? derivedState.order : null,
     error: derivedState.status === 'error' ? derivedState.error : null,
     retry,
+    refresh,
   };
 }

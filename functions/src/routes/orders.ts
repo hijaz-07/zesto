@@ -9,7 +9,12 @@ import {
   getOwnedOrder,
   toOrderResponse,
 } from "../domain/orders";
-import {cancelOrder, cancelOrderBodySchema, toCancellationResponse} from "../domain/orderCancellation";
+import {
+  cancelOrder,
+  cancelOrderBodySchema,
+  readOrderCancellationView,
+  toCancellationResponse,
+} from "../domain/orderCancellation";
 import {getPickupCredentialForCustomer} from "../domain/orderPickup";
 import {
   ensureProviderOrder,
@@ -196,7 +201,9 @@ async function handleListOrders(
  * the order's stored `userId` versus the verified session's `userId` — an
  * organization's own staff/manager/owner has no special access through this
  * endpoint, and an order belonging to a different customer is
- * indistinguishable from a nonexistent one.
+ * indistinguishable from a nonexistent one. Beside the order it returns the
+ * server's own `cancellation` hint (whether Cancel is on offer) and, if the
+ * order has one, the safe `refund` summary (`readOrderCancellationView`).
  *
  * @param {RouteContext} ctx The route context.
  * @param {OrdersRouteDeps} deps The route's dependencies.
@@ -218,10 +225,12 @@ async function handleGetOrder(
 
   try {
     const order = await getOwnedOrder(deps.db, session.userId, ctx.params?.orderId);
+    // Ownership is established above; the view is the server's own hint, never client input.
+    const view = await readOrderCancellationView(deps.db, order);
     return {
       kind: "success",
       status: 200,
-      data: {order: toOrderResponse(order)},
+      data: {order: toOrderResponse(order), ...view},
       userId: session.userId,
     };
   } catch (error) {

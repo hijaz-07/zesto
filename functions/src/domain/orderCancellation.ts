@@ -128,6 +128,24 @@ export function toCancellationResponse(result: CancelOrderResult): CancellationR
   };
 }
 
+/**
+ * Where an order stands as to cancelling, for the customer who owns it:
+ * `cancellable` (they may cancel it right now), `not_cancellable` (past it, for
+ * whatever reason) or `cancelled`. `canCancel` is exactly `state === "cancellable"`,
+ * spelled out so a client never has to infer it.
+ */
+export interface OrderCancellationState {
+  state: "cancellable" | "not_cancellable" | "cancelled";
+  canCancel: boolean;
+}
+
+/** What `GET /orders/{orderId}` adds to the order it returns. */
+export interface OrderCancellationView {
+  cancellation: OrderCancellationState;
+  /** Absent when the order has no refund (nothing was captured, or nothing yet refunded). */
+  refund?: CancellationRefundSummary;
+}
+
 export interface CancelOrderInput {
   /** Who is asking, as the SERVER verified it (a session user, or a membership). */
   actor: CancellationActor;
@@ -378,4 +396,62 @@ export async function cancelOrder(db: Firestore, input: CancelOrderInput): Promi
     }
     throw error;
   }
+}
+
+/**
+ * The cancellation hint and refund summary for an order its customer is reading
+ * (`GET /orders/{orderId}`): the SAME policy as `cancelOrder` — `decideCancellation`
+ * — evaluated on the same facts (the order, its payment, and for a `confirmed`
+ * order its menu's `orderingClosesAt`), but read-only and answering "could they
+ * cancel it now?" rather than doing it. The caller has already established that
+ * the customer owns `order`; nothing here is read from the request.
+ *
+ * It is a hint for the screen, never the authority: `cancelOrder` re-decides
+ * inside its own transaction, so an order that stops being cancellable between
+ * this read and the customer's tap is still refused there (`409`).
+ *
+ * One read-only transaction, so the payment, the refund and the deadline are a
+ * single consistent snapshot. A payment document that is missing or unreadable
+ * simply makes the order `not_cancellable` (the policy's own payment-consistency
+ * rule) and leaves the refund out; it never fails the read.
+ *
+ * @param {Firestore} db Admin Firestore instance.
+ * @param {Order} order The order, already known to belong to the caller.
+ * @param {Date} now The clock; injectable for tests.
+ * @return {Promise<OrderCancellationView>} The cancellation state and, if the order has one, its refund summary.
+ */
+export async function readOrderCancellationView(
+  db: Firestore,
+  order: Order,
+  now: Date = new Date(),
+): Promise<OrderCancellationView> {
+  return db.runTransaction(async (tx): Promise<OrderCancellationView> => {
+    const paymentRef = db
+      .collection("organizations").doc(order.organizationId)
+      .collection("outlets").doc(order.outletId)
+      .collection("menus").doc(order.menuId)
+      .collection("orders").doc(order.id)
+      .collection("payments").doc(order.id);
+    const paymentRead = await readPayment(tx, paymentRef, order);
+    const orderingClosesAt = order.status === "confirmed" ?
+      await readOrderingDeadline(db, tx, order) :
+      new Date(NaN);
+    const latestRefund = await readLatestRefund(tx, paymentRef, paymentRead, order);
+
+    const decision = decideCancellation({
+      actor: {kind: "customer", userId: order.userId},
+      order,
+      paymentStatus: paymentRead.kind === "ok" ? paymentRead.payment.status : "absent",
+      orderingClosesAt,
+      now,
+    });
+    const state: OrderCancellationState["state"] =
+      decision.outcome === "cancel" ? "cancellable" :
+        decision.outcome === "already_cancelled" ? "cancelled" : "not_cancellable";
+    const refund = toRefundSummary(latestRefund);
+    return {
+      cancellation: {state, canCancel: state === "cancellable"},
+      ...(refund !== null ? {refund} : {}),
+    };
+  }, {readOnly: true});
 }

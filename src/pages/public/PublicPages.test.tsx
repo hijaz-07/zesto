@@ -71,11 +71,27 @@ describe('public policy and contact pages', () => {
     expect(screen.getByRole('heading', { name: 'Before payment is completed' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Payment failures' })).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Duplicate or incorrect payments' })).toBeInTheDocument();
-    expect(screen.getByText(/Self-service cancellation is not yet available/)).toBeInTheDocument();
-    expect(screen.getByText(/before the applicable ordering deadline/)).toBeInTheDocument();
-    expect(screen.getByText(/full refund of the affected paid order or items/)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Cancelling an order yourself' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'How much is refunded' })).toBeInTheDocument();
+    expect(screen.getByText(/^While it is awaiting payment\.$/)).toBeInTheDocument();
+    expect(screen.getByText(/while the order is confirmed and before the ordering deadline of its menu/)).toBeInTheDocument();
+    expect(screen.getByText(/started preparing your order, you can no longer cancel it yourself/)).toBeInTheDocument();
+    expect(screen.getByText(/Cancelling is final/)).toBeInTheDocument();
+    expect(screen.getByText(/but you do not have to/)).toBeInTheDocument();
+    expect(screen.getByText(/refunded in full: the whole amount you paid, with no cancellation fee/)).toBeInTheDocument();
+    expect(screen.getByText(/A payment that failed is not refunded/)).toBeInTheDocument();
+    expect(screen.getByText(/refunded in full automatically/)).toBeInTheDocument();
+    expect(screen.getByText(/receive a full refund of the amount you paid/)).toBeInTheDocument();
     expect(screen.getByText(/initiated within 5 business days/)).toBeInTheDocument();
     expect(screen.queryByText(/to be confirmed/i)).not.toBeInTheDocument();
+  });
+
+  it('refund policy no longer says self-service cancellation or online payments are unavailable', () => {
+    renderAt('/refund-cancellation');
+
+    expect(screen.queryByText(/not yet available/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not yet enabled/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/being integrated/i)).not.toBeInTheDocument();
   });
 
   it('privacy policy states that raw card/UPI credentials are not stored', () => {

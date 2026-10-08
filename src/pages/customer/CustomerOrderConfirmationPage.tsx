@@ -9,9 +9,13 @@ import { Card } from '../../components/ui/Card';
 import { useAuth } from '../../features/auth/useAuth';
 import { useExploreMenu } from '../../features/explore/useExploreMenu';
 import { getOrderErrorMessage } from '../../features/order/errors';
+import { newestOrder } from '../../features/order/orderFreshness';
+import { OrderCancellationSection } from '../../features/order/OrderCancellationSection';
+import { OrderRefundCard } from '../../features/order/OrderRefundCard';
 import { humanizeStatus } from '../../features/order/orderStatusBadges';
 import { PickupCredentialCard } from '../../features/order/PickupCredentialCard';
 import { isPaymentConfirmedStatus, type Order } from '../../features/order/types';
+import { useCancelOrder } from '../../features/order/useCancelOrder';
 import { useOrder } from '../../features/order/useOrder';
 import { useOrderPickup } from '../../features/order/useOrderPickup';
 import { useReadyOrderRefresh } from '../../features/order/useReadyOrderRefresh';
@@ -40,11 +44,24 @@ const PAID_ORDER_MESSAGE: Partial<Record<Order['status'], string>> = {
   completed: 'Your order is complete.',
 };
 
-/** The page heading for an order that has been handed over; every other state keeps the original two. */
+/** The page heading for an order that has been handed over or cancelled; every other state keeps the original two. */
 const HANDED_OVER_TITLE: Partial<Record<Order['status'], string>> = {
   picked_up: 'Order picked up',
   completed: 'Order completed',
+  cancelled: 'Order cancelled',
 };
+
+/**
+ * What a cancelled order's card says. The order's own status is the lifecycle
+ * fact: a cancelled order is never "confirmed", even if a payment was captured
+ * after it was cancelled (the refund card then says where that money is).
+ */
+function cancelledOrderMessage(order: Order): string {
+  if (order.paymentStatus === 'paid' && order.refund && !order.refund.completedAt && order.refund.status !== 'failed') {
+    return 'Your order was cancelled. Your refund has been initiated.';
+  }
+  return 'Your order was cancelled.';
+}
 
 const PAYMENT_STATUS_LABEL: Record<Order['paymentStatus'], string> = {
   pending: 'Payment pending',
@@ -81,11 +98,20 @@ function isErrorNotice(notice: PaymentNotice): boolean {
  * longer ready or the page is hidden). Once the order is `picked_up` or
  * `completed` the credential is gone, not just hidden, and there is nothing to
  * do but read the status. A status this build doesn't know is shown as words.
+ *
+ * Cancelling (`OrderCancellationSection`): "Cancel order" is offered only while the
+ * server's own hint on the order says it can be cancelled (`order.cancellation`),
+ * behind a confirmation dialog with an optional reason; the server decides, and a
+ * refusal re-reads the order and explains. A cancelled order is shown as cancelled
+ * whatever its payment status (a payment captured after the cancellation is
+ * refunded, and the `OrderRefundCard` says so), never as confirmed. A refund still
+ * in flight is re-read slowly until it settles (`useReadyOrderRefresh`).
  */
 export function CustomerOrderConfirmationPage() {
   const { orderId } = useParams<{ orderId: string }>();
   const navigate = useNavigate();
-  const { status, order: fetchedOrder, error, retry } = useOrder(orderId);
+  const { status, order: fetchedOrder, error, retry, refresh } = useOrder(orderId);
+  const cancellation = useCancelOrder(orderId);
   const { user } = useAuth();
   const { phase, notice, confirmedOrder, busy, pay, retryVerification } = usePayOrder({
     orderId,
@@ -93,10 +119,12 @@ export function CustomerOrderConfirmationPage() {
     // Optional prefill only — payment never depends on any of these.
     customer: { name: user?.name, email: user?.email, contact: user?.phone },
   });
-  // After server verification the verify response IS the authoritative order;
-  // otherwise it's whatever the backend last returned for this order.
-  const loadedOrder = confirmedOrder && confirmedOrder.id === fetchedOrder?.id ? confirmedOrder : fetchedOrder;
-  // While it is Ready (and the page is visible) the order is re-read, so it can move on to picked up.
+  // The newest copy the server has given us: what was loaded, what payment verification returned,
+  // or what a cancellation (or a refused one's re-read) returned. After server verification the verify
+  // response IS the authoritative order; a later read supersedes it as soon as it is newer.
+  const loadedOrder = newestOrder(orderId, fetchedOrder, confirmedOrder, cancellation.order);
+  // While it is Ready, or cancelled with its refund still in flight (and the page is visible), the
+  // order is re-read, so it can move on to picked up / the refund can settle.
   const order = useReadyOrderRefresh(loadedOrder);
   // The pickup credential exists only for the customer's own READY, paid order, and is memory-only.
   const pickup = useOrderPickup(order?.id, order?.status === 'ready' && order.paymentStatus === 'paid');
@@ -160,8 +188,11 @@ export function CustomerOrderConfirmationPage() {
               {statusLabel ?? humanizeStatus(order.status)}
             </Badge>
             {needsPayment && <p className="text-sm text-text">Pay to confirm your order.</p>}
+            {order.status === 'cancelled' && <p className="text-sm text-text">{cancelledOrderMessage(order)}</p>}
           </Card>
         )}
+
+        <OrderRefundCard order={order} />
 
         <PickupCredentialCard pickup={pickup} />
 
@@ -218,14 +249,16 @@ export function CustomerOrderConfirmationPage() {
 
         {needsPayment &&
           (verifyFailed ? (
-            <Button onClick={() => void retryVerification()} disabled={busy}>
+            <Button onClick={() => void retryVerification().then(refresh)} disabled={busy}>
               Retry verification
             </Button>
           ) : (
-            <Button onClick={() => void pay()} disabled={busy} aria-busy={busy}>
+            <Button onClick={() => void pay().then(refresh)} disabled={busy} aria-busy={busy}>
               {payLabel}
             </Button>
           ))}
+
+        <OrderCancellationSection order={order} cancel={cancellation} />
 
         <Button variant="secondary" onClick={() => navigate('/explore')}>
           Continue browsing

@@ -6,9 +6,11 @@ import {onRequest} from "firebase-functions/v2/https";
 import {onSchedule} from "firebase-functions/v2/scheduler";
 import type {Response} from "express";
 import {getAdminFirestore} from "./firebaseAdmin";
+import {authenticateRequest} from "./auth/session";
 import {toResponseBody} from "./http/envelope";
 import {handleRequest} from "./http/handleRequest";
 import {logRequest, logUnhandledError} from "./http/logger";
+import {withRateLimits} from "./http/rateLimit";
 import {toNormalizedRequest} from "./http/request";
 import type {ApiResult} from "./http/types";
 import {createExploreRoutes} from "./routes/explore";
@@ -45,6 +47,19 @@ const ROUTES = [
   ...createNotificationRoutes({db: getAdminFirestore()}),
   ...createWebhookRoutes({db: getAdminFirestore()}),
 ];
+
+// Per-user, per-instance abuse limits on the highest-risk routes (see `http/rateLimit.ts`).
+// The caller is verified here only to pick a bucket; a request that fails verification is
+// passed straight on, and the route's own handler answers it (401/503) as it always did.
+const LIMITED_ROUTES = withRateLimits(ROUTES, {
+  resolveUserId: async (ctx) => {
+    const authorization = ctx.request.headers.authorization;
+    const session = await authenticateRequest({
+      headers: {authorization: Array.isArray(authorization) ? authorization[0] : authorization},
+    });
+    return session.userId;
+  },
+});
 
 /**
  * Applies the headers common to every response (always `X-Request-Id` and
@@ -96,7 +111,7 @@ export const api = onRequest(
     const normalized = toNormalizedRequest(request);
 
     const result: ApiResult = await handleRequest(
-      ROUTES,
+      LIMITED_ROUTES,
       normalized,
       (error) => logUnhandledError(requestId, normalized.path, error),
     );

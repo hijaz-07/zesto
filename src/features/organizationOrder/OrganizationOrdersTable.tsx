@@ -4,6 +4,7 @@ import { Card } from '../../components/ui/Card';
 import { formatPaiseAsRupees } from '../../utils/currency';
 import { formatBusinessDateTime, formatDate } from '../../utils/date';
 import { organizationOrderPaymentBadge, organizationOrderStatusBadge } from './badges';
+import { OrderCancellationStatus } from './OrderCancellationStatus';
 import type { OrganizationOrderSummary } from './types';
 
 export interface OrganizationOrdersTableProps {
@@ -127,6 +128,7 @@ function OrderRow({
       </td>
       <td className="px-4 py-3">
         <Badge tone={status.tone}>{status.label}</Badge>
+        <OrderCancellationStatus order={order} />
       </td>
       {renderActions && <td className="px-4 py-3">{renderActions(order)}</td>}
     </tr>

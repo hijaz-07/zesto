@@ -187,15 +187,23 @@ async function refundsOf(order: SeededOrder): Promise<Array<Record<string, unkno
  * @param {unknown} data The response's `data`.
  * @param {SeededOrder} order The order, whose customer's ID must not appear.
  * @param {string[]} extraIds More identities that must not appear.
+ * @param {string[]} allowedNames Field names to exempt from the check — only for a response that is
+ *   MEANT to carry them (the organization route's row has the operator-safe cancellation/refund
+ *   blocks); the actor, reason and every identifier stay forbidden.
  */
-function expectNothingInternal(data: unknown, order: SeededOrder, extraIds: string[] = []): void {
+function expectNothingInternal(
+  data: unknown,
+  order: SeededOrder,
+  extraIds: string[] = [],
+  allowedNames: string[] = [],
+): void {
   const body = JSON.stringify(data);
   for (const leaked of [
     "providerPaymentId", "providerRefundId", "providerOrderId", "pay_", "rfnd_", "evt_", "idempotencyKey",
     "refundId", "initiatedBy", "cancelledBy", "cancelledByRole", "cancellationReason", "cancelledAt", "cancelledFromStatus",
     "submitAttempts", "userId", "refundStatus", "refundedInPaise", "failureCode", "attentionRequired",
     order.customerId, `${order.id}-r`, ...extraIds,
-  ]) {
+  ].filter((name) => !allowedNames.includes(name))) {
     expect(body, leaked).not.toContain(leaked);
   }
 }
@@ -207,6 +215,16 @@ function customerCancel(userId: string, orderId: string, body?: unknown): Promis
     headers: {authorization: "Bearer token"},
     query: {},
     body,
+  }, () => {});
+}
+
+function customerGet(userId: string, orderId: string): Promise<ApiResult> {
+  return handleRequest(createOrderRoutes({db, validator: acceptingValidator(userId)}), {
+    method: "GET",
+    path: `/orders/${orderId}`,
+    headers: {authorization: "Bearer token"},
+    query: {},
+    body: undefined,
   }, () => {});
 }
 
@@ -227,6 +245,167 @@ describe("order cancellation routes (Firestore emulator)", () => {
   beforeAll(async () => {
     orgA = await buildOrg("Org A");
     orgB = await buildOrg("Org B");
+  });
+
+  describe("GET /orders/:orderId — cancellation state and refund summary", () => {
+    async function seedRefund(
+      order: SeededOrder,
+      status: "requested" | "pending" | "processed" | "failed",
+    ): Promise<void> {
+      const payment = order.ref.collection("payments").doc(order.id);
+      await payment.update({capturedAmountInPaise: AMOUNT, refundSeq: 1});
+      const refundId = `${order.id}-r1`;
+      const createdAt = Timestamp.fromDate(new Date("2026-09-01T06:00:00Z"));
+      const settledAt = Timestamp.fromDate(new Date("2026-09-02T08:30:00Z"));
+      await payment.collection("refunds").doc(refundId).set({
+        id: refundId,
+        paymentId: order.id,
+        orderId: order.id,
+        organizationId: orgA.organizationId,
+        outletId: orgA.outletId,
+        menuId: orgA.menuId,
+        userId: order.customerId,
+        providerPaymentId: "pay_secret_1",
+        amountInPaise: AMOUNT,
+        currency: "INR",
+        status,
+        reason: "customer_cancelled",
+        source: "cancellation",
+        initiatedBy: order.customerId,
+        initiatedByRole: "customer",
+        idempotencyKey: refundId,
+        ...(status === "requested" ? {} : {providerRefundId: "rfnd_secret_1"}),
+        ...(status === "pending" ? {pendingAt: createdAt} : {}),
+        submitAttempts: 1,
+        createdAt,
+        updatedAt: status === "processed" ? settledAt : createdAt,
+        ...(status === "processed" ? {processedAt: settledAt} : {}),
+        ...(status === "failed" ? {failedAt: settledAt, failureMessage: "secret provider failure"} : {}),
+        attentionRequired: status === "failed",
+        lastWebhookEventKey: "evt_secret_1",
+      });
+    }
+
+    async function markCancelled(order: SeededOrder, fromStatus: string): Promise<void> {
+      await order.ref.update({
+        status: "cancelled",
+        cancelledAt: Timestamp.now(),
+        cancelledBy: order.customerId,
+        cancelledByRole: "customer",
+        cancelledFromStatus: fromStatus,
+      });
+    }
+
+    it.each([
+      ["pending_payment", true],
+      ["confirmed", true],
+      ["preparing", false],
+      ["ready", false],
+      ["picked_up", false],
+      ["completed", false],
+    ] as const)("a %s order (before the deadline): canCancel is %s", async (status, canCancel) => {
+      const order = await seedOrder(orgA, status);
+
+      const result = await customerGet(order.customerId, order.id);
+
+      expect(result).toMatchObject({kind: "success", status: 200, data: {order: {id: order.id, status}}});
+      const data = (result as {data: Record<string, unknown>}).data;
+      expect(data.cancellation).toEqual({state: canCancel ? "cancellable" : "not_cancellable", canCancel});
+      expect(data).not.toHaveProperty("refund");
+      expect(Object.keys(data).sort()).toEqual(["cancellation", "order"]);
+    });
+
+    it("a confirmed order after the ordering deadline is not cancellable", async () => {
+      const order = await seedOrder(orgA, "confirmed", {menuId: orgA.closedMenuId});
+
+      const result = await customerGet(order.customerId, order.id);
+
+      expect((result as {data: Record<string, unknown>}).data.cancellation).toEqual({
+        state: "not_cancellable", canCancel: false,
+      });
+    });
+
+    it("a confirmed order whose menu is gone fails closed: not cancellable", async () => {
+      // An order under a menu document that does not exist (a subcollection needs no parent document).
+      const order = await seedOrder(orgA, "confirmed", {menuId: `no-such-menu-${randomUUID()}`});
+
+      const result = await customerGet(order.customerId, order.id);
+
+      expect((result as {data: Record<string, unknown>}).data.cancellation).toEqual({
+        state: "not_cancellable", canCancel: false,
+      });
+    });
+
+    it("a paid order whose payment document is missing is not cancellable, and the read still succeeds", async () => {
+      const order = await seedOrder(orgA, "confirmed");
+      await order.ref.collection("payments").doc(order.id).delete();
+
+      const result = await customerGet(order.customerId, order.id);
+
+      expect(result).toMatchObject({kind: "success", status: 200});
+      expect((result as {data: Record<string, unknown>}).data.cancellation).toEqual({
+        state: "not_cancellable", canCancel: false,
+      });
+    });
+
+    it("a cancelled unpaid order is cancelled and has no refund", async () => {
+      const order = await seedOrder(orgA, "pending_payment");
+      await markCancelled(order, "pending_payment");
+
+      const result = await customerGet(order.customerId, order.id);
+
+      const data = (result as {data: Record<string, unknown>}).data;
+      expect(data.cancellation).toEqual({state: "cancelled", canCancel: false});
+      expect(data).not.toHaveProperty("refund");
+    });
+
+    it.each(["requested", "pending", "processed", "failed"] as const)(
+      "a cancelled paid order with a %s refund returns exactly the safe refund summary",
+      async (status) => {
+        const order = await seedOrder(orgA, "confirmed");
+        await markCancelled(order, "confirmed");
+        await seedRefund(order, status);
+
+        const result = await customerGet(order.customerId, order.id);
+
+        const data = (result as {data: {order: Record<string, unknown>; refund: Record<string, unknown>}}).data;
+        expect(data.order).toMatchObject({status: "cancelled", paymentStatus: "paid"});
+        expect(data).toMatchObject({cancellation: {state: "cancelled", canCancel: false}});
+        expect(data.refund).toEqual({
+          status,
+          amountInPaise: AMOUNT,
+          currency: "INR",
+          initiatedAt: "2026-09-01T06:00:00.000Z",
+          ...(status === "processed" ? {completedAt: "2026-09-02T08:30:00.000Z"} : {}),
+        });
+        expectNothingInternal(data, order);
+      },
+    );
+
+    it("reads back the refund a real cancellation just created", async () => {
+      const order = await seedOrder(orgA, "confirmed");
+      await customerCancel(order.customerId, order.id, {reason: "changed_my_mind"});
+
+      const result = await customerGet(order.customerId, order.id);
+
+      expect(result).toMatchObject({
+        kind: "success",
+        data: {
+          order: {status: "cancelled", paymentStatus: "paid"},
+          cancellation: {state: "cancelled", canCancel: false},
+          refund: {status: "requested", amountInPaise: AMOUNT, currency: "INR"},
+        },
+      });
+      expectNothingInternal((result as {data: unknown}).data, order);
+    });
+
+    it("never returns a cancellation view to another customer (404)", async () => {
+      const order = await seedOrder(orgA, "confirmed");
+
+      const result = await customerGet(freshUserId(), order.id);
+
+      expect(result).toMatchObject({kind: "error", status: 404});
+    });
   });
 
   describe("POST /orders/:orderId/cancel", () => {
@@ -447,7 +626,12 @@ describe("order cancellation routes (Firestore emulator)", () => {
       });
       const data = (result as {data: {refund: Record<string, unknown>}}).data;
       expect(Object.keys(data.refund).sort()).toEqual(["amountInPaise", "currency", "initiatedAt", "status"]);
-      expectNothingInternal(data, order, [userId]);
+      // The organization's row carries the operator-safe blocks (a role and a time, a state and an amount)
+      // and still none of the actor, the reason or any identifier.
+      const row = (result as {data: {order: Record<string, unknown>}}).data.order;
+      expect(row.cancellation).toEqual({cancelledBy: "organization", cancelledAt: expect.any(String)});
+      expect(row.refund).toEqual({state: "in_progress", refundedInPaise: 0});
+      expectNothingInternal(data, order, [userId], ["cancelledBy", "cancelledAt", "refundedInPaise"]);
       const refunds = await refundsOf(order);
       expect(refunds).toHaveLength(1);
       expect(refunds[0]).toMatchObject({amountInPaise: AMOUNT, reason: "outlet_cancelled", initiatedBy: userId, initiatedByRole: "organization"});

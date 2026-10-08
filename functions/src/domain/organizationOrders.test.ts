@@ -175,6 +175,56 @@ describe("toOrganizationOrderSummary", () => {
     expect(summary).not.toHaveProperty("menu");
     expect(summary.id).toBe("order-1");
   });
+
+  describe("cancellation and refund blocks", () => {
+    const cancelledAt = Timestamp.fromDate(new Date("2026-09-27T05:00:00Z"));
+
+    it("carries neither block on an order that was never cancelled or refunded", () => {
+      const summary = toOrganizationOrderSummary(validOrder(), outlet, menu);
+
+      expect(summary).not.toHaveProperty("cancellation");
+      expect(summary).not.toHaveProperty("refund");
+    });
+
+    it("shows who cancelled (a role) and when, and nothing else of the audit", () => {
+      const summary = toOrganizationOrderSummary(validOrder({
+        status: "cancelled",
+        cancelledAt,
+        cancelledBy: "U-manager-secret",
+        cancelledByRole: "organization",
+        cancellationReason: "item_unavailable",
+        cancelledFromStatus: "confirmed",
+      }), outlet, menu);
+
+      expect(summary.cancellation).toEqual({cancelledBy: "organization", cancelledAt: "2026-09-27T05:00:00.000Z"});
+      const serialized = JSON.stringify(summary);
+      expect(serialized).not.toContain("U-manager-secret");
+      expect(serialized).not.toContain("item_unavailable");
+      expect(serialized).not.toContain("cancelledFromStatus");
+    });
+
+    it("omits the cancellation block for a cancelled order with no recorded audit, and for a non-cancelled order that has one", () => {
+      expect(toOrganizationOrderSummary(validOrder({status: "cancelled"}), outlet, menu)).not.toHaveProperty("cancellation");
+      expect(
+        toOrganizationOrderSummary(validOrder({cancelledAt, cancelledByRole: "customer"}), outlet, menu),
+      ).not.toHaveProperty("cancellation");
+    });
+
+    it("maps the order's refund mirror to the refund block, with only the state and the amount refunded", () => {
+      const summary = toOrganizationOrderSummary(
+        validOrder({refundStatus: "attention_required", refundedInPaise: 0}), outlet, menu,
+      );
+
+      expect(summary.refund).toEqual({state: "attention_required", refundedInPaise: 0});
+    });
+
+    it("leaves the refund block out for state none, or a half-written mirror", () => {
+      expect(toOrganizationOrderSummary(validOrder({refundStatus: "none", refundedInPaise: 0}), outlet, menu))
+        .not.toHaveProperty("refund");
+      expect(toOrganizationOrderSummary(validOrder({refundStatus: "refunded"}), outlet, menu))
+        .not.toHaveProperty("refund");
+    });
+  });
 });
 
 describe("listOrganizationOrders — cursor scope (no Firestore access)", () => {

@@ -126,3 +126,30 @@ export const orgOutlets: Outlet[] = [
   outlet('outlet-2', 'Hostel Café', 'active'),
   outlet('outlet-3', 'Old Annex', 'inactive'),
 ];
+
+/**
+ * A paid order cancelled by the organization, with its refund in the given state
+ * as the list endpoint reports it. `refund: null` is a cancelled paid order whose
+ * refund block is missing.
+ */
+export function cancelledPaidOrgOrder(
+  refund: OrganizationOrderSummary['refund'] | null = { state: 'in_progress', refundedInPaise: 0 },
+  overrides: Partial<OrganizationOrderSummary> = {},
+): OrganizationOrderSummary {
+  return {
+    ...confirmedOrgOrder,
+    id: 'order-cancelled-paid-9',
+    status: 'cancelled',
+    updatedAt: '2026-09-30T08:10:00+05:30',
+    cancellation: { cancelledBy: 'organization', cancelledAt: '2026-09-30T02:40:00.000Z' },
+    ...(refund ? { refund } : {}),
+    ...overrides,
+  };
+}
+
+/** An unpaid order the customer cancelled: nothing was captured, so no refund. */
+export const customerCancelledUnpaidOrgOrder: OrganizationOrderSummary = {
+  ...cancelledOrgOrder,
+  id: 'order-cancelled-unpaid-10',
+  cancellation: { cancelledBy: 'customer', cancelledAt: '2026-09-30T02:40:00.000Z' },
+};

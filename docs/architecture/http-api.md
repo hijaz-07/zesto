@@ -113,7 +113,8 @@ no cacheable, non-personal responses yet. A 401 response additionally gets
 | 404    | `not_found`            | No route registered for the path, or (e.g. `PATCH .../outlets/{outletId}`) the specific resource doesn't exist. |
 | 405    | `method_not_allowed`   | The path exists, but not for this method (`Allow` header lists what does). |
 | 409    | `already_exists`       | `POST /organizations` or `POST .../outlets` with a `slug` that is already taken. |
-| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`, `.../complete`), a cancellation (`POST /orders/{orderId}/cancel`, `.../orders/{orderId}/cancel`) of an order that is past cancelling, or a pickup (`POST .../pickups`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order, an order already picked up), a pickup at the wrong outlet, and `GET /orders/{orderId}/pickup-credential` for an order that cannot be collected right now. A client should re-read the resource, not retry the same request. Only the organization order routes and the pickup credential route use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
+| 409    | `conflict`             | The resource is not in a state the request can act on, or changed underneath it: a fulfillment action (`.../orders/{orderId}/start-preparing`, `.../mark-ready`, `.../complete`), a cancellation (`POST /orders/{orderId}/cancel`, `.../orders/{orderId}/cancel`) of an order that is past cancelling, a refund retry (`.../orders/{orderId}/retry-refund`) with no failed refund to retry, or a pickup (`POST .../pickups`) on an order that is not in the state it needs (stale screen, a racing colleague, an unpaid or cancelled order, an order already picked up), a pickup at the wrong outlet, and `GET /orders/{orderId}/pickup-credential` for an order that cannot be collected right now. A client should re-read the resource, not retry the same request. Only the organization order routes and the pickup credential route use it so far; elsewhere a wrong lifecycle state is still `400` (`failed-precondition`). |
+| 429    | `rate_limited`         | The verified caller sent too many requests to one of the highest-risk routes (order and payment preparation, cancellation, refund retry, pickup redemption, notification reads, organization creation) within the window. `Retry-After` gives the seconds to wait; the handler did not run, so nothing changed. A best-effort, per-user, per-instance limit — see [Rate limiting](#rate-limiting). Never returned to an unauthenticated caller. |
 | 500    | `internal`             | An unhandled exception in a route handler (e.g. a malformed stored Firestore document). The client never sees the underlying detail. |
 | 503    | `unavailable`          | An infrastructure failure while validating the session (see below) — **not** the caller's fault. |
 
@@ -137,6 +138,34 @@ failure or bad response fetching Descope's signing keys — is treated as a
 503. This is a heuristic on error message text, because that's the only
 signal the SDK exposes; `functions/src/auth/session.test.ts` documents and
 tests both directions.
+
+## Rate limiting
+
+`functions/src/http/rateLimit.ts` wraps a short list of routes (`RATE_LIMIT_POLICIES`:
+`POST /orders`, `.../payment`, `.../payment/verify`, `POST /orders/{id}/cancel`,
+`GET .../pickup-credential`, `POST /organizations`, the organization `cancel`,
+`retry-refund` and `pickups` routes, and the notification list / unread-count reads) so
+each request is counted against its **verified** caller before the handler runs. The
+caller is verified once in the wrapper only to choose a bucket (`{method} {route
+pattern}:{userId}`); a request that does not verify is passed on untouched and the
+handler answers it (401/503) exactly as before. Over the limit: `429 rate_limited` with
+`Retry-After`, and the handler never runs.
+
+Design choices, deliberately conservative:
+
+- **Keyed by user, never by IP.** A campus Wi-Fi puts hundreds of legitimate students
+  behind one address, and an unverified token claim would let anyone spend another
+  user's budget.
+- **Best effort, per instance.** Counters live in each function instance's memory (bounded
+  to 10,000 buckets), so one user's effective ceiling is the limit times the number of warm
+  instances (at most `maxInstances`, 10) and resets when an instance restarts. The limits
+  are well above real use (e.g. 20 order creations per minute, 120 pickup redemptions per
+  minute), so this stops runaway clients and single abusive accounts — chiefly protecting
+  the shared Razorpay API budget — without ever turning a real customer away. A hard global
+  limit needs shared state or an edge control and is a documented future step
+  (`docs/operations/production-readiness-audit.md`).
+- The webhook route is not limited: it is authenticated by Razorpay's signature, rejects
+  before touching Firestore, and must never drop a genuine delivery.
 
 ## Firestore Admin SDK access
 
@@ -889,7 +918,9 @@ listed like any other. Each row:
   "itemCount": 3,
   "items": [{ "name": "Chicken Biriyani", "quantity": 2 }],
   "moreItemLines": 0,
-  "createdAt": "…", "updatedAt": "…"
+  "createdAt": "…", "updatedAt": "…",
+  "cancellation": { "cancelledBy": "customer | organization", "cancelledAt": "…" },
+  "refund": { "state": "in_progress | partially_refunded | refunded | attention_required", "refundedInPaise": 0 }
 }
 ```
 
@@ -897,6 +928,17 @@ listed like any other. Each row:
   order's own snapshots — never the live menu, so a later rename or reprice
   changes nothing) and `moreItemLines` counts the rest; `itemCount` is the
   total portions across every line. No per-line prices.
+- `cancellation` and `refund` are **optional**, additive, read-only blocks (the
+  dashboard's cancellation/refund UX reads them). `cancellation` is present only
+  on a `cancelled` order whose cancellation was recorded, and says who it came
+  from (a role, never an identity) and when — not the reason, the actor, or the
+  status it was cancelled from. `refund` is the order document's own refund
+  mirror (no extra read): the payment-level state and the amount already
+  refunded; it is absent when the order has had no refund activity.
+  `attention_required` means a refund failed or stalled and needs an owner or
+  manager. No refund, payment or provider identifier, amount in flight or audit
+  field is ever sent. The fulfillment, pickup and `.../cancel` routes answer
+  with the same row, blocks included.
 - `outlet`/`menu` are display-only names, omitted (not an error) if that
   document no longer exists.
 - Never present: `userId` or any customer identity (name, phone, email),
@@ -1123,6 +1165,60 @@ same three blocks on both routes:
 data, audit field (who cancelled, why), idempotency key, or secret. There is no
 separate refund endpoint. A refused state is `409 conflict`. Errors: `401`, `403`, `400 invalid_argument`, `404 not_found`,
 `409 conflict`, `503`. No Firestore index is added.
+
+### Retrying a failed refund
+
+```
+POST /organizations/{organizationId}/orders/{orderId}/retry-refund     (no body)
+```
+
+An owner or manager of the order's organization starts a **new** refund attempt for a
+cancelled order whose latest refund `failed` (the provider definitively refused it, so
+the customer's money has not come back). Staff are refused (`403`). It is
+`functions/src/domain/orderRefundRetry.ts` (who may ask, which order) over
+`createRefundRetry` (what it does — see [Refund orchestration](#refund-orchestration)); there
+is no second implementation.
+
+- **Nothing is read from the request.** There is no body, amount or refund ID: the
+  amount is always the whole remaining refundable amount of the payment, decided in the
+  transaction, so the accounting can never exceed what was captured.
+- **Scope.** The order is resolved by ID and must belong to the caller's organization;
+  another organization's (or an unknown) order is a plain `404`. It must be `cancelled`.
+- **A new document, never a reopened one.** The failed attempt stays `failed`; the retry is
+  `{orderId}-r{seq+1}` (source `retry`, initiated by the caller, role `organization`) with its
+  own provider idempotency key, and the existing `onRefundCreated` trigger submits it. A
+  refund made outside Zesto (`external`) is never retried.
+- **Idempotent.** A repeat — or the loser of two racing requests — finds the new refund as
+  the latest one, which is not `failed`, and gets `409 conflict`; exactly one refund is created.
+  `409` also answers an order with no refund, a refund that has not failed, nothing left to refund,
+  or a payment that cannot be refunded safely.
+
+**Response.** `200` with the order's organization list row (now showing the refund as
+`in_progress`) and the new refund in the same safe shape a cancellation returns:
+
+```json
+{"data": {
+  "order": { "…": "the organization list row" },
+  "refund": {"status": "requested", "amountInPaise": 25000, "currency": "INR", "initiatedAt": "…"}
+}}
+```
+
+No provider refund or payment ID, idempotency key, failure code or actor is exposed.
+Errors: `401`, `403`, `404 not_found`, `409 conflict`, `503`. No Firestore index is added.
+
+**Reading the state back: `GET /orders/{orderId}` (customer).** The customer's order read carries the same two blocks beside `order`, so a screen can show whether Cancel is on offer and where a refund stands without a second endpoint:
+
+```json
+{"data": {
+  "order": { "…": "the customer's order shape" },
+  "cancellation": {"state": "cancellable | not_cancellable | cancelled", "canCancel": true},
+  "refund": {"status": "requested | pending | processed | failed", "amountInPaise": 25000, "currency": "INR",
+             "initiatedAt": "…", "completedAt": "…only once processed"}
+}}
+```
+
+`cancellation` is always present. `canCancel` is the SAME policy as the cancel route (`decideCancellation` for the customer: `pending_payment`, or `confirmed` strictly before the menu's `orderingClosesAt`; a missing menu or payment fails closed), read in one read-only transaction. It is a **hint, never the authority**: `POST /orders/{orderId}/cancel` decides again and may still answer `409`. `refund` is the order's latest refund (the same safe summary as above) and is absent when the order has none; a payment captured after cancellation (late capture) therefore reads as `status: cancelled`, `paymentStatus: paid` and a refund. An unreadable refund document is left out rather than failing the read. Nothing about the provider, payment, audit or idempotency is exposed. The order history list (`GET /orders`) does not carry these blocks.
+
 
 ## Organization order pickup
 
@@ -1576,7 +1672,7 @@ other route in this codebase (see `firestore.rules`'s own header comment).
 
 ## Refund orchestration
 
-Internal only — **no route** exposes any of this (no refund-status or retry endpoint exists yet). A refund is created `requested` by a cancellation or a late capture (see [Order cancellation](#order-cancellation)); `functions/src/domain/refundSubmission.ts`'s `submitRefund` is the ONE driver that moves it on with the provider, whoever calls it: the `onRefundCreated` Firestore trigger, the scheduled `reconcileRefunds` sweep, or a later route.
+Internal, with one exception — the owner/manager retry of a failed refund ([Retrying a failed refund](#retrying-a-failed-refund)); there is no refund-status endpoint (cancellation responses and the order reads carry the safe refund summary). A refund is created `requested` by a cancellation or a late capture (see [Order cancellation](#order-cancellation)); `functions/src/domain/refundSubmission.ts`'s `submitRefund` is the ONE driver that moves it on with the provider, whoever calls it: the `onRefundCreated` Firestore trigger, the scheduled `reconcileRefunds` sweep, or a later route.
 
 **Shape (a provider call is never inside a Firestore transaction).**
 
@@ -1613,7 +1709,7 @@ Each carries `refundId`, `orderId`, `paymentId`, `organizationId`, `outletId`, `
 
 **External / manual refunds.** A signed refund event (or a lookup) for a Zesto payment with no local refund document, and no Zesto identifier, is ADOPTED: a refund with reason `external`, source `reconciliation`, `attentionRequired: true`, its money booked like a refund of that status. It never cancels the order. If booking it would break `refunded + pending ≤ captured`, or the payment is not safely refundable, nothing is adopted: the payment is flagged and an `anomalies` record is written under it.
 
-**Retry.** `refundRetry.ts`'s `createRefundRetry` (a system capability, no route yet) creates the next refund (`{orderId}-r{seq+1}`, source `retry`) only when the LATEST refund is `failed` and not external, for the whole remaining refundable amount, in one transaction; the failed attempt is never reopened.
+**Retry.** `refundRetry.ts`'s `createRefundRetry` (the one implementation; the owner/manager route [below](#retrying-a-failed-refund) is a thin wrapper around it) creates the next refund (`{orderId}-r{seq+1}`, source `retry`) only when the LATEST refund is `failed` and not external, for the whole remaining refundable amount, in one transaction; the failed attempt is never reopened.
 
 **Required before this runs in production (not done in 7.5):** deploy the functions `onRefundCreated` and `reconcileRefunds` (the latter needs Cloud Scheduler), deploy the new Firestore indexes (`refunds`: `status`+`nextAttemptAt` composite; collection-group overrides on `refunds.providerRefundId` and `payments.providerPaymentId`), and add the three refund events to the Razorpay webhook subscription.
 

@@ -3,6 +3,7 @@ import {createHmac} from "node:crypto";
 import {afterEach, beforeEach, describe, expect, it, vi} from "vitest";
 import {
   createRazorpayGateway,
+  razorpayModeOf,
   getRazorpayKeyId,
   getRazorpayKeySecret,
   verifyCheckoutSignature,
@@ -472,5 +473,53 @@ describe("Checkout verification and webhook verification are separate operations
       providerOrderId: "o", razorpayPaymentId: "p", razorpaySignature: "s",
     })).toThrow("RAZORPAY_KEY_SECRET is not configured.");
     expect(verifyWebhookSignature({rawBody: "x", signature: computeWebhookSignature("x")})).toBe(true);
+  });
+});
+
+describe("createRazorpayGateway: request timeout", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("gives up on a hung createOrder with a PaymentProviderError instead of waiting forever", async () => {
+    vi.useFakeTimers();
+    const {client} = fakeRazorpayClient({create: () => new Promise(() => undefined)});
+    const gateway = createRazorpayGateway(client, 5_000);
+
+    const outcome = gateway.createOrder({amountInPaise: 100, currency: "INR", receipt: "payment-1"})
+      .then(() => "resolved", (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(await outcome).toBeInstanceOf(PaymentProviderError);
+  });
+
+  it("gives up on a hung fetchOrder the same way", async () => {
+    vi.useFakeTimers();
+    const {client} = fakeRazorpayClient({fetch: () => new Promise(() => undefined)});
+    const gateway = createRazorpayGateway(client, 5_000);
+
+    const outcome = gateway.fetchOrder("order_RazorpayTest1").then(() => "resolved", (error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(await outcome).toBeInstanceOf(PaymentProviderError);
+  });
+
+  it("does not interfere with a call that answers in time, and leaves no timer behind", async () => {
+    vi.useFakeTimers();
+    const {client} = fakeRazorpayClient();
+    const gateway = createRazorpayGateway(client, 5_000);
+
+    await expect(gateway.createOrder({amountInPaise: 100, currency: "INR", receipt: "p"}))
+      .resolves.toMatchObject({id: "order_RazorpayTest1"});
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("razorpayModeOf", () => {
+  it("reads the mode from the key_id's public prefix", () => {
+    expect(razorpayModeOf("rzp_test_AbC123")).toBe("test");
+    expect(razorpayModeOf("rzp_live_AbC123")).toBe("live");
+    expect(razorpayModeOf("something_else")).toBe("unknown");
+    expect(razorpayModeOf("")).toBe("unknown");
   });
 });

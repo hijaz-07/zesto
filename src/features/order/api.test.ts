@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, apiFetch } from '../../lib/api/client';
-import { createOrder, getOrder, getPickupCredential, listOrders } from './api';
+import { cancelOrder, createOrder, getOrder, getPickupCredential, listOrders } from './api';
 
 const apiFetchMock = vi.hoisted(() => vi.fn());
 vi.mock('../../lib/api/client', async (importOriginal) => ({
@@ -264,5 +264,183 @@ describe('getPickupCredential', () => {
     apiFetchMock.mockRejectedValue(refusal);
 
     await expect(getPickupCredential('order-1')).rejects.toBe(refusal);
+  });
+});
+
+describe('getOrder — the cancellation hint and refund summary', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  const refund = {
+    status: 'pending',
+    amountInPaise: 24000,
+    currency: 'INR',
+    initiatedAt: '2026-09-29T10:00:00.000Z',
+  };
+
+  it("folds the server's cancellation hint into the order", async () => {
+    apiFetchMock.mockResolvedValue({ order, cancellation: { state: 'cancellable', canCancel: true } });
+
+    const result = await getOrder('order-1');
+
+    expect(result.order).toEqual({ ...order, cancellation: { state: 'cancellable', canCancel: true } });
+  });
+
+  it('folds in a refund summary, keeping exactly the approved fields', async () => {
+    apiFetchMock.mockResolvedValue({
+      order,
+      cancellation: { state: 'cancelled', canCancel: false },
+      refund: { ...refund, completedAt: '2026-09-30T10:00:00.000Z', providerRefundId: 'rfnd_secret', refundId: 'order-1-r1' },
+    });
+
+    const result = await getOrder('order-1');
+
+    expect(result.order.refund).toEqual({ ...refund, completedAt: '2026-09-30T10:00:00.000Z' });
+    expect(JSON.stringify(result)).not.toContain('rfnd_secret');
+    expect(JSON.stringify(result)).not.toContain('order-1-r1');
+  });
+
+  it('still reads an order from a backend that sends neither block (no hint, no refund)', async () => {
+    apiFetchMock.mockResolvedValue({ order });
+
+    const result = await getOrder('order-1');
+
+    expect(result.order).toEqual(order);
+    expect(result.order).not.toHaveProperty('cancellation');
+    expect(result.order).not.toHaveProperty('refund');
+  });
+
+  it.each([
+    ['an unknown state', { state: 'maybe', canCancel: true }],
+    ['a non-boolean canCancel', { state: 'cancellable', canCancel: 'yes' }],
+    ['a hint that contradicts itself (cancellable but canCancel false)', { state: 'cancellable', canCancel: false }],
+    ['a hint that contradicts itself (not cancellable but canCancel true)', { state: 'not_cancellable', canCancel: true }],
+    ['null', null],
+    ['a string', 'cancellable'],
+  ])('ignores a malformed cancellation hint: %s', async (_name, cancellation) => {
+    apiFetchMock.mockResolvedValue({ order, cancellation });
+
+    const result = await getOrder('order-1');
+
+    expect(result.order).not.toHaveProperty('cancellation');
+  });
+
+  it.each([
+    ['an unknown status', { ...refund, status: 'reversed' }],
+    ['a zero amount', { ...refund, amountInPaise: 0 }],
+    ['a fractional amount', { ...refund, amountInPaise: 10.5 }],
+    ['a string amount', { ...refund, amountInPaise: '24000' }],
+    ['a different currency', { ...refund, currency: 'USD' }],
+    ['a missing initiatedAt', { ...refund, initiatedAt: undefined }],
+    ['a non-string completedAt', { ...refund, completedAt: 5 }],
+    ['null', null],
+    ['an array', []],
+  ])('ignores a malformed refund summary: %s', async (_name, malformed) => {
+    apiFetchMock.mockResolvedValue({ order, refund: malformed });
+
+    const result = await getOrder('order-1');
+
+    expect(result.order).not.toHaveProperty('refund');
+  });
+
+  it('fails clearly if the response has no order at all', async () => {
+    apiFetchMock.mockResolvedValue({});
+
+    await expect(getOrder('order-1')).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+});
+
+describe('cancelOrder', () => {
+  const cancelled = { ...order, status: 'cancelled' as const, updatedAt: '2026-09-29T10:05:00+05:30' };
+
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  it('POSTs /orders/{id}/cancel with only the reason', async () => {
+    apiFetchMock.mockResolvedValue({ order: cancelled, cancellation: { state: 'cancelled', canCancel: false } });
+
+    await cancelOrder('order-1', 'changed_my_mind');
+
+    expect(apiFetchMock).toHaveBeenCalledTimes(1);
+    const [path, init] = apiFetchMock.mock.calls[0];
+    expect(path).toBe('/orders/order-1/cancel');
+    expect(init).toMatchObject({ method: 'POST', headers: { 'Content-Type': 'application/json' } });
+    const body = JSON.parse(init.body as string);
+    expect(body).toEqual({ reason: 'changed_my_mind' });
+    expect(Object.keys(body)).toEqual(['reason']);
+  });
+
+  it('sends an empty object when the customer gave no reason — never an amount, status, user or deadline', async () => {
+    apiFetchMock.mockResolvedValue({ order: cancelled, cancellation: { state: 'cancelled', canCancel: false } });
+
+    await cancelOrder('order-1');
+
+    const [, init] = apiFetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it('does not send a reason that is not one of the approved five', async () => {
+    apiFetchMock.mockResolvedValue({ order: cancelled, cancellation: { state: 'cancelled', canCancel: false } });
+
+    await cancelOrder('order-1', 'because I said so' as never);
+
+    const [, init] = apiFetchMock.mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({});
+  });
+
+  it('percent-encodes the order ID in the path', async () => {
+    apiFetchMock.mockResolvedValue({
+      order: { ...cancelled, id: 'a/b' },
+      cancellation: { state: 'cancelled', canCancel: false },
+    });
+
+    await cancelOrder('a/b');
+
+    expect(apiFetchMock.mock.calls[0][0]).toBe('/orders/a%2Fb/cancel');
+  });
+
+  it('returns the cancelled order with its refund summary folded in', async () => {
+    apiFetchMock.mockResolvedValue({
+      order: { ...cancelled, paymentStatus: 'paid' },
+      cancellation: { state: 'cancelled', canCancel: false },
+      refund: { status: 'requested', amountInPaise: 24000, currency: 'INR', initiatedAt: '2026-09-29T10:05:00.000Z' },
+    });
+
+    const result = await cancelOrder('order-1');
+
+    expect(result.order).toMatchObject({
+      status: 'cancelled',
+      cancellation: { state: 'cancelled', canCancel: false },
+      refund: { status: 'requested', amountInPaise: 24000 },
+    });
+  });
+
+  it('knows the order is cancelled even if the response left out the hint', async () => {
+    apiFetchMock.mockResolvedValue({ order: cancelled });
+
+    const result = await cancelOrder('order-1');
+
+    expect(result.order.cancellation).toEqual({ state: 'cancelled', canCancel: false });
+    expect(result.order).not.toHaveProperty('refund');
+  });
+
+  it('rejects a 200 that is not a cancelled order, so the screen never shows one that was not cancelled', async () => {
+    apiFetchMock.mockResolvedValue({ order: { ...order, status: 'confirmed' } });
+
+    await expect(cancelOrder('order-1')).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+
+  it('rejects an answer about a different order', async () => {
+    apiFetchMock.mockResolvedValue({ order: { ...cancelled, id: 'someone-elses' } });
+
+    await expect(cancelOrder('order-1')).rejects.toMatchObject({ code: 'invalid_response' });
+  });
+
+  it("passes the backend's refusal through unchanged", async () => {
+    apiFetchMock.mockRejectedValue(new ApiError(409, 'conflict', 'This order is already being prepared.'));
+
+    await expect(cancelOrder('order-1')).rejects.toMatchObject({ status: 409 });
   });
 });

@@ -59,4 +59,10 @@ describe("functions/src/index.ts registers every route module", () => {
   it("serves refund webhooks on the existing api function: no second webhook function exists", () => {
     expect(indexSource.split("= onRequest(").length - 1).toBe(1);
   });
+
+  it("dispatches through the rate-limited route list, never the bare one", () => {
+    expect(indexSource).toContain("const LIMITED_ROUTES = withRateLimits(ROUTES,");
+    expect(indexSource).toMatch(/handleRequest\(\s*LIMITED_ROUTES,/);
+    expect(indexSource).not.toMatch(/handleRequest\(\s*ROUTES,/);
+  });
 });

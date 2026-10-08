@@ -1,5 +1,5 @@
 import { IonContent, IonPage } from '@ionic/react';
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { EmptyState } from '../../components/common/EmptyState';
 import { ErrorState } from '../../components/common/ErrorState';
 import { LoadingState } from '../../components/common/LoadingState';
@@ -11,8 +11,10 @@ import {
   isOrganizationOrdersForbidden,
   listOrganizationOrdersErrorMessage,
 } from '../../features/organizationOrder/errors';
+import { CancelOrganizationOrderDialog } from '../../features/organizationOrder/CancelOrganizationOrderDialog';
+import { isOrderCancellable, type OrganizationCancellationReason } from '../../features/organizationOrder/cancellation';
 import { canFulfillOrders } from '../../features/organizationOrder/fulfillment';
-import { OrderFulfillmentActions } from '../../features/organizationOrder/OrderFulfillmentActions';
+import { OrganizationOrderActions } from '../../features/organizationOrder/OrganizationOrderActions';
 import { OrganizationOrdersTable } from '../../features/organizationOrder/OrganizationOrdersTable';
 import { useOrderFulfillment } from '../../features/organizationOrder/useOrderFulfillment';
 import { useOrganizationOrders } from '../../features/organizationOrder/useOrganizationOrders';
@@ -21,7 +23,7 @@ import { useOnBecameVisible } from '../../hooks/useOnBecameVisible';
 
 export interface OrganizationOrdersPageProps {
   organizationId: OrganizationId;
-  /** The caller's membership role (from `GET /organizations`, threaded down via `OrganizationGate` -> `OrganizationAppLayout`). Decides only whether the fulfilment actions are shown — see `canFulfillOrders`. */
+  /** The caller's membership role (from `GET /organizations`, threaded down via `OrganizationGate` -> `OrganizationAppLayout`). Decides only which actions are shown — see `canFulfillOrders` and `canCancelOrders`. */
   role: OrganizationMemberRole;
 }
 
@@ -35,7 +37,10 @@ const ALL_OUTLETS = '';
  * on a preparing one, and "Mark completed" on a picked-up one
  * (`useOrderFulfillment`). A ready order reads "Awaiting pickup": handing it over
  * needs the customer's credential and happens on `/org/pickup`, never from a
- * row. Every action is a request the backend decides — the row shown afterwards
+ * row. An owner or manager can also cancel an order whose status still allows it
+ * (a dialog asks for one of the approved reasons first); the resulting row shows who
+ * cancelled it and, for a paid order, where its refund stands — to staff too, who
+ * cannot cancel (`canCancelOrders`). Every action is a request the backend decides — the row shown afterwards
  * is the server's own answer, and a refused action refreshes the list rather than
  * trusting what was on screen. Orders can't be changed in any other way here, and
  * nothing is shown to customers beyond their order's status.
@@ -69,7 +74,7 @@ export function OrganizationOrdersPage({ organizationId, role }: OrganizationOrd
     replaceOrder,
   } = useOrganizationOrders(organizationId, outletId);
   const { status: outletsStatus, outlets } = useOutlets(organizationId);
-  const { pendingOrderIds, errors: actionErrors, run: runAction } = useOrderFulfillment({
+  const { pendingOrderIds, errors: actionErrors, run: runAction, cancel: cancelOrder, retryRefund } = useOrderFulfillment({
     organizationId,
     onOrderUpdated: replaceOrder,
     onNeedsRefresh: refresh,
@@ -78,6 +83,54 @@ export function OrganizationOrdersPage({ organizationId, role }: OrganizationOrd
 
   const pageRef = useRef<HTMLDivElement>(null);
   useOnBecameVisible(pageRef, refresh);
+
+  // The cancellation dialog follows the list: it shows the order as the list last reported it, and
+  // closes if that order is gone or has moved past cancelling (cancelled elsewhere, picked up, ...).
+  const [cancelTargetId, setCancelTargetId] = useState<string | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: 'success' | 'info'; text: string } | null>(null);
+  const noticeRef = useRef<HTMLParagraphElement>(null);
+  const liveTarget = cancelTargetId === null ? undefined : orders.find((order) => order.id === cancelTargetId);
+  const dialogOrder = liveTarget && isOrderCancellable(liveTarget) ? liveTarget : null;
+  if (cancelTargetId !== null && dialogOrder === null) {
+    // Adjusting state while rendering, as React documents: the dialog can't stay open on this order.
+    setCancelTargetId(null);
+    setCancelError(null);
+    if (liveTarget && liveTarget.status !== 'cancelled') {
+      setNotice({
+        kind: 'info',
+        text: `Order #${liveTarget.id} changed while you were deciding, so it can no longer be cancelled.`,
+      });
+    }
+  }
+  const cancelPending = dialogOrder !== null && pendingOrderIds.has(dialogOrder.id);
+
+  // Focus has nowhere to return to once the Cancel button is gone, so a completed cancellation takes it.
+  useEffect(() => {
+    if (notice?.kind === 'success') {
+      noticeRef.current?.focus();
+    }
+  }, [notice]);
+
+  async function confirmCancel(orderId: string, reason: OrganizationCancellationReason) {
+    setCancelError(null);
+    const outcome = await cancelOrder(orderId, reason);
+    if (outcome.kind === 'cancelled') {
+      setNotice({ kind: 'success', text: `Order #${orderId} was cancelled.` });
+      setCancelTargetId(null);
+    } else if (outcome.kind === 'refused') {
+      setCancelTargetId(null);
+    } else if (outcome.kind === 'failed') {
+      setCancelError(outcome.message);
+    }
+  }
+
+  async function confirmRetryRefund(orderId: string) {
+    setNotice(null);
+    if (await retryRefund(orderId)) {
+      setNotice({ kind: 'success', text: `A new refund was started for order #${orderId}.` });
+    }
+  }
 
   let content: ReactNode;
   if (status === 'loading') {
@@ -121,11 +174,18 @@ export function OrganizationOrdersPage({ organizationId, role }: OrganizationOrd
           renderActions={
             canFulfillOrders(role)
               ? (order) => (
-                  <OrderFulfillmentActions
+                  <OrganizationOrderActions
                     order={order}
+                    role={role}
                     pending={pendingOrderIds.has(order.id)}
                     error={actionErrors[order.id] ?? null}
                     onRun={runAction}
+                    onCancel={(orderId) => {
+                      setNotice(null);
+                      setCancelError(null);
+                      setCancelTargetId(orderId);
+                    }}
+                    onRetryRefund={confirmRetryRefund}
                   />
                 )
               : undefined
@@ -188,8 +248,38 @@ export function OrganizationOrdersPage({ organizationId, role }: OrganizationOrd
             </p>
           )}
 
+          {notice !== null && (
+            <p
+              ref={noticeRef}
+              tabIndex={-1}
+              role="status"
+              className={`rounded-lg border px-3 py-2 text-sm outline-none ${
+                notice.kind === 'success'
+                  ? 'border-success/30 bg-success/10 text-text'
+                  : 'border-warning/30 bg-warning/10 text-text'
+              }`}
+            >
+              {notice.text}
+            </p>
+          )}
+
           {content}
         </div>
+
+        <CancelOrganizationOrderDialog
+          order={dialogOrder}
+          pending={cancelPending}
+          errorMessage={cancelError}
+          onConfirm={(reason) => {
+            if (dialogOrder) {
+              void confirmCancel(dialogOrder.id, reason);
+            }
+          }}
+          onClose={() => {
+            setCancelTargetId(null);
+            setCancelError(null);
+          }}
+        />
       </IonContent>
     </IonPage>
   );

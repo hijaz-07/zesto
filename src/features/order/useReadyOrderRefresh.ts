@@ -1,10 +1,36 @@
 import { useEffect, useState } from 'react';
 import { ApiError } from '../../lib/api/client';
 import { getOrder } from './api';
-import type { Order } from './types';
+import { isTerminalRefundStatus, type Order } from './types';
 
 /** How often a Ready order is re-read while the page is on screen. */
 export const READY_ORDER_REFRESH_MS = 10_000;
+
+/**
+ * How often a cancelled order whose refund is still in flight is re-read. A
+ * refund settles over minutes to days, so this is deliberately slow.
+ */
+export const REFUND_REFRESH_MS = 30_000;
+
+/**
+ * How long this order should wait between re-reads, or `null` if it should not
+ * be re-read at all. Only two situations change under a customer who is simply
+ * looking at the page: a Ready order being collected, and a cancelled order's
+ * refund (`requested` or `pending`) being settled. Every other order, and a refund
+ * that has `processed` or `failed`, is left alone.
+ */
+function refreshIntervalMs(order: Order | null | undefined): number | null {
+  if (!order) {
+    return null;
+  }
+  if (order.status === 'ready') {
+    return READY_ORDER_REFRESH_MS;
+  }
+  if (order.status === 'cancelled' && order.refund && !isTerminalRefundStatus(order.refund.status)) {
+    return REFUND_REFRESH_MS;
+  }
+  return null;
+}
 
 /** Whether `a` was last changed after `b` (an unreadable timestamp is never "newer"). */
 function isNewer(a: Order, b: Order): boolean {
@@ -17,21 +43,29 @@ function isPermanentFailure(error: unknown): boolean {
 }
 
 /**
- * Keeps a customer's READY order fresh while they stand at the counter, so
- * their screen moves on to "Picked up" without a manual refresh. It re-reads
- * the order through the existing order-detail API (`getOrder`) about every ten
- * seconds, and ONLY under all of these:
+ * Keeps a customer's order fresh while it is in a state that changes without
+ * them doing anything:
  *
- * - the order on screen is `ready` — never for `pending_payment`, `confirmed`,
- *   `preparing`, `picked_up`, `completed` or `cancelled`;
+ * - a READY order, while they stand at the counter, so their screen moves on to
+ *   "Picked up" without a manual refresh — about every ten seconds;
+ * - a CANCELLED order whose refund is still `requested` or `pending`, so the
+ *   refund card moves on to "processed" or "failed" — every thirty seconds, and
+ *   not at all once the refund has settled either way.
+ *
+ * It re-reads the order through the existing order-detail API (`getOrder`), and
+ * ONLY under all of these:
+ *
+ * - the order on screen is one of the two above — never for `pending_payment`,
+ *   `confirmed`, `preparing`, `picked_up`, `completed`, or a cancelled order
+ *   with no refund in flight;
  * - the component is mounted;
  * - the page is visible. When the tab or window goes hidden the timer is
  *   cleared and nothing is requested; when it becomes visible again the order
  *   is re-read at once (it may have moved while the customer was away) and the
  *   ten-second beat resumes.
  *
- * It stops the instant a read shows the order is no longer `ready` — the timer
- * is not rescheduled — and on unmount. It never overlaps requests (the next
+ * It stops the instant a read shows the order no longer needs it (no longer
+ * `ready`, or its refund settled) — the timer is not rescheduled — and on unmount. It never overlaps requests (the next
  * read is scheduled only after the previous one finishes), and a failed read
  * changes nothing on screen: a network or server hiccup just waits for the next
  * beat, while a 401/403/404 stops it for good. Deliberately NOT a general
@@ -50,14 +84,15 @@ export function useReadyOrderRefresh(order: Order | null): Order | null {
   const current =
     order && refreshed && refreshed.id === order.id && !isNewer(order, refreshed) ? refreshed : order;
   const orderId = current?.id;
-  const polling = current?.status === 'ready';
+  const intervalMs = refreshIntervalMs(current);
 
   useEffect(() => {
-    if (!polling || orderId === undefined) {
+    if (intervalMs === null || orderId === undefined) {
       return;
     }
-    // Declared as a plain string so the hoisted functions below see it as one.
+    // Declared as plain values so the hoisted functions below see them as such.
     const id: string = orderId;
+    const beat: number = intervalMs;
 
     let cancelled = false;
     let inFlight = false;
@@ -70,7 +105,7 @@ export function useReadyOrderRefresh(order: Order | null): Order | null {
     };
     const scheduleNext = () => {
       stopTimer();
-      timer = setTimeout(() => void read(), READY_ORDER_REFRESH_MS);
+      timer = setTimeout(() => void read(), beat);
     };
 
     async function read() {
@@ -90,8 +125,9 @@ export function useReadyOrderRefresh(order: Order | null): Order | null {
           return;
         }
         setRefreshed(latest);
-        if (latest.status !== 'ready') {
-          return; // Moved on: stop right here, without waiting for the re-render.
+        if (refreshIntervalMs(latest) !== beat) {
+          // Moved on (or onto a different beat): stop right here, without waiting for the re-render, which restarts it if need be.
+          return;
         }
         scheduleNextIfVisible();
       } catch (error: unknown) {
@@ -126,7 +162,7 @@ export function useReadyOrderRefresh(order: Order | null): Order | null {
       stopTimer();
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [polling, orderId]);
+  }, [intervalMs, orderId]);
 
   return current;
 }

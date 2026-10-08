@@ -127,3 +127,77 @@ export function completeOrderErrorMessage(error: unknown): string {
   }
   return "Couldn't reach Zesto. Please check your connection and try again.";
 }
+
+/**
+ * Whether a failed cancellation leaves it unknown whether the order was
+ * cancelled: the request was sent but no usable answer came back (the connection
+ * dropped, a 5xx other than 503, an answer that was not the expected shape). A
+ * 503 means the request was not processed, and a 4xx is a definite refusal.
+ */
+export function cancelOutcomeUnknown(error: unknown): boolean {
+  if (!(error instanceof ApiError)) {
+    return true;
+  }
+  return error.status === 200 || (error.status >= 500 && error.status !== 503);
+}
+
+/**
+ * Maps a failed organization cancellation to a message for the person who asked
+ * for it. A 403 says only that they may not do this (it does not explain the
+ * organization's roles or reveal anything about the order); a 409 and a 404 say
+ * the list on screen was out of date and has been refreshed; a lost answer says
+ * so plainly and does not claim either outcome. Repeating a cancellation is safe,
+ * which is why the last case invites another try.
+ */
+export function cancelOrganizationOrderErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.status) {
+    case 400:
+      return 'Choose a reason for cancelling this order.';
+    case 401:
+      return 'Your session has expired. Please sign in again.';
+    case 403:
+      return "You don't have permission to cancel orders.";
+    case 404:
+      return "This order couldn't be found. The list has been refreshed.";
+    case 409:
+      return 'This order has changed since you opened it and can no longer be cancelled. The list has been refreshed.';
+    case 503:
+      return 'Zesto is temporarily unavailable. The order was not cancelled. Please try again in a moment.';
+    default:
+      if (!cancelOutcomeUnknown(error)) {
+        return "Couldn't cancel this order. Please try again.";
+      }
+    }
+  }
+  return "Couldn't confirm the cancellation. The order may or may not have been cancelled — check its status below, or try again.";
+}
+
+/**
+ * Maps a failed refund retry to a message for the person who pressed it. A 403 says
+ * only that they may not do this; a 404 and a 409 say the list on screen was out of
+ * date and has been refreshed (the refund may already have been retried, or never
+ * failed); a lost answer says so plainly and does not claim either outcome, and
+ * does not invite a blind repeat — the refreshed row shows whether a new refund exists.
+ */
+export function retryRefundErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    switch (error.status) {
+    case 401:
+      return 'Your session has expired. Please sign in again.';
+    case 403:
+      return "You don't have permission to retry refunds.";
+    case 404:
+      return "This order couldn't be found. The list has been refreshed.";
+    case 409:
+      return "This refund can't be retried right now: it may already have been retried, or it hasn't failed. The list has been refreshed.";
+    case 503:
+      return 'Zesto is temporarily unavailable. The refund was not retried. Please try again in a moment.';
+    default:
+      if (!cancelOutcomeUnknown(error)) {
+        return "Couldn't retry this refund. Please try again.";
+      }
+    }
+  }
+  return "Couldn't confirm the retry. A new refund may or may not have been started — check the order's refund status once the list refreshes.";
+}

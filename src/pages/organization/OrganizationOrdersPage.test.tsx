@@ -44,6 +44,9 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+/** Any button but 'Cancel order': an owner or manager also gets that one, and these assertions are about fulfilment actions. */
+const NOT_CANCEL = /^(?!Cancel order)/;
+
 function renderPage(organizationId = 'org-1', role: OrganizationMemberRole = 'owner') {
   return render(
     <MemoryRouter initialEntries={['/org/orders']}>
@@ -742,7 +745,7 @@ describe('OrganizationOrdersPage', () => {
         expect(within(rowOf('order-confirmed-1')).getByRole('button', { name: /Start preparing/ })).toBeInTheDocument();
         expect(within(rowOf('order-preparing-5')).getByRole('button', { name: /Mark ready/ })).toBeInTheDocument();
         for (const id of ['order-ready-6', 'order-pending-2', 'order-cancelled-3']) {
-          expect(within(rowOf(id)).queryByRole('button')).not.toBeInTheDocument();
+          expect(within(rowOf(id)).queryByRole('button', { name: NOT_CANCEL })).not.toBeInTheDocument();
         }
         expect(screen.getAllByRole('button', { name: /Start preparing|Mark ready/ })).toHaveLength(2);
       });
@@ -873,7 +876,7 @@ describe('OrganizationOrdersPage', () => {
         action.resolve({ ...readyOrgOrder, id: 'order-preparing-5' });
 
         await waitFor(() => expect(within(rowOf('order-preparing-5')).getByText('Ready')).toBeInTheDocument());
-        expect(within(rowOf('order-preparing-5')).queryByRole('button')).not.toBeInTheDocument();
+        expect(within(rowOf('order-preparing-5')).queryByRole('button', { name: NOT_CANCEL })).not.toBeInTheDocument();
         expect(screen.queryByText('Mark this order ready?')).not.toBeInTheDocument();
       });
     });
@@ -891,7 +894,7 @@ describe('OrganizationOrdersPage', () => {
         await screen.findByRole('table');
 
         expect(within(rowOf('order-ready-6')).getByText('Awaiting pickup')).toBeInTheDocument();
-        expect(within(rowOf('order-ready-6')).queryByRole('button')).not.toBeInTheDocument();
+        expect(within(rowOf('order-ready-6')).queryByRole('button', { name: NOT_CANCEL })).not.toBeInTheDocument();
         expect(within(rowOf('order-picked-up-7')).getByRole('button', { name: /Mark completed/ })).toBeInTheDocument();
         expect(within(rowOf('order-completed-8')).queryByRole('button')).not.toBeInTheDocument();
         expect(within(rowOf('order-completed-8')).queryByText('Awaiting pickup')).not.toBeInTheDocument();
@@ -1006,7 +1009,7 @@ describe('OrganizationOrdersPage', () => {
         expect(alert).toHaveTextContent('This order has changed since you loaded it. The list has been refreshed.');
         await waitFor(() => expect(mockedList).toHaveBeenCalledTimes(2));
         await waitFor(() => expect(within(rowOf('order-confirmed-1')).getByText('Ready')).toBeInTheDocument());
-        expect(within(rowOf('order-confirmed-1')).queryByRole('button')).not.toBeInTheDocument();
+        expect(within(rowOf('order-confirmed-1')).queryByRole('button', { name: NOT_CANCEL })).not.toBeInTheDocument();
       });
 
       it("on a 409 from Mark ready: closes the confirmation and shows the order's real state", async () => {

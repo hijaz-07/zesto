@@ -10,8 +10,9 @@ import {orderRefFor, paymentRefFor, type RefundLocation} from "./refundTransitio
 import {parseRefund, refundIdFor, type RefundInitiatorRole} from "./refunds";
 
 /**
- * Starting a NEW refund attempt after one `failed` — the system capability only;
- * no route exposes it yet (a later checkpoint adds the owner/manager retry).
+ * Starting a NEW refund attempt after one `failed`. The one implementation: the
+ * owner/manager route (`POST .../orders/{orderId}/retry-refund`, see
+ * `orderRefundRetry.ts`) only decides who may ask and which order, then calls this.
  *
  * A failed refund is terminal and is never reopened: the retry is a new document
  * with the next deterministic ID (`${orderId}-r${seq}`) and therefore a new
