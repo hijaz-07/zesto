@@ -28,7 +28,8 @@
           { "key": "X-Content-Type-Options", "value": "nosniff" },
           { "key": "X-Frame-Options", "value": "DENY" },
           { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
-          { "key": "Permissions-Policy", "value": "camera=(self), microphone=(), geolocation=()" }
+          { "key": "Permissions-Policy", "value": "camera=(self), microphone=(), geolocation=()" },
+          { "key": "Content-Security-Policy-Report-Only", "value": "default-src 'self'; script-src 'self' https://checkout.razorpay.com https://static.descope.com https://static2.descope.com https://descopecdn.com https://cdn.jsdelivr.net https://fpnpmcdn.net https://accounts.google.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' data: https://fonts.gstatic.com https://static.descope.com https://static2.descope.com https://descopecdn.com; img-src 'self' data: blob: https://cdn.razorpay.com https://static.descope.com https://static2.descope.com https://descopecdn.com; connect-src 'self' https://*.descope.com https://descopecdn.com https://cdn.jsdelivr.net https://fpnpmcdn.net https://api.razorpay.com https://lumberjack.razorpay.com https://checkout.razorpay.com https://accounts.google.com; frame-src https://api.razorpay.com https://checkout.razorpay.com https://accounts.google.com; worker-src 'self' blob:; media-src 'self' blob:; manifest-src 'self'; object-src 'none'; base-uri 'self'" }
         ]
       },
       {

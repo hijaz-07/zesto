@@ -93,8 +93,8 @@ export interface RazorpayRefundGatewayOptions {
   timeoutMs?: number;
 }
 
-interface RequestSpec<T> {
-  operation: "createRefund" | "fetchRefund" | "listPaymentRefunds" | "fetchPayment";
+export interface RequestSpec<T> {
+  operation: "createRefund" | "fetchRefund" | "listPaymentRefunds" | "fetchPayment" | "listOrderPayments";
   method: "GET" | "POST";
   path: string;
   query?: Record<string, string>;
@@ -335,7 +335,7 @@ function malformedFailure(spec: RequestSpec<unknown>, status: number): RefundPro
  * @return {string} The ID, if it is safe to place in a URL path.
  * @throws {ProviderRefundRejectedError} If it is not (a local bug; nothing is sent).
  */
-function requireProviderId(value: string, label: string): string {
+export function requireProviderId(value: string, label: string): string {
   if (!PROVIDER_ID_PATTERN.test(value)) {
     throw new ProviderRefundRejectedError("invalid_input", `The ${label} is not a valid provider ID.`);
   }
@@ -343,11 +343,18 @@ function requireProviderId(value: string, label: string): string {
 }
 
 /**
+ * The one bounded HTTP request Razorpay's server API is called through: credentials →
+ * timeout → send → classify → parse. Shared by the refund gateway below and the payment
+ * lookup gateway (`razorpayPayments.ts`), so both get the same timeout, the same
+ * credential redaction and the same typed failures.
+ *
  * @param {RazorpayRefundGatewayOptions} options Credentials, and test seams.
- * @return {RefundProviderGateway} The Razorpay refund gateway.
+ * @return {<T>(spec: RequestSpec<T>) => Promise<T>} The request function.
  * @throws {Error} If `timeoutMs` is out of range.
  */
-export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOptions): RefundProviderGateway {
+export function createRazorpayRequester(
+  options: RazorpayRefundGatewayOptions,
+): <T>(spec: RequestSpec<T>) => Promise<T> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_REFUND_REQUEST_TIMEOUT_MS;
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_REFUND_REQUEST_TIMEOUT_MS) {
     throw new Error(`timeoutMs must be a whole number from 1 to ${MAX_REFUND_REQUEST_TIMEOUT_MS}.`);
@@ -356,8 +363,6 @@ export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOption
   const fetchFn: FetchLike = options.fetchFn ?? ((url, init) => fetch(url, init));
 
   /**
-   * One bounded HTTP request: credentials → timeout → send → classify → parse.
-   *
    * @param {RequestSpec<T>} spec The request.
    * @return {Promise<T>} The parsed, normalized answer.
    * @template T
@@ -406,7 +411,7 @@ export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOption
       bodyText = await response.text();
     } catch {
       const failure = transportFailure(spec, timedOut);
-      logger.warn("razorpay refund request did not complete", {
+      logger.warn("razorpay request did not complete", {
         operation: spec.operation, category: failure.category, code: failure.code,
       });
       throw failure;
@@ -416,7 +421,7 @@ export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOption
 
     if (status < 200 || status > 299) {
       const failure = classifyHttpFailure(spec, status, bodyText, credentials);
-      logger.warn("razorpay refund request failed", {
+      logger.warn("razorpay request failed", {
         operation: spec.operation, category: failure.category, code: failure.code, httpStatus: status,
       });
       throw failure;
@@ -428,12 +433,23 @@ export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOption
       return spec.parse(JSON.parse(bodyText));
     } catch {
       const failure = malformedFailure(spec, status);
-      logger.warn("razorpay refund response unreadable", {
+      logger.warn("razorpay response unreadable", {
         operation: spec.operation, category: failure.category, code: failure.code, httpStatus: status,
       });
       throw failure;
     }
   }
+
+  return send;
+}
+
+/**
+ * @param {RazorpayRefundGatewayOptions} options Credentials, and test seams.
+ * @return {RefundProviderGateway} The Razorpay refund gateway.
+ * @throws {Error} If `timeoutMs` is out of range.
+ */
+export function createRazorpayRefundGateway(options: RazorpayRefundGatewayOptions): RefundProviderGateway {
+  const send = createRazorpayRequester(options);
 
   return {
     async createRefund(input: CreateProviderRefundInput): Promise<ProviderRefund> {

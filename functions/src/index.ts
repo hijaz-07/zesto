@@ -25,8 +25,10 @@ import {createOutletRoutes} from "./routes/outlets";
 import {createWebhookRoutes} from "./routes/webhooks";
 import {handleNotificationEventCreated} from "./domain/notificationEventTrigger";
 import {pickupCredentialSecret} from "./domain/pickupCredential";
+import {reconcileDuePayments} from "./domain/paymentReconciliation";
 import {handleRefundCreated, reconcileDueRefunds} from "./domain/refundReconciliation";
 import {razorpayKeySecret, razorpayWebhookSecret} from "./providers/razorpay";
+import {getRazorpayPaymentLookupGateway} from "./providers/razorpayPayments";
 import {getRazorpayRefundGateway} from "./providers/razorpayRefunds";
 
 // For cost control, you can set the maximum number of containers that can be
@@ -193,5 +195,28 @@ export const reconcileRefunds = onSchedule(
   async () => {
     const summary = await reconcileDueRefunds(getAdminFirestore(), getRazorpayRefundGateway());
     logger.info("Refund reconciliation finished.", summary);
+  },
+);
+
+/**
+ * The payment safety net: every 15 minutes, looks at a bounded batch of payments that
+ * might have been captured without Zesto hearing about it (the browser closed before
+ * Checkout verification AND the webhook was missed or refused) and adopts a capture the
+ * provider confirms, through the same trusted `markPaymentSucceeded` as the other paths
+ * (see `domain/paymentReconciliation.ts`). Read-only towards Razorpay. Safe if two runs
+ * overlap. Deploying it needs the Cloud Scheduler API enabled on the project and the
+ * `payments.reconciliation.nextAttemptAt` collection-group index READY.
+ */
+export const reconcilePayments = onSchedule(
+  {
+    schedule: "every 15 minutes",
+    region: "asia-south1",
+    timeoutSeconds: 540,
+    maxInstances: 1,
+    secrets: [razorpayKeySecret],
+  },
+  async () => {
+    const summary = await reconcileDuePayments(getAdminFirestore(), getRazorpayPaymentLookupGateway());
+    logger.info("Payment reconciliation finished.", summary);
   },
 );

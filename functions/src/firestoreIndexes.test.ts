@@ -116,11 +116,13 @@ describe("firestore.indexes.json", () => {
       "orders.id",
       "payments.providerOrderId",
       "payments.providerPaymentId",
+      // The payment reconciliation sweep (`reconcileDuePayments`): range + order on this one field.
+      "payments.reconciliation.nextAttemptAt",
       "refunds.providerRefundId",
     ]) {
       expect(overrides.find((o) => o.key === key)?.scopes, key).toContain("COLLECTION_GROUP");
     }
     expect(overrides.find((o) => o.key === "outlets.id")?.scopes).toEqual(["COLLECTION", "COLLECTION_GROUP"]);
-    expect(file.fieldOverrides).toHaveLength(5);
+    expect(file.fieldOverrides).toHaveLength(6);
   });
 });

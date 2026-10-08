@@ -13,13 +13,13 @@ recovery), [production-e2e-plan.md](./production-e2e-plan.md),
 
 | # | Severity | Finding | Status |
 | - | -------- | ------- | ------ |
-| 1 | Medium | **No payment reconciliation.** Refunds have a scheduled safety net (`reconcileRefunds`); payments do not. A payment captured while *both* the customer's `payment/verify` call and Razorpay's webhook deliveries fail leaves the order `pending_payment` with money taken. | Open — recommended follow-up (see [Razorpay](#razorpay)) |
-| 2 | Medium | **No separate staging environment.** One Firebase project (`zesto-dev-2026`) and one Descope project serve development *and* production; production builds read the deploying machine's `.env.local`. | Open — recommend a staging project before Live Mode |
+| 1 | Medium | **No payment reconciliation.** A payment captured while *both* the customer's `payment/verify` call and Razorpay's webhook deliveries fail leaves the order `pending_payment` with money taken. | **Built in 4.6, not deployed** — `reconcilePayments` (see [payment-reconciliation.md](./payment-reconciliation.md)) |
+| 2 | Medium | **No separate staging environment.** One Firebase project (`zesto-dev-2026`) and one Descope project serve development *and* production; production builds read the deploying machine's `.env.local`; dev and production share one Razorpay Test namespace. | **Open — designed, not created.** Console-only steps; exact plan and a read-only guard (`npm run check:env`) in [environments.md](./environments.md). Required before Live Mode |
 | 3 | Medium | **Backups and monitoring are not defined in the repo.** No PITR/scheduled-backup configuration, no TTL on growing operational collections, no alert policies. | Open — exact setup in the [runbook](./deployment-runbook.md#recovery-plan) and [Observability](#observability) |
 | 4 | Medium | **No abuse limits on the API.** | **Mitigated in this checkpoint** — per-user best-effort limiter (`http/rateLimit.ts`); global limit remains future work |
 | 5 | Medium | **Razorpay order create/fetch had no timeout** (the SDK sets none) — a hung connection held a customer request until the function's 60 s limit. | **Fixed** — 15 s bound, `PaymentProviderError` on expiry |
 | 6 | Medium (probable) | **Missing collection-scope composite index** `menus (status, menuDate, createdAt)`. `listUpcomingPublishedMenusForOutlet` filters one outlet's `menus` collection by `status` + range on `menuDate`; only the *collection-group* variant was defined. The emulator does not enforce indexes, so no test could catch this. | **Fixed (additive)** — index added and pinned by `firestoreIndexes.test.ts`. Verify against the live index list; if the live project already has it the deploy is a no-op |
-| 7 | Low | No baseline security headers on Hosting (clickjacking, MIME sniffing, referrer, camera scope). | **Fixed** — `firebase.json` headers, pinned by `hostingConfig.test.ts`. A CSP is still outstanding (see [Hosting headers](#hosting-headers-and-csp)) |
+| 7 | Low | No baseline security headers on Hosting (clickjacking, MIME sniffing, referrer, camera scope). | **Fixed** — `firebase.json` headers, pinned by `hostingConfig.test.ts`. A **`Content-Security-Policy-Report-Only`** header was added in 4.6; enforcement waits for collected violations (see [Hosting headers](#hosting-headers-and-csp)) |
 | 8 | Low | Organization membership is organization-wide: any active member can act on every outlet of the organization. By design today; relevant before multi-outlet SaaS. | Documented |
 | 9 | Low | `POST /organizations` is open to any authenticated user (now capped at 10/hour/user per instance). | Documented |
 | 10 | Low | Descope's browser SDK keeps session tokens in browser storage (its default). An XSS would expose them; a CSP is the compensating control. | Documented |
@@ -29,7 +29,8 @@ recovery), [production-e2e-plan.md](./production-e2e-plan.md),
 
 **Critical: none. High: none confirmed.** No secret, key or credential is committed, the
 client has no path to payment, ownership or authorization state, and every Firestore rule
-is `if false`.
+is `if false` — intentionally, and verified in 4.6 to match how the frontend works (see
+[Firestore access architecture](#firestore-access-architecture)).
 
 ## 1. Environment and secrets
 
@@ -130,8 +131,8 @@ Added to every page: `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 `Permissions-Policy: camera=(self), microphone=(), geolocation=()` (the camera stays available to
 the app itself for the pickup QR scanner).
 
-A **Content-Security-Policy is not added** and should be introduced as
-`Content-Security-Policy-Report-Only` first: the page legitimately loads Razorpay Checkout
+**Update (4.6):** a `Content-Security-Policy-Report-Only` header is now served on every page (see
+[CSP status](#csp-status-checkpoint-46) below). It was originally recommended as follows: the page legitimately loads Razorpay Checkout
 (script from `checkout.razorpay.com`, frames/connect to `api.razorpay.com` and
 `lumberjack.razorpay.com`) and Descope's flow (`api.descope.com`, `static.descope.com`), plus
 Ionic/Tailwind inline styles. A wrong enforced CSP would break payment or sign-in, and neither
@@ -156,7 +157,8 @@ Audited by reading the integration (no network call, no Dashboard change):
 | Failed webhook delivery | Razorpay redelivers non-2xx responses for a bounded period; every handler is idempotent. |
 | Logging | Provider errors log `statusCode`/`code`/`description` only; the webhook body, signature, secrets and `Authorization` header are never logged. |
 
-**Gap (Medium) — payments are not reconciled.** If a payment is captured but both the
+**Gap (Medium) — payments were not reconciled; closed in 4.6 (undeployed).** See
+[payment-reconciliation.md](./payment-reconciliation.md). Original finding: if a payment is captured but both the
 browser's `payment/verify` call and every webhook delivery fail (e.g. a long outage that
 outlasts Razorpay's redelivery window), the order stays `pending_payment` and nothing polls
 Razorpay for it. Recommended follow-up (not built here — it adds a second scheduled job that
@@ -164,6 +166,57 @@ calls the provider): a bounded sweep of `pending_payment` orders older than N mi
 fetches the provider order's payments and routes any captured one through the existing
 `markPaymentSucceeded`. Until then, the runbook's *post-outage payment check* (compare the
 Razorpay Dashboard's captured payments with Zesto's `pending_payment` orders) covers it.
+
+### CSP status (Checkpoint 4.6)
+
+`firebase.json` now sends, on every page, `Content-Security-Policy-Report-Only` (it **enforces nothing**; a test asserts
+there is no enforcing `Content-Security-Policy`). Built from what the shipped bundle actually references:
+
+| Directive | Allows | Why |
+| --------- | ------ | --- |
+| `script-src` | `self`; `checkout.razorpay.com`; Descope (`static.descope.com`, `static2.descope.com`, `descopecdn.com`, `cdn.jsdelivr.net` fallback); `fpnpmcdn.net` (Descope fingerprint loader); `accounts.google.com` (Google sign-in, if the flow uses it) | The built `index.html` has **no inline script** and the bundle uses no WebAssembly, so no `unsafe-inline` / `unsafe-eval` |
+| `connect-src` | `self` (the `/api` rewrite), `*.descope.com` (the API host is regional), Descope CDNs, `api.razorpay.com`, `lumberjack.razorpay.com`, `checkout.razorpay.com`, `accounts.google.com` | Sign-in and Checkout network calls |
+| `frame-src` | `api.razorpay.com`, `checkout.razorpay.com`, `accounts.google.com` | Checkout renders in an iframe |
+| `style-src` | `self`, `unsafe-inline`, Google Fonts | Ionic / Tailwind / web-component inline styles |
+| `img-src`, `font-src` | `self`, `data:`, `blob:`, `cdn.razorpay.com`, Descope hosts, Google Fonts | Checkout and Descope assets; the pickup QR is inline SVG (no image source needed) |
+| `object-src 'none'`, `base-uri 'self'`, `worker-src`, `media-src`, `manifest-src` | tight | no plugins, no `<base>` injection |
+| **Deliberately absent** | `form-action` (Checkout redirects to banks), `frame-ancestors` (ignored in Report-Only; `X-Frame-Options: DENY` covers it), any Firebase data endpoint (the frontend uses none — see below), `report-uri` (see below) | |
+
+**First measurement (4.6, local).** The built app was served by a throwaway local server that applies `firebase.json`'s
+headers (the Firebase Hosting emulator does **not** apply custom headers at all — neither the existing security headers
+nor this one — so the served header can only be confirmed after a real deploy; runbook smoke check 4). Loading `/login`
+(no sign-in, nothing submitted) produced exactly one report: *"Evaluating a string as JavaScript violates … 'unsafe-eval'"*.
+The app's own bundle contains no `eval`/`new Function`; **`@descope/web-components-ui@3.20.4`, which the Descope SDK injects
+from `descopecdn.com`, contains one `new Function(`** — the likely source. Its allowed origin was loaded without any
+other violation. **Consequence:** enforcing this policy as written might degrade the Descope sign-in UI; whether it
+actually does cannot be known without a real sign-in. Do **not** add `'unsafe-eval'` pre-emptively (it weakens
+`script-src` for the whole app); test an enforced policy on staging first, and add it only if sign-in breaks and
+Descope offers no alternative. Razorpay Checkout has not been exercised, so its origins are unverified.
+
+**Not enforced, and not fully measured.** There is deliberately **no report endpoint**: it would be a new unauthenticated write
+surface. Violations show in the browser console as `[Report Only] Refused to …`. **Next step:** run the
+[production E2E plan](./production-e2e-plan.md) (sign-in, order, Razorpay Checkout, pickup) with DevTools open, add any
+legitimately blocked origin, and only then rename the header to `Content-Security-Policy`.
+
+### Firestore access architecture
+
+The rules are `allow read, write: if false` for **every** path (plus a final catch-all deny). Verified as intentional
+and correct:
+
+```
+Frontend ──HTTPS /api/** (Hosting rewrite)──▶ Cloud Function `api`: verify Descope session, authorize, validate
+                                              ──Admin SDK (bypasses rules)──▶ Firestore
+```
+
+- No application source imports Firestore, Storage, Functions or Auth from the Firebase SDK. `src/lib/firebase.ts`
+  initialises the SDK but **nothing imports it** (dead code, left in place: removing it is unrelated to this
+  checkpoint); the built bundle contains no Firebase data endpoint.
+- The only network client for Zesto's own data is `src/lib/api/client.ts` (`/api/*`). Every feature (menus, orders,
+  payments, notifications, organization tools) uses it.
+- `src/lib/noDirectFirebaseAccess.test.ts` pins all of this, so adding a direct client read fails a test instead of
+  quietly requiring a rules change. **No production feature depends on direct Firestore access: no blocker.** The
+  rules were not modified.
+- `storage.rules` is likewise `if false`; Storage is not used by the frontend.
 
 ## 4. Descope and sessions
 

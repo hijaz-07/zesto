@@ -13,10 +13,12 @@ modified, cancelled, refunded, reused or tested against — in any step below.
 ## What production holds today (from project history — confirm in preflight)
 
 - Functions: `api`, `onNotificationEventCreated` (from commit `3cdffc1`). **Not yet deployed:**
-  cancellation routes, refund domain, `onRefundCreated`, `reconcileRefunds`, the refund retry route.
+  cancellation routes, refund domain, `onRefundCreated`, `reconcileRefunds`, the refund retry route, and — new in
+  4.6 — `reconcilePayments` (the payment safety net; see [payment-reconciliation.md](./payment-reconciliation.md)).
 - Indexes: the 11 from checkpoint 6, READY. **Not yet deployed:** `refunds (status, nextAttemptAt)`,
   the `payments.providerPaymentId` and `refunds.providerRefundId` collection-group field overrides, and — new in
-  4.5 — `menus (status, menuDate, createdAt)` at collection scope.
+  4.5 — `menus (status, menuDate, createdAt)` at collection scope, and — new in 4.6 — the `payments.reconciliation.nextAttemptAt`
+  collection-group field override (the payment sweep's query).
 - Rules: deployed in checkpoint 6A (locked down, all `if false`).
 - Hosting: the checkpoint-6 frontend (old: no cancellation/refund UI).
 - Razorpay webhook: subscribed to `payment.captured` and `payment.failed` only.
@@ -35,7 +37,7 @@ modified, cancelled, refunded, reused or tested against — in any step below.
 | 1 | `firebase deploy --only firestore:indexes` | 0 | Queries fail with `FAILED_PRECONDITION` until an index is **READY**; the refund trigger/reconciler and the webhook lookups use the new ones. Wait for every index to read READY before step 3. Additive; never needs `--force` |
 | 2 | `firebase deploy --only firestore:rules` | 0 | Independent of the Admin SDK paths, but cheap and must precede Hosting. Byte-identical to what 6A shipped unless `git diff` says otherwise |
 | 3a | `functions:onRefundCreated` | 1 (READY) | Create the consumer *before* any producer exists. Creates the Eventarc trigger |
-| 3b | `functions:reconcileRefunds` | 1 (READY), Cloud Scheduler API enabled | Creates the scheduler job |
+| 3b | `functions:reconcileRefunds`, `functions:reconcilePayments` | 1 (READY — incl. the `payments.reconciliation.nextAttemptAt` override), Cloud Scheduler API enabled | Creates the scheduler jobs. The payment sweep finds nothing until `api` (3d) starts scheduling payments, so deploying it earlier is harmless |
 | 3c | `functions:onNotificationEventCreated` | 1 | The updated processor must understand refund events **before** the API starts writing them; an old processor receiving an unknown event type would fail it permanently |
 | 3d | `functions:api` | 3a–3c | Last: this is what makes cancellation/refund-retry routes (the producers) and the refund webhook handlers live |
 | 4 | Verify Eventarc triggers | 3a, 3c | See checks below |
@@ -49,13 +51,14 @@ Razorpay webhook, smoke checks); 7 is the go/no-go gate between Hosting and the 
 
 ### 0. Preflight (read-only)
 
-1. Work from a clean checkout of the exact commit to release; record `git rev-parse HEAD`. The 4.5
-   changes and 7.7–7.9 are uncommitted at the time of writing — **committing them is a prerequisite and
-   needs its own instruction**; this plan never pushes.
+1. Work from a clean checkout of the exact commit to release; record `git rev-parse HEAD`. 7.7–7.9 and 4.5
+   are committed locally as `24eb4ff`; the 4.6 payment-reconciliation work is on top of it, uncommitted at the
+   time of writing. Nothing is pushed — **pushing needs its own instruction**.
 2. Run the gates: root `npm run lint`, `npm run typecheck`, `npm --prefix functions run typecheck`,
    `npx vitest run`, `npm run test:functions-emulator`, `npm run test:functions-trigger`,
    `npm run test:rules`, `npm run build`.
-3. Confirm the deploying machine's `.env.local` is the **production** frontend configuration
+3. Run `npm run check:env -- --env production` (read-only): it must print OK — correct Firebase project, matching
+   Descope ids, Razorpay **test** key. Then confirm the deploying machine's `.env.local` is the **production** frontend configuration
    (Firebase web config, `VITE_DESCOPE_PROJECT_ID`, `VITE_PUBLIC_SUPPORT_EMAIL`,
    `VITE_PUBLIC_OPERATOR_NAME`) — `vite build` bakes it in — and that `functions/.env.zesto-dev-2026`
    exists with `DESCOPE_PROJECT_ID` and a `RAZORPAY_KEY_ID` starting `rzp_test_`.
@@ -89,6 +92,7 @@ If the CLI offers to delete indexes that exist live but not in the file, answer 
 ```bash
 firebase deploy --only functions:onRefundCreated --project zesto-dev-2026
 firebase deploy --only functions:reconcileRefunds --project zesto-dev-2026
+firebase deploy --only functions:reconcilePayments --project zesto-dev-2026
 firebase deploy --only functions:onNotificationEventCreated --project zesto-dev-2026
 firebase deploy --only functions:api --project zesto-dev-2026
 ```
@@ -106,9 +110,9 @@ Two triggers should be ACTIVE in `asia-south1`: one for
 
 ### 5. Scheduler check
 
-One job for `reconcileRefunds` should exist, `ENABLED`, schedule `every 15 minutes`, region
-`asia-south1`. After the first scheduled tick, its log should show `Refund reconciliation finished.`
-with `examined: 0` (no refunds exist yet).
+Two jobs should exist — `reconcileRefunds` and `reconcilePayments` — each `ENABLED`, schedule `every 15 minutes`,
+region `asia-south1`. After the first scheduled tick, their logs should show `Refund reconciliation finished.` and
+`Payment reconciliation finished.` with `examined: 0` (nothing is scheduled yet).
 
 ### 6. Hosting
 
@@ -138,7 +142,7 @@ Do not change the URL or the secret.
 2. `GET /api/me` without a token → 401 with `WWW-Authenticate: Bearer`.
 3. `POST /api/webhooks/razorpay` with no signature → 401; with a wrong signature → 401 (nothing written).
 4. `/` response carries `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
-   `Permissions-Policy`; `/api/**` carries `Cache-Control: private, no-store`.
+   `Permissions-Policy` and `Content-Security-Policy-Report-Only` (and **no** enforcing `Content-Security-Policy`); `/api/**` carries `Cache-Control: private, no-store`.
 5. Logs: no `unhandled api error`; the scheduler tick logged `examined: 0`.
 6. Indexes all READY; Eventarc triggers ACTIVE; scheduler job ENABLED.
 7. Then run the [production E2E](./production-e2e-plan.md) with a fresh test customer — that is the
@@ -209,9 +213,13 @@ source of truth lives (Razorpay Dashboard, Descope console) outside the repo. No
    sees them in the org orders list and can use *Retry refund* only when the latest refund is `failed`.
    Check logs for `A refund needs attention`.
 2. **Payments.** Razorpay redelivers failed webhooks for a bounded period; deliveries are idempotent. For
-   an outage longer than that, compare Razorpay Dashboard *captured* payments with Zesto orders still
-   `pending_payment` and resolve each through the Dashboard/support (there is no automatic payment
-   sweep yet — audit finding 1).
+   anything longer, `reconcilePayments` asks Razorpay what it holds for each unresolved payment's own provider
+   order and adopts a confirmed capture through the same `markPaymentSucceeded` (25 per 15-minute run, oldest
+   first, for 7 days from creation). Nothing to do manually unless it flags a payment: search the logs for
+   `A payment needs attention.` and follow [payment-reconciliation.md §7](./payment-reconciliation.md#7-operator-procedures-for-a-flagged-payment).
+   Any `A payment captured at the provider was recovered by reconciliation.` line means the primary paths
+   missed a payment — find out why (webhook secret, subscription, outage). Payments created before 4.6 are
+   not swept; compare the Dashboard's *captured* list with `pending_payment` orders for those.
 3. **Notifications.** `notificationEvents` documents are the outbox; the trigger retries transient
    failures and marks exhausted ones `failed` (logged). Re-delivery of refund notifications is covered by
    `scripts/backfill-refund-notifications.mjs` (dry-run by default; real writes need the explicit flag and
@@ -223,7 +231,7 @@ source of truth lives (Razorpay Dashboard, Descope console) outside the repo. No
 
 ### Break-glass levers (no deploy needed)
 
-- Pause the refund sweep: pause the Scheduler job.
+- Pause the refund or payment sweep: pause its Scheduler job (`reconcileRefunds` / `reconcilePayments`).
 - Stop new customer orders: archive the menu (organization UI) — existing orders are untouched.
 - Stop all API writes quickly: shift `api` traffic to a known-good revision, or set the function's
   `max instances` to 0 in the Console (returns 5xx to everyone — last resort).

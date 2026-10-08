@@ -518,6 +518,43 @@ describe("ensureProviderOrder", () => {
     expect(result.payment.providerOrderId).toBe(result.providerOrderId);
   });
 
+  it("schedules reconciliation from the moment a customer could pay: first check due in 15 minutes, once", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway} = fakeGateway();
+    expect(payment.reconciliation).toBeUndefined();
+
+    const before = Date.now();
+    const first = await ensureProviderOrder(db, order.id, payment.id, gateway);
+    const scheduled = first.payment.reconciliation;
+
+    expect(scheduled).toMatchObject({attempts: 0, inconclusiveStreak: 0});
+    const dueAt = scheduled?.nextAttemptAt?.toMillis() ?? 0;
+    expect(dueAt).toBeGreaterThanOrEqual(before + 15 * 60 * 1000);
+    expect(dueAt).toBeLessThanOrEqual(Date.now() + 15 * 60 * 1000);
+    // A repeat reuses the provider order and does not reset the schedule.
+    const second = await ensureProviderOrder(db, order.id, payment.id, gateway);
+    expect(second.payment.reconciliation?.nextAttemptAt?.toMillis()).toBe(dueAt);
+    const stored = await db.collectionGroup("payments").where("reconciliation.nextAttemptAt", "==", first.payment.reconciliation?.nextAttemptAt).get();
+    expect(stored.docs.map((doc) => doc.id)).toContain(payment.id);
+  });
+
+  it("confirming the payment takes it out of the reconciliation sweep in the same transaction", async () => {
+    const {order, payment} = await preparedPayment();
+    const {gateway} = fakeGateway();
+    await ensureProviderOrder(db, order.id, payment.id, gateway);
+
+    const result = await markPaymentSucceeded(db, {
+      orderId: order.id, paymentId: payment.id, amountInPaise: payment.amountInPaise, currency: payment.currency,
+      providerPaymentId: "pay_scheduled_then_paid",
+    });
+
+    expect(result.payment.status).toBe("succeeded");
+    const raw = (await db.collectionGroup("payments").where("orderId", "==", order.id).get()).docs[0].data();
+    expect(raw.reconciliation.nextAttemptAt).toBeUndefined();
+    expect(raw.reconciliation.leaseExpiresAt).toBeUndefined();
+    expect(raw.reconciliation).toMatchObject({attempts: 0});
+  });
+
   it("never marks anything paid/confirmed: payment stays pending, order stays pending_payment", async () => {
     const {order, payment} = await preparedPayment();
     const {gateway} = fakeGateway();

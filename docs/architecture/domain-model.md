@@ -186,6 +186,15 @@ The payment record associated with an `Order` — amount, method,
 status, and any gateway reference. Payment status is authoritative
 only when confirmed server-side, never from client state.
 
+A payment reaches `succeeded` by exactly three server-side paths — Checkout
+verification, the Razorpay webhook, and **payment reconciliation** (a
+scheduled, read-only lookup of what the provider holds for the payment's own
+provider order, for a capture Zesto never heard about) — all through the one
+`markPaymentSucceeded` transition. Reconciliation state lives in an internal
+`reconciliation` map on the payment (never in an API response) and an audit
+subcollection `reconciliationAudit`; see
+`docs/operations/payment-reconciliation.md`.
+
 ### Pickup
 The collection event for an `Order` — when a customer collected their
 food, and which organization member handed it over. It is not a separate

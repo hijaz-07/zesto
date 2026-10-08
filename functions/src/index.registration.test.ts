@@ -56,6 +56,14 @@ describe("functions/src/index.ts registers every route module", () => {
     expect(indexSource).toMatch(/reconcileRefunds[\s\S]*?region: "asia-south1"/);
   });
 
+  it("exports the scheduled payment reconciliation, in asia-south1, as a single instance, with the Razorpay secret", () => {
+    expect(indexSource).toContain("export const reconcilePayments = onSchedule(");
+    expect(indexSource).toContain("reconcileDuePayments(");
+    expect(indexSource).toMatch(/reconcilePayments[\s\S]*?maxInstances: 1/);
+    expect(indexSource).toMatch(/reconcilePayments[\s\S]*?region: "asia-south1"/);
+    expect(indexSource).toMatch(/reconcilePayments[\s\S]*?secrets: \[razorpayKeySecret\]/);
+  });
+
   it("serves refund webhooks on the existing api function: no second webhook function exists", () => {
     expect(indexSource.split("= onRequest(").length - 1).toBe(1);
   });

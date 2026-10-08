@@ -14,6 +14,12 @@ import {
   type PaymentProviderGateway,
 } from "../providers/razorpay";
 import {recordNotificationEvent, recordRefundNotificationEvent} from "./notificationEvents";
+import {
+  initialReconciliation,
+  paymentReconciliationSchema,
+  unscheduleReconciliationUpdate,
+  type PaymentReconciliation,
+} from "./paymentReconciliationState";
 import {resolveOrderById, type Order} from "./orders";
 import {
   PAYMENT_REFUND_STATE_VALUES,
@@ -115,6 +121,9 @@ export interface Payment {
   refundPendingInPaise?: number;
   refundSeq?: number;
   refundState?: PaymentRefundState;
+  /** Internal bookkeeping for `paymentReconciliation.ts`; absent on a payment written before it
+   * existed (such a payment is simply never swept). Never part of `PaymentResponse`. */
+  reconciliation?: PaymentReconciliation;
   createdAt: Timestamp;
   updatedAt: Timestamp;
 }
@@ -158,6 +167,9 @@ const paymentDocSchema = z.object({
   refundPendingInPaise: z.number().int().min(0).optional(),
   refundSeq: z.number().int().min(0).optional(),
   refundState: z.enum(PAYMENT_REFUND_STATE_VALUES).optional(),
+  // Bookkeeping only: a damaged `reconciliation` map must never make the payment itself
+  // unreadable (customers, webhooks and refunds all parse it), so it degrades to "none".
+  reconciliation: paymentReconciliationSchema.optional().catch(undefined),
   createdAt: z.custom<Timestamp>(
     (value) => value instanceof Timestamp,
     "createdAt must be a Firestore Timestamp",
@@ -547,7 +559,8 @@ export async function markPaymentSucceeded(
     if (lateCapture) {
       return captureAfterCancellation(tx, {order, orderRef, payment, paymentRef, paymentUpdate, now});
     }
-    tx.update(paymentRef, paymentUpdate);
+    // A captured payment leaves the reconciliation sweep in the same transaction.
+    tx.update(paymentRef, {...paymentUpdate, ...unscheduleReconciliationUpdate()});
     tx.update(orderRef, {status: "confirmed", paymentStatus: "paid", updatedAt: now});
 
     const confirmedOrder: Order = {...order, status: "confirmed", paymentStatus: "paid", updatedAt: now};
@@ -643,9 +656,9 @@ async function captureAfterCancellation(
   if (plan.kind === "create") {
     tx.create(plan.refundRef, plan.refund);
     recordRefundNotificationEvent(plan.refundRef.firestore, tx, plan.refund, "refund_requested", now);
-    tx.update(paymentRef, {...paymentUpdate, ...plan.paymentUpdate});
+    tx.update(paymentRef, {...paymentUpdate, ...plan.paymentUpdate, ...unscheduleReconciliationUpdate()});
   } else {
-    tx.update(paymentRef, paymentUpdate);
+    tx.update(paymentRef, {...paymentUpdate, ...unscheduleReconciliationUpdate()});
   }
   tx.update(orderRef, orderUpdate);
 
@@ -874,9 +887,12 @@ async function claimProviderOrder(
     }
 
     const now = Timestamp.now();
+    // From here a customer can pay, so from here Zesto must be able to notice a payment it
+    // never hears about: schedule the first reconciliation check (see `paymentReconciliation.ts`).
     const update: Partial<Payment> = {
       provider: "razorpay",
       providerOrderId: candidateProviderOrderId,
+      reconciliation: initialReconciliation(now),
       updatedAt: now,
     };
     tx.update(paymentRef, update);
