@@ -1,6 +1,7 @@
 {
   "projects": {
     "default": "zesto-dev-2026",
-    "production": "zesto-dev-2026"
+    "production": "zesto-dev-2026",
+    "staging": "zesto-staging-2026"
   }
 }

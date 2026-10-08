@@ -1,7 +1,7 @@
 # Environments: current state and the staging plan (Checkpoints 4.6–4.7)
 
-Status (updated in 4.7): **audit + plan + deployment guard. No Firebase, Descope or Razorpay resource was created or changed.**
-A real staging environment does **not** exist (re-assessed in 4.7: see §3). This document says exactly what it needs.
+Status (updated in 4.8): **the staging Firebase project exists but staging is NOT usable yet** — Blaze billing, a staging Descope project and a staging Razorpay Test key pair + webhook are still to be created by a human (§7).
+Sections 1–6 describe the state at 4.7 and are kept as history.
 What 4.7 *did* change is the repository: a deploy can no longer reach production by accident (§1, "Deployment guard").
 
 Read-only tooling added: `npm run check:env -- --env <production|staging>` ([`scripts/check-environment.mjs`](../../scripts/check-environment.mjs))
@@ -172,3 +172,27 @@ The backend verifies the session token's audience against `DESCOPE_PROJECT_ID`; 
 rejected by staging and vice versa. `check:env` fails if staging reuses production's Descope project id, Razorpay key id or
 Firebase project, or holds a Live key. No production user or customer data is to be copied into staging; seed it with
 `scripts/seed-org-orders.mjs`-style synthetic data against staging's own project.
+
+## 7. Checkpoint 4.8 — staging partially created (BLOCKED on manual steps)
+
+**Created (4.8):** Firebase/GCP project `zesto-staging-2026` ("Zesto Staging", project number `825362502936`) and its web app
+`1:825362502936:web:d593b212b509ebb09efa6d`, both from the CLI. `.firebaserc` now has `"staging": "zesto-staging-2026"`.
+The frontend config `.env.staging.local` (gitignored) defines **every** `VITE_*` name `.env.local` defines, so a staging build cannot inherit a
+production value; `VITE_DESCOPE_PROJECT_ID` is blank on purpose.
+
+**Not created — each needs a console action by a human:**
+
+| # | Resource | Where | Then |
+| - | -------- | ----- | ---- |
+| 1 | Blaze billing on `zesto-staging-2026` | Firebase console → Usage and billing | `firebase functions:list --project zesto-staging-2026` must stop failing; Functions v2, Secret Manager, Scheduler and Eventarc need it |
+| 2 | Descope project "Zesto Staging" (own sign-in flow; allowed domains `https://zesto-staging-2026.web.app` and `localhost`) | Descope console | its project id → `.env.staging.local` (`VITE_DESCOPE_PROJECT_ID`) **and** `functions/.env.zesto-staging-2026` (`DESCOPE_PROJECT_ID`) |
+| 3 | Razorpay **Test Mode** key pair, separate from production's | Razorpay Dashboard → API Keys | key **id** → `functions/.env.zesto-staging-2026` (`RAZORPAY_KEY_ID`); key **secret** → Secret Manager only |
+| 4 | Razorpay Test webhook → `https://zesto-staging-2026.web.app/api/webhooks/razorpay`; events `payment.captured`, `payment.failed`, `refund.created`, `refund.processed`, `refund.failed`; its **own** signing secret | Razorpay Dashboard → Webhooks | signing secret → Secret Manager only. Test webhooks are account-wide (§6): on the same Razorpay account a staging payment is also delivered to the production webhook — use a separate Test account or disable production's webhook while testing |
+| 5 | Secrets `RAZORPAY_KEY_SECRET`, `RAZORPAY_WEBHOOK_SECRET`, `PICKUP_CREDENTIAL_SECRET` (new random, >= 32 chars) | `firebase functions:secrets:set <NAME> --project zesto-staging-2026` | consumed by the `api` function (`providers/razorpay.ts`, `domain/pickupCredential.ts`) |
+| 6 | Firestore `(default)` database in `asia-south1`; APIs (§4B, or the first deploy enables them) | CLI, after 1 | — |
+
+Gate to continue: `npm run check:env -- --env staging` must print `OK` with no "not found" notes; then deploy only through
+`npm run deploy:staging -- --only <targets>` in the runbook's order.
+
+Verified in 4.8: `check:env --env staging` fails today only on the blank Descope id; `check:env --env production` is still OK;
+`npm run deploy:staging -- --dry-run` refuses to proceed; a bare `firebase deploy` is stopped by the predeploy guard.
