@@ -173,14 +173,14 @@ rejected by staging and vice versa. `check:env` fails if staging reuses producti
 Firebase project, or holds a Live key. No production user or customer data is to be copied into staging; seed it with
 `scripts/seed-org-orders.mjs`-style synthetic data against staging's own project.
 
-## 7. Checkpoint 4.8 — staging partially created (BLOCKED on manual steps)
+## 7. Checkpoint 4.8 — staging created (manual steps completed 2026-10-09; results in §8)
 
 **Created (4.8):** Firebase/GCP project `zesto-staging-2026` ("Zesto Staging", project number `825362502936`) and its web app
 `1:825362502936:web:d593b212b509ebb09efa6d`, both from the CLI. `.firebaserc` now has `"staging": "zesto-staging-2026"`.
 The frontend config `.env.staging.local` (gitignored) defines **every** `VITE_*` name `.env.local` defines, so a staging build cannot inherit a
 production value; `VITE_DESCOPE_PROJECT_ID` is blank on purpose.
 
-**Not created — each needs a console action by a human:**
+**Manual steps — all completed on 2026-10-09** (Razorpay items 3–4 on a **separate** Razorpay Test account, so staging events never reach the production webhook):
 
 | # | Resource | Where | Then |
 | - | -------- | ----- | ---- |
@@ -196,3 +196,55 @@ Gate to continue: `npm run check:env -- --env staging` must print `OK` with no "
 
 Verified in 4.8: `check:env --env staging` fails today only on the blank Descope id; `check:env --env production` is still OK;
 `npm run deploy:staging -- --dry-run` refuses to proceed; a bare `firebase deploy` is stopped by the predeploy guard.
+
+## 8. Checkpoint 4.8 — staging deployed and validated (2026-10-09 / 10)
+
+**Configuration.**
+- Blaze billing is on.
+- The Functions, Run, Cloud Build, Artifact Registry, Scheduler, Eventarc and Firestore APIs are enabled.
+- Firestore `(default)` is Native/Standard in `asia-south1`.
+- The Storage bucket `zesto-staging-2026.firebasestorage.app` is in `ASIA-SOUTH1`.
+- The three secrets are set (the pickup secret was generated and never displayed).
+- The Descope project "Zesto Staging" exists.
+- The Razorpay **Test** key pair and its webhook belong to a separate Razorpay account.
+- `check:env` reports OK for both staging and production.
+
+**Deploy.** Done through `npm run deploy:staging` in the runbook order:
+1. indexes (all READY)
+2. Firestore rules
+3. Storage rules
+4. functions: `onRefundCreated`, `reconcileRefunds`, `reconcilePayments`, `onNotificationEventCreated` and `api`, one at a time
+5. hosting
+
+Two Scheduler jobs and two Eventarc triggers are active. The staging bundle names only `zesto-staging-2026`, and the security headers are served.
+
+**Setup findings.**
+- **Descope.** Approved Domains must be entered **without** a protocol (`zesto-staging-2026.web.app`, `localhost`). With `https://` the flow fails with `E011014 Forbidden origin` (a CORS error in the browser). A new Descope project starts with the default email-link + Google flow, so production's `sign-up-or-in` flow (SMS OTP) was exported and imported into staging.
+- **Deploy wrapper.** `retry: true` triggers need `--force` in a non-interactive deploy. The wrapper accepts `--force` only for functions-only targets (commit `c13bb50`).
+- **First 2nd-gen trigger deploy.** It failed once with "first time using 2nd gen functions". Redeploying after about 4 minutes worked.
+- **Artifact Registry.** Staging has no cleanup policy (production does). Open.
+
+**Validated end to end (browser + server logs).**
+- SMS and email sign-in, session check (`/api/me`), navigation and sign-out.
+- Organization, outlet and menu created and published.
+- A customer order paid through Razorpay **Test Mode**. The staging webhook received `payment.captured` → `payment_succeeded`, and the production project received no requests.
+- The owner moved the order from confirmed to preparing to ready.
+- Notifications reached the customer and the owner through `onNotificationEventCreated`.
+- The customer's pickup QR and code were issued, so the pickup secret works. Pickup completion was not run.
+
+**Bugs found and fixed on staging** (both also affect production until its next frontend rollout):
+- A blank login page after sign-out: a Descope SDK ref loop causing React #185 (commit `41e0a73`).
+- Sign-in not returning to the requested page: stale Ionic views redirected a second time (commit `850693b`).
+
+**Open — refund (blocks Live Mode).**
+- An owner cancellation of a paid order works. The order becomes Cancelled, the refund is reserved and the notifications fire.
+- Razorpay rejects `createRefund` with HTTP 400 "invalid request sent" and names no field (attempts `…-r1` and `…-r2`). The payment stays captured, with nothing refunded.
+- A probe with an impossible amount showed that **every** body/header variant, including Zesto's exact one, passes Razorpay's format validation. The cause is therefore a condition on the new staging Razorpay account at the real amount, most likely no settled balance before the first settlement (due 2026-10-13), and not Zesto's request.
+- Refund failures now keep Razorpay's field, reason and step when Razorpay sends them (commit `ed625c7`).
+- **Gate:** a refund must succeed end to end on staging before Live Mode. Retry once after the settlement, and contact Razorpay support if it still fails.
+
+**Other open items.**
+- The customer Menu tab, the organization Dashboard, Analytics and Settings still show built-in sample content.
+- The home page's "Organization sign-in" opens `/login`, which defaults to the customer menu.
+- Production (`zesto-dev-2026`) runs the 2026-10-05 website and lacks `onRefundCreated`, `reconcileRefunds` and `reconcilePayments`. Roll it out in full by the runbook; a hosting-only deploy would put the newer frontend on the older backend.
+
