@@ -17,7 +17,7 @@ export function PublicHeader() {
           <Link to={PUBLIC_LINKS.explore} className={`${navLinkClasses} hidden sm:inline`}>
             Explore
           </Link>
-          <Link to={PUBLIC_LINKS.signIn} className={`${navLinkClasses} hidden sm:inline`}>
+          <Link to={PUBLIC_LINKS.organizationSignIn} className={`${navLinkClasses} hidden sm:inline`}>
             Organization sign-in
           </Link>
           <Link to={PUBLIC_LINKS.contact} className={`${navLinkClasses} hidden sm:inline`}>

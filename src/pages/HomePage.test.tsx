@@ -61,7 +61,7 @@ describe('HomePage', () => {
     renderHome();
 
     const header = screen.getByRole('navigation', { name: 'Primary' });
-    expect(within(header).getByRole('link', { name: 'Organization sign-in' })).toHaveAttribute('href', '/login');
+    expect(within(header).getByRole('link', { name: 'Organization sign-in' })).toHaveAttribute('href', '/org');
   });
 
   it('exposes all policy and contact links in the footer', () => {

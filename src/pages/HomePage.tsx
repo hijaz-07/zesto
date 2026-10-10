@@ -79,7 +79,7 @@ export function HomePage() {
             <Link to={PUBLIC_LINKS.explore} className={buttonClassName('primary', 'px-6 py-3 text-base')}>
               Explore Menus
             </Link>
-            <Link to={PUBLIC_LINKS.signIn} className={buttonClassName('secondary', 'px-6 py-3 text-base')}>
+            <Link to={PUBLIC_LINKS.organizationSignIn} className={buttonClassName('secondary', 'px-6 py-3 text-base')}>
               Organization sign-in
             </Link>
           </div>

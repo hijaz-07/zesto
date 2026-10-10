@@ -22,7 +22,8 @@ export function getOperatorName(): string | null {
 
 export const PUBLIC_LINKS = {
   explore: '/explore',
-  signIn: '/login',
+  // The organization area; signed-out visitors are sent to /login and returned here.
+  organizationSignIn: '/org',
   privacy: '/privacy',
   terms: '/terms',
   refundCancellation: '/refund-cancellation',
