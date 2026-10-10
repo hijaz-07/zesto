@@ -13,7 +13,9 @@ current Apple and Google documentation when the work starts.
   marked placeholder. Policy date constant: `POLICY_LAST_UPDATED`.
 - Refund/cancellation policy copy matches the implemented behaviour (7.9).
 - A camera path exists (organization pickup QR scanner, `cameraScanning.ts` / `QrScanner.tsx`).
-- No push-notification code (no FCM, no service worker); notifications are an in-app, polled inbox.
+- No push-notification code (no FCM, no service worker); notifications are an in-app, polled inbox. The in-app
+  notification centre and the backend notification-event/inbox processing exist; native push is a required future
+  subphase (see [Native push notifications](#native-push-notifications-required-mobile--capacitor-subphase)).
 - Descope handles authentication (SMS OTP flow).
 
 ## Gaps and launch requirements
@@ -40,10 +42,45 @@ current Apple and Google documentation when the work starts.
 | **Crash & diagnostics** | Crashlytics or equivalent, disclosed in the data-safety forms. | Not present |
 | **Regional / compliance** | India: DPDP Act notice and consent wording, data-principal rights (deletion, grievance officer contact); GST invoices if applicable; Razorpay merchant KYC for Live Mode before any production payment. | Business owner |
 
+## Native push notifications (required Mobile / Capacitor subphase)
+
+**NOT started.** Accepted future-roadmap requirement: a required subphase of Mobile / Capacitor that must be
+completed before Android/iOS release readiness. Out of scope until staging validation (Checkpoint 4.8) and the
+later production gates are done.
+
+**Status**
+
+- In-app notification centre: implemented.
+- Backend notification events and inbox processing: implemented and tested.
+- Native Android/iOS push delivery: not yet confirmed implemented (no FCM/APNs code in the repo).
+- Device token registration, push permissions, delivery, foreground/background handling and notification deep
+  links: require implementation and testing.
+
+**Approach**
+
+- Reuse the existing backend notification-event architecture (outbox events → processor → inbox); add push as an
+  additional delivery channel, not a second notification system.
+- Evaluate Firebase Cloud Messaging for Android and the appropriate APNs integration for iOS (e.g. via FCM's APNs
+  support or a Capacitor push plugin; decide when work starts).
+- Descope stays the sole authentication provider; no direct Firestore access from the client (device tokens are
+  registered through a backend API, validated server-side).
+
+**Requirements**
+
+- [ ] Secure device-token registration (authenticated, server-validated, scoped to the user).
+- [ ] Invalid/expired-token cleanup.
+- [ ] Notification deduplication (deterministic event IDs, no duplicate push vs inbox).
+- [ ] Permission-denied fallback (the in-app inbox keeps working).
+- [ ] Deep links to the correct order.
+- [ ] Foreground/background handling.
+- [ ] Token revocation on logout/account deletion.
+- [ ] Tests on real Android and iOS devices (plus unit/emulator tests for the backend parts).
+
 ## Sequencing recommendation
 
 1. Account deletion (backend + UI + policy text) — blocks both stores.
 2. Real support email/operator name set in the production build; privacy/terms reviewed.
-3. Decide push (FCM) scope; until then keep the polled inbox and omit notification permission entirely.
+3. Native push (FCM/APNs) is a required subphase before release readiness; until it is built keep the polled inbox
+   and omit the notification permission.
 4. Decide the native HTTP/CORS approach and deep-link domains; add `.well-known` files to Hosting.
 5. Only then add Capacitor, native permissions, and the store declarations.

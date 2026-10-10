@@ -159,6 +159,15 @@ describe('buildPlan', () => {
     expect(() => plan('production', ['--confirm-production', PRODUCTION_PROJECT_ID])).toThrow(/--only/);
   });
 
+  it('passes --force only for functions-only deploys', () => {
+    expect(plan('staging', ['--only', 'functions:onRefundCreated', '--force']).deployArgs).toEqual([
+      'deploy', '--project', 'zesto-staging-x', '--only', 'functions:onRefundCreated', '--non-interactive', '--force',
+    ]);
+    expect(plan('staging', ['--only', 'functions:api']).deployArgs).not.toContain('--force');
+    expect(() => plan('staging', ['--only', 'firestore:indexes', '--force'])).toThrow(/--force/);
+    expect(() => plan('staging', ['--only', 'functions,hosting', '--force'])).toThrow(/--force/);
+  });
+
   it('rejects shell metacharacters and unknown flags', () => {
     expect(() => plan('staging', ['--only', 'hosting;rm -rf /'])).toThrow(DeployGuardError);
     expect(() => plan('staging', ['--only', 'hosting&&calc'])).toThrow(DeployGuardError);

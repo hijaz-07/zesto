@@ -12,6 +12,8 @@
  *                               Follow docs/operations/deployment-runbook.md for the order.
  *   --confirm-production <id>   REQUIRED for production, and must equal the production project id.
  *   --dry-run                   Run the checks and print the exact command; change nothing, build nothing.
+ *   --force                     Functions only: passes Firebase's --force, which a non-interactive deploy needs to
+ *                               create or change a `retry: true` trigger. Refused with any non-functions target.
  *
  * Firebase's own `predeploy` hooks (firebase.json) call scripts/deploy-guard.mjs, which stops any
  * deploy that did not come from this script. See docs/operations/deployment-runbook.md.
@@ -36,15 +38,17 @@ const ONLY_PATTERN = /^[A-Za-z0-9_:,-]+$/;
 
 /**
  * @param {string[]} argv The arguments after the target.
- * @return {{only?: string, confirmProduction?: string, dryRun: boolean}} The parsed flags.
+ * @return {{only?: string, confirmProduction?: string, dryRun: boolean, force: boolean}} The parsed flags.
  * @throws {DeployGuardError} On an unknown or valueless flag.
  */
 export function parseFlags(argv) {
-  const flags = {dryRun: false};
+  const flags = {dryRun: false, force: false};
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--dry-run') {
       flags.dryRun = true;
+    } else if (arg === '--force') {
+      flags.force = true;
     } else if (arg === '--only' || arg === '--confirm-production') {
       const value = argv[i + 1];
       if (value === undefined || value.startsWith('--')) {
@@ -53,7 +57,7 @@ export function parseFlags(argv) {
       flags[arg === '--only' ? 'only' : 'confirmProduction'] = value;
       i += 1;
     } else {
-      throw new DeployGuardError(`Unknown option ${arg}. Supported: --only, --confirm-production, --dry-run.`);
+      throw new DeployGuardError(`Unknown option ${arg}. Supported: --only, --confirm-production, --dry-run, --force.`);
     }
   }
   return flags;
@@ -77,6 +81,10 @@ export function buildPlan({target, flagArgs, firebaserc}) {
     throw new DeployGuardError('--only may contain only letters, digits, ":", "," "-" and "_".');
   }
   const targets = deployTargetsIn(only);
+  // Firebase's --force also skips the index-deletion prompt, which must never be auto-answered (runbook §2).
+  if (flags.force && targets.some((name) => name !== 'functions')) {
+    throw new DeployGuardError('--force is allowed only when every --only target is functions[:name].');
+  }
   const env = {[APPROVED_PROJECT_VARIABLE]: resolved.projectId};
   if (resolved.target === 'production') {
     env[PRODUCTION_CONFIRMATION_VARIABLE] = PRODUCTION_PROJECT_ID;
@@ -91,7 +99,7 @@ export function buildPlan({target, flagArgs, firebaserc}) {
     env,
     buildArgs: resolved.target === 'staging' ? ['run', 'build', '--', '--mode', 'staging'] : ['run', 'build'],
     // `--project` is explicit on purpose: nothing here depends on the CLI's active project.
-    deployArgs: ['deploy', '--project', resolved.projectId, '--only', only, '--non-interactive'],
+    deployArgs: ['deploy', '--project', resolved.projectId, '--only', only, '--non-interactive', ...(flags.force ? ['--force'] : [])],
   };
 }
 

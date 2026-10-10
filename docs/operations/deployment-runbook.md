@@ -136,7 +136,8 @@ npm run deploy:production -- --only functions:api --confirm-production zesto-dev
 
 Known behaviour from checkpoint 6: the first Firestore-trigger create can fail once with an Eventarc
 service-agent propagation error — wait about four minutes and redeploy only that function.
-`retry: true` triggers need `--force` in a non-interactive deploy. The `firebase-functions-cleanup`
+`retry: true` triggers (`onRefundCreated`, `onNotificationEventCreated`) need `--force` in a non-interactive deploy: add `--force` to
+that one command; the wrapper refuses it with any non-functions target. The `firebase-functions-cleanup`
 Artifact Registry policy (7 days) is already set.
 
 ### 4. Eventarc check
