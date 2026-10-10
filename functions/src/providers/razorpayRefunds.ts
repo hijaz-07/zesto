@@ -56,6 +56,7 @@ const LIST_PAGE_SIZE = 100;
 const MAX_LIST_PAGES = 20;
 const MAX_RESPONSE_CHARS = 1_000_000;
 const MAX_DESCRIPTION_CHARS = 200;
+const MAX_CONTEXT_CHARS = 60;
 
 /** The provider's idempotency-key alphabet and minimum length (see the file header). */
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_-]{10,255}$/;
@@ -246,17 +247,25 @@ function classifyHttpFailure(
 ): RefundProviderError {
   let providerCode: unknown;
   let description: unknown;
+  let context: Array<[string, unknown]> = [];
   try {
     const parsed: unknown = JSON.parse(bodyText);
-    const error = (parsed as {error?: {code?: unknown; description?: unknown}} | null)?.error;
+    const error = (parsed as {error?: {code?: unknown; description?: unknown; field?: unknown; reason?: unknown; step?: unknown}} | null)?.error;
     providerCode = error?.code;
     description = error?.description;
+    context = [["field", error?.field], ["reason", error?.reason], ["step", error?.step]];
   } catch {
     // A non-JSON error body is fine: the status alone classifies it.
   }
   const code = safeCode(providerCode);
   const detail = safeText(description, credentials);
-  const message = `Razorpay ${spec.operation} failed (HTTP ${status}${detail ? `: ${detail}` : ""}).`;
+  // Razorpay names the offending field / reason / step on a 400; "NA" means "not applicable".
+  const extra = context
+    .map(([name, value]) => [name, safeText(value, credentials).slice(0, MAX_CONTEXT_CHARS)])
+    .filter(([, value]) => value && value !== "NA")
+    .map(([name, value]) => `${name}=${value}`)
+    .join("; ");
+  const message = `Razorpay ${spec.operation} failed (HTTP ${status}${detail ? `: ${detail}` : ""}${extra ? `; ${extra}` : ""}).`;
 
   if (status === 401 || status === 403) {
     return new ProviderConfigurationError("provider_auth_rejected", `Razorpay rejected the credentials (HTTP ${status}).`, status);

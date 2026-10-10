@@ -357,6 +357,19 @@ describe("error classification", () => {
     expect(failure).toMatchObject({category, code, mayHaveBeenApplied, httpStatus: status});
   });
 
+  it("keeps Razorpay's field, reason and step in the message, skipping \"NA\" and redacting secrets", async () => {
+    const {http, gateway} = harness();
+    http.script({respond: {status: 400, body: {error: {
+      code: "BAD_REQUEST_ERROR", description: "invalid request sent", field: "receipt",
+      reason: `input_validation_failed ${KEY_SECRET}`, step: "NA", source: "business",
+    }}}});
+    const failure = await failureOf(gateway.createRefund(request()));
+    expect(failure).toMatchObject({category: "DEFINITIVE_FAILURE", code: "BAD_REQUEST_ERROR"});
+    expect(failure.message).toBe(
+      "Razorpay createRefund failed (HTTP 400: invalid request sent; field=receipt; reason=input_validation_failed [redacted]).",
+    );
+  });
+
   it("maps each category onto its own error type, so the saga can tell them apart", async () => {
     const types = new Map<number, unknown>([
       [400, ProviderRefundRejectedError], [429, ProviderRetryableError],
