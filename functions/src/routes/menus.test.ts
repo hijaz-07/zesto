@@ -235,11 +235,12 @@ function ctx(overrides: Partial<RouteContext> = {}): RouteContext {
 }
 
 describe("createMenuRoutes", () => {
-  it("registers exactly the 6 documented routes", () => {
+  it("registers exactly the 7 documented routes", () => {
     const routes = createMenuRoutes({db: {} as Firestore});
     expect(routes.map((r) => `${r.method} ${r.path}`).sort()).toEqual([
       `GET ${MENU_ROUTE_PATTERN}`,
       `GET ${MENU_ROUTE_PATTERN}/:menuId`,
+      `GET ${MENU_ROUTE_PATTERN}/:menuId/demand`,
       `PATCH ${MENU_ROUTE_PATTERN}/:menuId`,
       `POST ${MENU_ROUTE_PATTERN}`,
       `POST ${MENU_ROUTE_PATTERN}/:menuId/archive`,

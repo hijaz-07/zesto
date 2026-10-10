@@ -23,6 +23,7 @@ import {
   updateMenu,
   updateMenuBodySchema,
 } from "../domain/menus";
+import {getMenuDemand} from "../domain/menuDemand";
 import type {
   ApiResult,
   NormalizedRequest,
@@ -69,6 +70,11 @@ export function createMenuRoutes(deps: MenusRouteDeps): RouteDefinition[] {
       method: "GET",
       path: `${base}/:menuId`,
       handler: (ctx) => handleGetMenu(ctx, deps),
+    },
+    {
+      method: "GET",
+      path: `${base}/:menuId/demand`,
+      handler: (ctx) => handleGetMenuDemand(ctx, deps),
     },
     {
       method: "PATCH",
@@ -308,6 +314,43 @@ async function handleGetMenu(
       data: {menu: toMenuResponse(menu)},
       userId: session.userId,
     };
+  } catch (error) {
+    return mapKnownError(error);
+  }
+}
+
+/**
+ * `GET .../menus/{menuId}/demand`: the menu's demand — paid, not-cancelled
+ * orders added up per item (see `domain/menuDemand.ts`). Read-only; any active
+ * `owner`/`manager`/`staff` member may read it, exactly like the menu itself.
+ * The outlet and menu are resolved inside the caller's verified organization,
+ * so another organization's menu is a plain 404.
+ *
+ * @param {RouteContext} ctx The route context.
+ * @param {MenusRouteDeps} deps The route's dependencies.
+ * @return {Promise<ApiResult>} The route's outcome: `200` with `{demand}`.
+ */
+async function handleGetMenuDemand(
+  ctx: RouteContext,
+  deps: MenusRouteDeps,
+): Promise<ApiResult> {
+  let caller: AuthorizedCaller;
+  try {
+    caller = await authenticateAndAuthorize(ctx, deps, VIEW_ROLES);
+  } catch (error) {
+    return mapKnownError(error);
+  }
+  const {session, membership} = caller;
+
+  try {
+    const outlet = await requireOutlet(
+      ctx, deps, membership.organizationId, {requireActive: false},
+    );
+    const menu = await getMenu(
+      deps.db, membership.organizationId, outlet.id, ctx.params?.menuId,
+    );
+    const demand = await getMenuDemand(deps.db, menu);
+    return {kind: "success", status: 200, data: {demand}, userId: session.userId};
   } catch (error) {
     return mapKnownError(error);
   }

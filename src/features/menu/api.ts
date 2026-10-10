@@ -1,6 +1,6 @@
 import type { OrganizationId, OutletId } from '../../domain/types';
 import { apiFetch } from '../../lib/api/client';
-import type { Menu, MenuId } from './types';
+import type { Menu, MenuDemand, MenuId } from './types';
 
 export interface CreateMenuInput {
   menuDate: string;
@@ -59,6 +59,21 @@ export function getMenu(
 ): Promise<GetMenuResponse> {
   return apiFetch<GetMenuResponse>(
     `/organizations/${organizationId}/outlets/${outletId}/menus/${menuId}`,
+  );
+}
+
+interface GetMenuDemandResponse {
+  demand: MenuDemand;
+}
+
+/** The menu's demand (paid, not-cancelled orders per item), computed on the server. */
+export function getMenuDemand(
+  organizationId: OrganizationId,
+  outletId: OutletId,
+  menuId: MenuId,
+): Promise<GetMenuDemandResponse> {
+  return apiFetch<GetMenuDemandResponse>(
+    `/organizations/${organizationId}/outlets/${outletId}/menus/${menuId}/demand`,
   );
 }
 

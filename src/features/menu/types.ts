@@ -26,3 +26,19 @@ export interface Menu {
   createdBy: UserId;
   publishedAt?: string;
 }
+
+/** One menu item's demand: portions from paid, not-cancelled orders. */
+export interface MenuItemDemand {
+  itemId: string;
+  name: string;
+  portions: number;
+}
+
+/** `GET .../menus/{menuId}/demand`: computed on the server from paid, not-cancelled orders. */
+export interface MenuDemand {
+  menuId: MenuId;
+  paidOrders: number;
+  totalPortions: number;
+  items: MenuItemDemand[];
+  computedAt: string;
+}

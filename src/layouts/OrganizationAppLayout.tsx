@@ -32,7 +32,7 @@ export function OrganizationAppLayout({ organizationId, role }: OrganizationAppL
         <OrganizationSideNav />
         <IonRouterOutlet id="org-main-content">
           <Routes>
-            <Route path="dashboard" element={<OrganizationDashboardPage />} />
+            <Route path="dashboard" element={<OrganizationDashboardPage organizationId={organizationId} />} />
             <Route path="menus" element={<OrganizationMenusPage organizationId={organizationId} />} />
             <Route
               path="menus/:outletId"
