@@ -6,6 +6,7 @@ import { SIGN_UP_OR_IN_FLOW_ID } from '../features/auth/config';
 import { useAuth } from '../features/auth/useAuth';
 
 const DEFAULT_REDIRECT = '/app/menu';
+const LOGIN_PATH = '/login';
 
 /**
  * The Descope flow, shielded from parent re-renders. `<Descope>` (SDK 3.3.8) re-attaches
@@ -29,7 +30,9 @@ export function LoginPage() {
   const from = (location.state as { from?: Location } | null)?.from?.pathname ?? DEFAULT_REDIRECT;
 
   if (status === 'signedIn') {
-    return <Navigate to={from} replace />;
+    // Ionic keeps this view mounted after the redirect; once the location has moved on,
+    // redirecting again (without the original `from`) would send the user to the default.
+    return location.pathname === LOGIN_PATH ? <Navigate to={from} replace /> : null;
   }
 
   return (

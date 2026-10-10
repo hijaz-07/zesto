@@ -74,6 +74,27 @@ describe('LoginPage', () => {
     expect(screen.queryByTestId('descope-flow')).not.toBeInTheDocument();
   });
 
+  // Regression: Ionic keeps the login view mounted after the redirect; re-rendering at the
+  // new location (without `from`) must not redirect a second time to the default.
+  it('does not redirect again once the location has left the login page', () => {
+    descopeMock.setSignedIn();
+
+    render(
+      <AuthProvider>
+        <MemoryRouter initialEntries={['/org/dashboard']}>
+          <LoginPage />
+          <Routes>
+            <Route path="/org/dashboard" element={<div>Organization dashboard</div>} />
+            <Route path="/app/menu" element={<div>Customer menu</div>} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    expect(screen.getByText('Organization dashboard')).toBeInTheDocument();
+    expect(screen.queryByText('Customer menu')).not.toBeInTheDocument();
+  });
+
   it('redirects signed-in users to the customer menu by default', () => {
     descopeMock.setSignedIn();
 

@@ -66,4 +66,24 @@ describe('RequireAuth (Descope session)', () => {
     expect(screen.queryByText('Protected content')).not.toBeInTheDocument();
     expect(screen.getByText('Login page (from: /app)')).toBeInTheDocument();
   });
+
+  // Regression: Ionic keeps the guarded view mounted after the redirect, so the guard
+  // re-renders at /login; redirecting again overwrote `from` with /login.
+  it('does not redirect again once the location is already the login page', () => {
+    render(
+      <AuthProvider>
+        <MemoryRouter initialEntries={[{ pathname: '/login', state: { from: { pathname: '/org' } } }]}>
+          <RequireAuth>
+            <div>Protected content</div>
+          </RequireAuth>
+          <Routes>
+            <Route path="/login" element={<LoginProbe />} />
+          </Routes>
+        </MemoryRouter>
+      </AuthProvider>,
+    );
+
+    expect(screen.queryByText('Protected content')).not.toBeInTheDocument();
+    expect(screen.getByText('Login page (from: /org)')).toBeInTheDocument();
+  });
 });
