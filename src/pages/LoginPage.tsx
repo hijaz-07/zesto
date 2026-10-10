@@ -1,10 +1,22 @@
 import { Descope } from '@descope/react-sdk';
+import { memo } from 'react';
 import { Navigate, useLocation, type Location } from 'react-router-dom';
 import { LoadingState } from '../components/common';
 import { SIGN_UP_OR_IN_FLOW_ID } from '../features/auth/config';
 import { useAuth } from '../features/auth/useAuth';
 
 const DEFAULT_REDIRECT = '/app/menu';
+
+/**
+ * The Descope flow, shielded from parent re-renders. `<Descope>` (SDK 3.3.8) re-attaches
+ * its element ref on every render, and each re-attach sets state again; when it mounts
+ * mid-transition (signing out from `/app/*`) the page and auth state re-render it repeatedly
+ * and React aborts with "Maximum update depth exceeded" (#185), blanking the whole app.
+ * It takes no props, so `memo` renders it exactly once per mount.
+ */
+const SignInFlow = memo(function SignInFlow() {
+  return <Descope flowId={SIGN_UP_OR_IN_FLOW_ID} />;
+});
 
 /**
  * Hosts the Descope `sign-up-or-in` flow. Descope owns the OTP UI and the
@@ -30,7 +42,7 @@ export function LoginPage() {
       {status === 'initializing' ? (
         <LoadingState label="Checking sign-in status…" />
       ) : (
-        <Descope flowId={SIGN_UP_OR_IN_FLOW_ID} />
+        <SignInFlow />
       )}
     </div>
   );

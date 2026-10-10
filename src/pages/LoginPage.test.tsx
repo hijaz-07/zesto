@@ -8,7 +8,11 @@ import { LoginPage } from './LoginPage';
 vi.mock('@descope/react-sdk', async () => (await import('../test/mockDescopeSdk')).mockDescopeSdkModule);
 
 function renderLogin(initialEntry: string | { pathname: string; state: unknown } = '/login') {
-  return render(
+  return render(loginTree(initialEntry));
+}
+
+function loginTree(initialEntry: string | { pathname: string; state: unknown }) {
+  return (
     <AuthProvider>
       <MemoryRouter initialEntries={[initialEntry]}>
         <Routes>
@@ -17,7 +21,7 @@ function renderLogin(initialEntry: string | { pathname: string; state: unknown }
           <Route path="/org/dashboard" element={<div>Organization dashboard</div>} />
         </Routes>
       </MemoryRouter>
-    </AuthProvider>,
+    </AuthProvider>
   );
 }
 
@@ -37,6 +41,19 @@ describe('LoginPage', () => {
     expect(screen.getByRole('heading', { name: 'Sign in to Zesto' })).toBeInTheDocument();
     expect(screen.getByTestId('descope-flow')).toHaveAttribute('data-flow-id', 'sign-up-or-in');
     expect(descopeMock.flowProps).toHaveBeenCalledWith(expect.objectContaining({ flowId: 'sign-up-or-in' }));
+  });
+
+  // Regression: re-rendering the real <Descope> after mount loops its ref (React #185), which
+  // blanked the app when /login mounted mid sign-out transition.
+  it('does not re-render the Descope flow when the page re-renders', () => {
+    const { rerender } = renderLogin();
+    expect(descopeMock.flowProps).toHaveBeenCalledTimes(1);
+
+    rerender(loginTree('/login'));
+    rerender(loginTree('/login'));
+
+    expect(screen.getByTestId('descope-flow')).toBeInTheDocument();
+    expect(descopeMock.flowProps).toHaveBeenCalledTimes(1);
   });
 
   it('shows a loading state instead of the flow while the session is still loading', () => {
